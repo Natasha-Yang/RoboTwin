@@ -69,12 +69,18 @@ def init_wandb(
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(
+            id=run_id,
+            resume="must",
+            project=config.project_name,
+            entity="natashayang04-university-of-toronto",
+        )
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            entity="natashayang04-university-of-toronto",
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
