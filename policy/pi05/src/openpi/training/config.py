@@ -609,6 +609,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30000,
         fsdp_devices=1,
+        ema_decay=None,
     ),
     # pi0_base by lora
     TrainConfig(
