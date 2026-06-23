@@ -224,10 +224,10 @@ def run(TASK_ENV, args):
             with open(info_file_path, "w", encoding="utf-8") as file:
                 json.dump(info_db, file, ensure_ascii=False, indent=4)
 
+            assert TASK_ENV.check_success(), "Collect Error"
             TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
             TASK_ENV.merge_pkl_to_hdf5_video()
             TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
 
         command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
         os.system(command)

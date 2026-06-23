@@ -585,7 +585,7 @@ _CONFIGS = [
         name="pi05_base_aloha_lora",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
-            repo_id="your_repo_id",  # your datasets repo_id
+            repo_id="NatashaYang/robotwin_lerobot_dataset",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({

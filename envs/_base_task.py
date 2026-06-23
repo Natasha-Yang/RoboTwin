@@ -8,6 +8,7 @@ import gymnasium as gym
 import pdb
 import toppra as ta
 import json
+import gc
 import transforms3d as t3d
 from collections import OrderedDict
 import torch, random
@@ -120,20 +121,44 @@ class Base_Task(gym.Env):
         self.create_table_and_wall(table_xy_bias=table_xy_bias, table_height=0.74)
         self.load_robot(**kwags)
         self.load_camera(**kwags)
+
+        def _dbg(label):
+            self.scene.update_render()
+            try:
+                self.cameras.left_camera.take_picture()
+                print(f"[DEBUG] {label}: OK", flush=True)
+            except Exception as e:
+                print(f"[DEBUG] {label}: FAILED - {e}", flush=True)
+
+        _dbg("after load_camera")
         self.robot.move_to_homestate()
+        _dbg("after move_to_homestate")
 
         render_freq = self.render_freq
         self.render_freq = 0
         self.together_open_gripper(save_freq=None)
         self.render_freq = render_freq
+        _dbg("after together_open_gripper")
 
         self.robot.set_origin_endpose()
+        _dbg("after set_origin_endpose")
+
         self.load_actors()
+
+        # Test after actors
+        self.scene.update_render()
+        try:
+            self.cameras.left_camera.take_picture()
+            print("[DEBUG] take_picture AFTER load_actors: OK", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] take_picture AFTER load_actors: FAILED - {e}", flush=True)
 
         if self.cluttered_table:
             self.get_cluttered_table()
 
+        print("[DEBUG] before check_stable", flush=True)
         is_stable, unstable_list = self.check_stable()
+        print("[DEBUG] after check_stable", flush=True)
         if not is_stable:
             raise UnStableError(
                 f'Objects is unstable in seed({kwags.get("seed", 0)}), unstable objects: {", ".join(unstable_list)}')
@@ -202,19 +227,19 @@ class Base_Task(gym.Env):
         Set the scene
             - Set up the basic scene: light source, viewer.
         """
-        self.engine = sapien.Engine()
-        # declare sapien renderer
-        from sapien.render import set_global_config
+        if not hasattr(Base_Task, '_shared_engine') or Base_Task._shared_engine is None:
+            from sapien.render import set_global_config
+            set_global_config(max_num_materials=50000, max_num_textures=50000)
+            Base_Task._shared_engine = sapien.Engine()
+            Base_Task._shared_renderer = sapien.SapienRenderer()
+            Base_Task._shared_engine.set_renderer(Base_Task._shared_renderer)
+            sapien.render.set_camera_shader_dir("rt")
+            sapien.render.set_ray_tracing_samples_per_pixel(32)
+            sapien.render.set_ray_tracing_path_depth(8)
+            sapien.render.set_ray_tracing_denoiser("optix")
 
-        set_global_config(max_num_materials=50000, max_num_textures=50000)
-        self.renderer = sapien.SapienRenderer()
-        # give renderer to sapien sim
-        self.engine.set_renderer(self.renderer)
-
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        self.engine = Base_Task._shared_engine
+        self.renderer = Base_Task._shared_renderer
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -576,9 +601,10 @@ class Base_Task(gym.Env):
         self.eval_video_ffmpeg = ffmpeg
 
     def close_env(self, clear_cache=False):
+        if hasattr(self, 'scene'):
+            del self.scene
+        gc.collect()
         if clear_cache:
-            # for actor in self.scene.get_all_actors():
-            #     self.scene.remove_actor(actor)
             sapien_clear_cache()
         self.close()
 
@@ -963,6 +989,7 @@ class Base_Task(gym.Env):
                     if self.plan_success is False:
                         return False
 
+            print("[DEBUG] before take_dense_action", flush=True)
             self.take_dense_action(control_seq)
 
         return True
@@ -1418,6 +1445,7 @@ class Base_Task(gym.Env):
 
         save_freq = self.save_freq if save_freq == -1 else save_freq
         if save_freq != None:
+            print("[DEBUG] before _take_picture in take_dense_action", flush=True)
             self._take_picture()
 
         max_control_len = 0
