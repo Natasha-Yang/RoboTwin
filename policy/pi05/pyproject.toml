@@ -27,7 +27,13 @@ dependencies = [
     "pillow>=11.0.0",
     "s3fs>=2024.9.0",
     "sentencepiece>=0.2.0",
-    "torch>=2.5.1",
+    "torch==2.7.0",
+    "warp-lang==1.12.0",
+    "yourdfpy>=0.0.53",
+    "numpy-quaternion",
+    "scikit-image",
+    "pybind11",
+    "setuptools-scm>=6.2",
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
@@ -68,9 +74,22 @@ dev = [
 ]
 
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+override-dependencies = [
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+]
+
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "a445d9c9da6bea99a8972daa4fe1fdd053d711d2" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.uv.workspace]
 members = ["packages/*"]

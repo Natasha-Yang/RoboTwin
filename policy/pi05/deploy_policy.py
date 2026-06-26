@@ -6,6 +6,7 @@ import os, sys
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 sys.path.append(parent_directory)
+sys.path.insert(0, os.path.join(parent_directory, "src"))
 
 from pi_model import *
 

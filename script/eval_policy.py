@@ -219,10 +219,12 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        expert_success = False
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
+                expert_success = TASK_ENV.plan_success and TASK_ENV.check_success()
                 TASK_ENV.close_env()
             except UnStableError as e:
                 # print(" -------------")
@@ -233,17 +235,18 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
+                stack_trace = traceback.format_exc()
+                print(" -------------")
+                print("Error: ", e)
+                print(stack_trace)
+                print(" -------------")
                 TASK_ENV.close_env()
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print("error occurs !")
                 continue
 
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+        if (not expert_check) or expert_success:
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
