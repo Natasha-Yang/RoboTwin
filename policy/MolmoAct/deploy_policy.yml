@@ -3,6 +3,8 @@ policy_name: null
 task_name: null
 task_config: null
 ckpt_setting: null
+ckpt_path: "allenai/MolmoAct2-Think" # "allenai/MolmoAct2-BimanualYAM"
+molmoact_step: 10
 seed: null
 instruction_type: unseen
 

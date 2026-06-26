@@ -1,9 +1,9 @@
 #!/bin/bash
 
-policy_name=Your_Policy # [TODO] 
+policy_name=MolmoAct # [TODO] 
 task_name=${1}
 task_config=${2}
-ckpt_setting=${3}
+ckpt_setting=${3} # [TODO] add parameters here
 seed=${4}
 gpu_id=${5}
 # [TODO] add parameters here
