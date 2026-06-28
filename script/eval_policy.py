@@ -12,6 +12,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 import traceback
+import pandas as pd
 
 import yaml
 from datetime import datetime
@@ -159,11 +160,11 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = 5
     topk = 1
 
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
+    st_seed, suc_num, episode_results = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
                                    model,
@@ -181,6 +182,11 @@ def main(usr_args):
         file.write(f"Instruction Type: {instruction_type}\n\n")
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+
+    episode_file_path = os.path.join(save_dir, f"_episode_results.csv")
+    # write num_steps and success to csv file
+    episode_results_df = pd.DataFrame(episode_results)
+    episode_results_df.to_csv(episode_file_path)
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -204,6 +210,8 @@ def eval_policy(task_name,
     now_id = 0
     succ_seed = 0
     suc_test_seed_list = []
+
+    episode_results = {"num_steps": [], "success": []}
 
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
@@ -299,6 +307,8 @@ def eval_policy(task_name,
             if TASK_ENV.eval_success:
                 succ = True
                 break
+        episode_results["num_steps"].append(TASK_ENV.take_action_cnt)
+        episode_results["success"].append(succ)
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
@@ -324,7 +334,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, episode_results
 
 
 def parse_args_and_config():
