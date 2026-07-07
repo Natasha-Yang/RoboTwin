@@ -1,0 +1,20 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Add Parameters You Need
+train_config_name: pnull
+model_name: null
+checkpoint_id: 30000
+pi0_step: 50
+
+# Dataset collection parameters
+num_episodes: 100          # number of successful expert-checked rollouts to collect
+expert_check: true        # only roll out on seeds where the expert can solve the task
+output_dir: ./rollout_datasets   # where the HuggingFace dataset is saved (save_to_disk)
+hub_repo_id: NatashaYang/robotwin_pi05_rollouts_dataset         # e.g. "username/robotwin-rollouts"; required if push_to_hub is true
+push_to_hub: true        # push the built dataset to the HuggingFace Hub
