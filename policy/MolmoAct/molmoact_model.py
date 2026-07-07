@@ -16,7 +16,17 @@ class MolmoAct:
         self.checkpoint_path = checkpoint_path
         self.norm_tag = norm_tag
 
-        self.processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
+        # MolmoAct checkpoints exported with older Transformers versions store
+        # `extra_special_tokens` as a list. Transformers >= 4.56 expects that
+        # field to be a mapping and otherwise fails in
+        # `_set_model_specific_special_tokens` before loading the tokenizer.
+        # The tokens themselves remain registered in tokenizer.json, so ignore
+        # the obsolete metadata field rather than changing the vocabulary.
+        self.processor = AutoProcessor.from_pretrained(
+            checkpoint_path,
+            trust_remote_code=True,
+            extra_special_tokens={},
+        )
         self.policy = AutoModelForImageTextToText.from_pretrained(
             checkpoint_path,
             trust_remote_code=True,
@@ -43,9 +53,6 @@ class MolmoAct:
             img_arr[1],
             img_arr[2],
         )
-        # img_front = np.transpose(img_front, (2, 0, 1))
-        # img_right = np.transpose(img_right, (2, 0, 1))
-        # img_left = np.transpose(img_left, (2, 0, 1))
 
         self.observation_window = {
             "state": state,

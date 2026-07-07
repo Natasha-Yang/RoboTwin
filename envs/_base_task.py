@@ -231,7 +231,14 @@ class Base_Task(gym.Env):
             from sapien.render import set_global_config
             set_global_config(max_num_materials=50000, max_num_textures=50000)
             Base_Task._shared_engine = sapien.Engine()
-            Base_Task._shared_renderer = sapien.SapienRenderer()
+            # Pin the renderer to the CUDA-visible (SLURM-allocated) GPU. Without
+            # this, SAPIEN probes every Vulkan device on the node, which is slow
+            # and hangs / fails on busy multi-GPU nodes (it touches a GPU that is
+            # allocated to another job). Falls back to the default if unavailable.
+            try:
+                Base_Task._shared_renderer = sapien.SapienRenderer(device=sapien.Device("cuda:0"))
+            except Exception:
+                Base_Task._shared_renderer = sapien.SapienRenderer()
             Base_Task._shared_engine.set_renderer(Base_Task._shared_renderer)
             sapien.render.set_camera_shader_dir("rt")
             sapien.render.set_ray_tracing_samples_per_pixel(32)

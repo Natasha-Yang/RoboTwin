@@ -108,6 +108,19 @@ def run(TASK_ENV, args):
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
+    def is_fatal_cuda_error(error):
+        """CUDA execution faults poison the process and cannot be retried."""
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "cuda error: an illegal instruction",
+                "cuda error: an illegal memory access",
+                "cuda error: device-side assert",
+                "cuda error: unspecified launch failure",
+            )
+        )
+
     # =========== Collect Seed ===========
     os.makedirs(args["save_path"], exist_ok=True)
 
@@ -154,11 +167,19 @@ def run(TASK_ENV, args):
                     TASK_ENV.viewer.close()
                 time.sleep(0.3)
             except Exception as e:
-                # stack_trace = traceback.format_exc()
                 print(" -------------")
                 print(f"simulate data episode {suc_num} fail! (seed = {epid})")
                 print("Error: ", e)
+                traceback.print_exc()
                 print(" -------------")
+
+                # A CUDA execution fault leaves the context unusable. Closing
+                # the environment or trying another seed only produces more
+                # misleading failures, so preserve the original traceback and
+                # let Slurm mark the job failed.
+                if is_fatal_cuda_error(e):
+                    raise
+
                 fail_num += 1
                 TASK_ENV.close_env()
 
