@@ -83,6 +83,12 @@ explicit = true
 override-dependencies = [
     "torch==2.7.0",
     "torchvision==0.22.0",
+    # PyAV 14.4.0 was published sdist-only (no wheels on PyPI for any platform),
+    # forcing a source build against the system ffmpeg. On CVMFS/Gentoo clusters the
+    # only ffmpeg is 4.x (no `ch_layout`), so the build fails. 14.2.0 is the newest
+    # 14.x with prebuilt manylinux wheels (which bundle their own ffmpeg) and still
+    # satisfies lerobot's `av>=14.2.0`.
+    "av==14.2.0",
 ]
 
 [tool.uv.sources]
