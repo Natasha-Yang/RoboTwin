@@ -503,7 +503,7 @@ This fork carries its own **project-level Claude Code config** in `.claude/`
 they must never enter its history. Instead:
 
 - `.claude/conversations/` is a **separate PRIVATE git repo**
-  (`github.com/Natasha-Yang/robotwin-conversations`, SSH remote) and is
+  (`github.com/Natasha-Yang/RoboTwinConvos`, SSH remote) and is
   **gitignored** by the main repo (`/.claude/conversations/`). No submodule, no URL
   leak, no gitlink churn in the public fork.
 - Claude's live transcripts live in `~/.claude/projects/<path-hash>/` (the hash is
@@ -527,7 +527,7 @@ clone the private repo into place, then pull:
 
 ```bash
 git clone <main repo> && cd <repo>
-cd .claude && git clone git@github.com:Natasha-Yang/robotwin-conversations.git conversations
+cd .claude && git clone git@github.com:Natasha-Yang/RoboTwinConvos.git conversations
 cd .. && bash .claude/hooks/sync-conversations.sh pull
 ```
 
