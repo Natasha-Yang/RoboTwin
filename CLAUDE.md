@@ -17,6 +17,27 @@ new cluster.
 
 ---
 
+## Agent working notes (Claude — read first)
+
+- **Before a non-trivial edit to the simulation code**, invoke the **`/framework`**
+  skill first. It's a fast orientation to how the actual code fits together (task
+  envs in `envs/`, the base task, the motion/actor API, actor point system, configs,
+  and the collect/eval + policy-adapter contracts) so your edit matches existing
+  contracts instead of reinventing them. Load it whenever a request means writing or
+  substantially changing: a task env (`envs/*.py`), `envs/_base_task.py`, the
+  motion/actor utilities (`envs/utils/`, `envs/robot/`), a policy adapter
+  (`policy/*/deploy_policy.py`), a task config, or the collect/eval drivers
+  (`script/collect_data.py`, `script/eval_policy.py`). Skip it for pure
+  cluster/ops/sync changes — this file already covers those.
+- **Log files can be huge — never blindly read one into context.** Before opening
+  anything under `logs/` (or any `*.log` / `*.out` / `slurm-*` output), check its
+  size first (`ls -lh <file>`, `wc -l <file>`). Only read the whole file if it is
+  trivially small or the user explicitly asks for all of it; otherwise `tail` /
+  `head` / `grep` the relevant slice. Loading a multi-MB log burns the context
+  window for no benefit.
+
+---
+
 ## 0. Porting checklist (read first)
 
 When moving to a **new cluster**, the things that are environment-specific and
@@ -495,7 +516,9 @@ This fork carries its own **project-level Claude Code config** in `.claude/`
   the transcript's latest token counts; the trailing `/sync-claude` reminds you of
   the everyday sync skill.
 - **Skills** live in `.claude/skills/` (auto-discovered by Claude Code — a root
-  `skills/` would *not* be picked up): `sync-claude` (both stores), `sync-conversations`,
+  `skills/` would *not* be picked up): `framework` (fast orientation to the
+  simulation codebase; auto-loaded before non-trivial code edits — see "Agent
+  working notes" at the top), `sync-claude` (both stores), `sync-conversations`,
   `sync-memory`.
 
 ### State sync across machines (kept out of the public fork)
