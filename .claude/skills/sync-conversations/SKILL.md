@@ -11,32 +11,31 @@ repo** nested at `.claude/conversations/` (gitignored by the main public fork).
 store at `~/.claude/projects/<path-hash>/`. See `.claude/README.md` for the full
 design.
 
-Both actions must run from a **login node** (network required for push/pull); the
-compute nodes are offline.
+Runs from a **login node** (network required); compute nodes are offline.
 
-## Default action — SAVE (export + commit + push)
+## Default action — SYNC (bidirectional: pull AND push)
 
-Run this to back up the current machine's conversations to the private remote:
-
-```bash
-bash .claude/hooks/sync-conversations.sh save
-```
-
-This exports the live transcripts into `.claude/conversations/`, commits them
-(timestamp + hostname message, no-op if nothing changed), and pushes to `origin`.
-Report to the user whether anything was committed and whether the push succeeded.
-
-## PULL (fetch + import) — bring in conversations from other machines
-
-When the user wants conversations recorded elsewhere to be resumable here:
+Unless the user clearly wants one direction only, run the full bidirectional sync:
 
 ```bash
-bash .claude/hooks/sync-conversations.sh pull
+bash .claude/hooks/sync-conversations.sh sync
 ```
 
-This pulls the latest from the private remote and imports every transcript into
-this machine's live store. Afterward tell the user they can run `claude --resume`
-to pick a conversation.
+This exports this machine's live transcripts into `.claude/conversations/`, commits
+them, **pulls + merges** any transcripts pushed from other machines, imports the
+merged set back into the live store, and **always pushes** to `origin`. Report to
+the user what was committed, whether the pull brought anything in, and that the push
+succeeded. Every call ends with a push.
+
+## One-directional variants (only if the user asks)
+
+```bash
+bash .claude/hooks/sync-conversations.sh save   # push-only: export + commit + push
+bash .claude/hooks/sync-conversations.sh pull   # pull-only: fetch + import to live store
+```
+
+After a `pull`/`sync`, tell the user they can run `claude --resume` to pick up a
+conversation recorded on another machine.
 
 ## Guidance
 

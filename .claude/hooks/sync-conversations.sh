@@ -57,45 +57,73 @@ copy() { # copy *.jsonl from $1 to $2, only when newer or missing
   return 0
 }
 
+require_git_repo() {
+  if [ ! -d "$REPO_CONV/.git" ]; then
+    echo "error: $REPO_CONV is not a git repo. Clone the private conversations" >&2
+    echo "       repo there first (see .claude/README.md)." >&2
+    exit 1
+  fi
+}
+has_origin() { git -C "$REPO_CONV" remote get-url origin >/dev/null 2>&1; }
+
+git_commit_local() { # stage + commit whatever is in the nested repo; no-op if clean
+  git -C "$REPO_CONV" add -A
+  if git -C "$REPO_CONV" diff --cached --quiet; then
+    echo "conversations: nothing new to commit"
+  else
+    git -C "$REPO_CONV" commit -q -m "sync conversations: $(date -u +%Y-%m-%dT%H:%MZ) from $(hostname -s)"
+    echo "conversations: committed local changes."
+  fi
+}
+git_pull_remote() { # merge remote into local; tolerant of offline / first push
+  has_origin || { echo "conversations: no 'origin' remote — skipping pull." >&2; return 0; }
+  local br; br="$(git -C "$REPO_CONV" branch --show-current)"
+  git -C "$REPO_CONV" pull -q --no-edit origin "$br" 2>/dev/null \
+    && echo "conversations: pulled remote changes." \
+    || echo "conversations: pull skipped (offline, no upstream yet, or nothing to pull)."
+}
+git_push_remote() {
+  has_origin || { echo "conversations: no 'origin' remote — commit saved locally only." >&2; return 0; }
+  git -C "$REPO_CONV" push -q origin HEAD \
+    && echo "conversations: pushed to origin." \
+    || echo "conversations: push failed (offline, or the remote repo doesn't exist yet)." >&2
+}
+
 case "$DIRECTION" in
+  # low-level file copies (network-free); used by the SessionStart/SessionEnd hooks.
   export) copy "$LIVE_DIR" "$REPO_CONV" ;;
   import) copy "$REPO_CONV" "$LIVE_DIR" ;;
 
-  # save: export live -> nested repo, then commit + push the PRIVATE repo.
-  # Requires network (run from a login node). No-op commit if nothing changed.
-  save)
-    copy "$LIVE_DIR" "$REPO_CONV"
-    if [ ! -d "$REPO_CONV/.git" ]; then
-      echo "error: $REPO_CONV is not a git repo. Clone the private conversations" >&2
-      echo "       repo there first (see .claude/README.md)." >&2
-      exit 1
-    fi
-    git -C "$REPO_CONV" add -A
-    if git -C "$REPO_CONV" diff --cached --quiet; then
-      echo "conversations: nothing new to save"
-    else
-      git -C "$REPO_CONV" commit -q -m "sync conversations: $(date -u +%Y-%m-%dT%H:%MZ) from $(hostname -s)"
-      echo "conversations: committed."
-    fi
-    if git -C "$REPO_CONV" remote get-url origin >/dev/null 2>&1; then
-      git -C "$REPO_CONV" push -q origin HEAD && echo "conversations: pushed to origin."
-    else
-      echo "conversations: no 'origin' remote set — commit saved locally only." >&2
-    fi
+  # sync (DEFAULT for the /sync-conversations skill): fully bidirectional.
+  # export local -> commit -> pull+merge remote -> import merged set -> PUSH.
+  # Every call ends with a push. Run from a login node (needs network).
+  sync)
+    require_git_repo
+    copy "$LIVE_DIR" "$REPO_CONV"   # capture this machine's live transcripts
+    git_commit_local                # commit them
+    git_pull_remote                 # merge in other machines' transcripts
+    copy "$REPO_CONV" "$LIVE_DIR"   # push merged set back into the live store
+    git_push_remote                 # always push
+    echo "conversations: sync complete (pulled + pushed)."
     ;;
 
-  # pull: fetch the latest from the private repo, then import into the live store.
+  # save: push-only (export local -> commit -> push). Skips the pull step.
+  save)
+    require_git_repo
+    copy "$LIVE_DIR" "$REPO_CONV"
+    git_commit_local
+    git_push_remote
+    ;;
+
+  # pull: pull-only (fetch remote -> import to live store).
   pull)
-    if [ -d "$REPO_CONV/.git" ] && git -C "$REPO_CONV" remote get-url origin >/dev/null 2>&1; then
-      git -C "$REPO_CONV" pull -q --ff-only origin HEAD 2>/dev/null \
-        || git -C "$REPO_CONV" pull -q origin "$(git -C "$REPO_CONV" branch --show-current)" \
-        || echo "conversations: pull skipped (offline or no upstream)"
-    fi
+    require_git_repo
+    git_pull_remote
     copy "$REPO_CONV" "$LIVE_DIR"
     echo "conversations: imported into live store — use 'claude --resume'."
     ;;
 
-  *) echo "usage: sync-conversations.sh [export|import|save|pull]" >&2; exit 2 ;;
+  *) echo "usage: sync-conversations.sh [sync|save|pull|export|import]" >&2; exit 2 ;;
 esac
 
 exit 0

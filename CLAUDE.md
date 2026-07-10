@@ -509,16 +509,17 @@ they must never enter its history. Instead:
 - Claude's live transcripts live in `~/.claude/projects/<path-hash>/` (the hash is
   derived from the repo's absolute path, so it differs per machine).
   `.claude/hooks/sync-conversations.sh` bridges the two:
+  - `sync` — **bidirectional (default for the `/sync-conversations` skill)**: export
+    local + commit + pull/merge remote + import + **push**. Every call ends with a push.
+  - `save` — push-only (export + commit + push).
+  - `pull` — pull-only (fetch + import into the live store), then `claude --resume`.
   - `export` / `import` — plain file copies (network-free; the SessionEnd/SessionStart
     hooks call these automatically).
-  - `save` — export + commit + **push** the private repo (login node only).
-  - `pull` — fetch the private repo + import into the live store, then `claude --resume`.
 
-**Save/sync from a login node** (or just run the `/sync-conversations` skill):
+**Sync from a login node** (or just run the `/sync-conversations` skill):
 
 ```bash
-bash .claude/hooks/sync-conversations.sh save   # this machine -> private repo
-bash .claude/hooks/sync-conversations.sh pull   # private repo -> this machine
+bash .claude/hooks/sync-conversations.sh sync   # bidirectional: pull + push
 ```
 
 **Fresh clone on a new machine** — the main clone does NOT contain conversations;
@@ -545,8 +546,7 @@ cd .. && bash .claude/hooks/sync-conversations.sh pull
 source setup_env.sh                     # every session/job
 
 # --- claude conversation sync (login node) ---
-bash .claude/hooks/sync-conversations.sh save   # or run the /sync-conversations skill
-bash .claude/hooks/sync-conversations.sh pull   # then: claude --resume
+bash .claude/hooks/sync-conversations.sh sync   # bidirectional (or run /sync-conversations)
 
 # --- data collection ---
 bash collect_data.sh beat_block_hammer demo_randomized 0
