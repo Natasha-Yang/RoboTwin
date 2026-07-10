@@ -8,59 +8,69 @@ path or the machine's GPU/deps.
 
 | Path | Purpose |
 |---|---|
-| `settings.json` | Project settings: default model `opus`, default mode `acceptEdits` ("auto"), custom status line, and conversation-sync hooks. |
-| `statusline.sh` | Status line renderer → `auto · Opus 4.8 · ctx 45.1k/200k (23%)` (mode · model · context usage). |
-| `hooks/sync-conversations.sh` | Syncs transcripts between the local store and `conversations/`. |
-| `conversations/` | Conversation transcripts (`*.jsonl`), tracked in a **separate private git repo** — **gitignored** by this (public) repo. See below. |
-| `skills/` | Project skills (auto-discovered). See `skills/README.md`. |
+| `settings.json` | Project settings: default model `opus`, default mode `acceptEdits` ("auto"), custom status line, and conversation/memory sync hooks. |
+| `statusline.sh` / `.py` | Status line renderer → `auto · Opus 4.8 · ctx 45.1k/200k (23%) · /sync-claude` (mode · model · context usage · skill hint). |
+| `hooks/sync-store.sh` | Generic sync engine (bidirectional git-backed sync of a Claude "store"). |
+| `hooks/sync-conversations.sh`, `hooks/sync-memory.sh` | Thin wrappers over `sync-store.sh` for the two stores. |
+| `conversations/` | Conversation transcripts (`*.jsonl`) — **separate private git repo**, **gitignored** here. |
+| `memory/` | Project memory (`*.md`, incl. `MEMORY.md`) — **separate private git repo**, **gitignored** here. |
+| `skills/` | Project skills (auto-discovered): `sync-claude`, `sync-conversations`, `sync-memory`. See `skills/README.md`. |
 
 ## Settings applied
 
 - **Model:** `opus` (newest Opus) by default.
 - **Mode:** `acceptEdits` — "auto" mode, so edits apply without a prompt. Cycle
   modes anytime with `Shift+Tab`.
-- **Status line:** shows current mode, model, and live context-window usage.
+- **Status line:** shows current mode, model, live context-window usage, and the
+  `/sync-claude` reminder.
 
-## Resuming conversations across machines (without exposing them)
+## Syncing portable Claude state across machines (without exposing it)
 
-This repo's `origin` is a **public GitHub fork**, and transcripts leak absolute
-paths, command output, and sometimes secrets — so they must **never** enter this
-repo's history. Instead, `.claude/conversations/` is:
+This repo's `origin` is a **public GitHub fork**, and both conversation transcripts
+and memory can leak absolute paths, command output, and sometimes secrets — so they
+must **never** enter this repo's history. Each is kept as its **own separate private
+git repo**, nested here and **gitignored** by this repo:
 
-- **gitignored** by this repo (see `.gitignore`), and
-- **its own separate private git repo** with its own private remote.
+| Store | Nested path | Live store on each machine | Private remote |
+|---|---|---|---|
+| conversations | `.claude/conversations/` | `~/.claude/projects/<path-hash>/*.jsonl` | `RoboTwinConvos` |
+| memory | `.claude/memory/` | `~/.claude/projects/<path-hash>/memory/*.md` | `RoboTwinMemory` |
 
-The main repo therefore has *zero* reference to conversations — no content, no
-submodule, no URL. The two repos are fully decoupled.
+The public repo has *zero* reference to either — no content, no submodule, no URL.
+The `<path-hash>` is derived from the repo's absolute path, so it differs per
+machine; the hooks bridge that machine-specific live store and the portable nested
+repos:
 
-Claude stores live transcripts in `~/.claude/projects/<path-hash>/`, where the hash
-is derived from the repo's absolute path (differs per machine). The hooks bridge
-that store and the nested `conversations/` repo:
+- **`SessionStart` → `import`** (both stores): copies into this machine's live store
+  (conversations appear in `claude --resume`; memory is live for new sessions).
+- **`SessionEnd` → `export`** (both stores): copies this machine's live state into
+  the nested repos, ready to commit. (Network-free file copies.)
 
-- **`SessionStart` → `import`**: copies conversations into this machine's live
-  store, so they appear in `claude --resume`.
-- **`SessionEnd` → `export`**: copies this machine's transcripts into
-  `conversations/` (as untracked files in the nested repo) ready to commit.
+### Everyday sync (from a login node — needs network)
+
+Run the **`/sync-claude`** skill, or:
+
+```bash
+bash .claude/hooks/sync-conversations.sh sync   # bidirectional: pull + push
+bash .claude/hooks/sync-memory.sh sync          # bidirectional: pull + push
+```
+
+`sync` = export live → commit → pull/merge other machines' state → import → **push**.
+Per-store `save` (push-only) and `pull` (pull-only) variants also exist.
 
 ### First-time setup on a new machine
 
-```bash
-git clone <this repo>            # main repo — does NOT include conversations
-cd <repo>/.claude
-git clone <PRIVATE conversations remote> conversations   # the nested private repo
-```
-
-### Saving / syncing conversations (from a login node — needs network)
+The main clone contains **neither** store; clone each private repo into place:
 
 ```bash
-# export live -> nested repo, then commit + push the PRIVATE repo:
-bash .claude/hooks/sync-conversations.sh export
-cd .claude/conversations && git add -A && git commit -m "save conversations" && git push
+git clone git@github.com:Natasha-Yang/RoboTwin.git && cd RoboTwin
+cd .claude
+git clone git@github.com:Natasha-Yang/RoboTwinConvos.git  conversations
+git clone git@github.com:Natasha-Yang/RoboTwinMemory.git  memory
+cd .. && bash .claude/hooks/sync-conversations.sh pull && bash .claude/hooks/sync-memory.sh pull
 ```
 
-On another machine: `cd .claude/conversations && git pull`, then start Claude once
-(SessionStart imports them) and `claude --resume` lists them.
-
-> Compute nodes are offline — only *record* there; commit/push the conversations
-> repo from a login node. The `export`/`import` hooks are network-free file copies
-> and run fine anywhere.
+> Compute nodes are offline — only *record* there; commit/push from a login node.
+> The `export`/`import` hooks are network-free and run fine anywhere.
+> `gh`'s API can't see these private repos (fine-grained PAT scope), but the sync
+> uses git-over-SSH, which works.

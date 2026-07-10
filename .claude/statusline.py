@@ -59,7 +59,8 @@ def human(n):
 
 
 # Frequently-used skill hint, shown as a reminder of the slash command.
-SKILL_HINT = "/sync-conversations"
+# /sync-claude syncs both conversations + memory (bidirectional).
+SKILL_HINT = "/sync-claude"
 
 parts = []
 if mode_label:

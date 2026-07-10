@@ -481,7 +481,7 @@ see the upstream docs for their specific fine-tuning setup.
 
 ---
 
-## 8. Claude Code setup & conversation sync (this fork)
+## 8. Claude Code setup & state sync (this fork)
 
 This fork carries its own **project-level Claude Code config** in `.claude/`
 (checked into git, so every clone on every machine behaves the same). See
@@ -489,53 +489,62 @@ This fork carries its own **project-level Claude Code config** in `.claude/`
 
 - **`.claude/settings.json`** — default model `opus`, default mode `acceptEdits`
   ("auto", edits apply without a prompt; `Shift+Tab` cycles modes), a custom status
-  line, and `SessionStart`/`SessionEnd` hooks for conversation sync.
+  line, and `SessionStart`/`SessionEnd` hooks that import/export both sync stores.
 - **Status line** (`.claude/statusline.sh` → `.claude/statusline.py`) renders
-  `mode · model · ctx <used>/200k (pct) · /sync-conversations`. Context usage is
-  read from the transcript's latest token counts; the trailing `/sync-conversations`
-  is a reminder of the frequently-used skill.
+  `mode · model · ctx <used>/200k (pct) · /sync-claude`. Context usage is read from
+  the transcript's latest token counts; the trailing `/sync-claude` reminds you of
+  the everyday sync skill.
 - **Skills** live in `.claude/skills/` (auto-discovered by Claude Code — a root
-  `skills/` would *not* be picked up). Current skill: `sync-conversations`.
+  `skills/` would *not* be picked up): `sync-claude` (both stores), `sync-conversations`,
+  `sync-memory`.
 
-### Conversation sync across machines (kept out of the public fork)
+### State sync across machines (kept out of the public fork)
 
-`origin` is a **public** GitHub fork, and transcripts leak paths/output/secrets, so
-they must never enter its history. Instead:
+`origin` is a **public** GitHub fork, and both conversation transcripts and memory
+leak paths/output/secrets, so they must never enter its history. Each portable store
+is its **own separate PRIVATE git repo**, nested here and **gitignored** by the main
+repo (no submodule, no URL leak, no gitlink churn):
 
-- `.claude/conversations/` is a **separate PRIVATE git repo**
-  (`github.com/Natasha-Yang/RoboTwinConvos`, SSH remote) and is
-  **gitignored** by the main repo (`/.claude/conversations/`). No submodule, no URL
-  leak, no gitlink churn in the public fork.
-- Claude's live transcripts live in `~/.claude/projects/<path-hash>/` (the hash is
-  derived from the repo's absolute path, so it differs per machine).
-  `.claude/hooks/sync-conversations.sh` bridges the two:
-  - `sync` — **bidirectional (default for the `/sync-conversations` skill)**: export
-    local + commit + pull/merge remote + import + **push**. Every call ends with a push.
+| Store | Nested path (gitignored) | Live store per machine | Private remote (SSH) |
+|---|---|---|---|
+| conversations | `.claude/conversations/` | `~/.claude/projects/<path-hash>/*.jsonl` | `Natasha-Yang/RoboTwinConvos` |
+| memory | `.claude/memory/` | `~/.claude/projects/<path-hash>/memory/*.md` | `Natasha-Yang/RoboTwinMemory` |
+
+The `<path-hash>` is derived from the repo's absolute path (differs per machine).
+`.claude/hooks/sync-store.sh` is the engine; `sync-conversations.sh` / `sync-memory.sh`
+are thin wrappers. Each supports:
+  - `sync` — **bidirectional (default for the sync skills)**: export local + commit +
+    pull/merge remote + import + **push**. Every call ends with a push.
   - `save` — push-only (export + commit + push).
-  - `pull` — pull-only (fetch + import into the live store), then `claude --resume`.
+  - `pull` — pull-only (fetch + import into the live store).
   - `export` / `import` — plain file copies (network-free; the SessionEnd/SessionStart
-    hooks call these automatically).
+    hooks call these automatically for both stores).
 
-**Sync from a login node** (or just run the `/sync-conversations` skill):
+**Everyday sync from a login node** (or just run the `/sync-claude` skill):
 
 ```bash
 bash .claude/hooks/sync-conversations.sh sync   # bidirectional: pull + push
+bash .claude/hooks/sync-memory.sh sync          # bidirectional: pull + push
 ```
 
-**Fresh clone on a new machine** — the main clone does NOT contain conversations;
-clone the private repo into place, then pull:
+**Fresh clone on a new machine** — the main clone contains NEITHER store; clone each
+private repo into place, then pull:
 
 ```bash
-git clone <main repo> && cd <repo>
-cd .claude && git clone git@github.com:Natasha-Yang/RoboTwinConvos.git conversations
-cd .. && bash .claude/hooks/sync-conversations.sh pull
+git clone git@github.com:Natasha-Yang/RoboTwin.git && cd RoboTwin
+cd .claude
+git clone git@github.com:Natasha-Yang/RoboTwinConvos.git conversations
+git clone git@github.com:Natasha-Yang/RoboTwinMemory.git  memory
+cd .. && bash .claude/hooks/sync-conversations.sh pull && bash .claude/hooks/sync-memory.sh pull
 ```
 
-> **Porting note:** the conversations remote URL is Natasha's private repo. On a new
-> account/cluster, create your own private repo and point
-> `.claude/conversations`'s `origin` at it. `gh` isn't a cluster module (the
-> `gh/0.18.0` module is a different tool) — install the static binary into `~/bin`
-> from https://github.com/cli/cli/releases if you want the `gh` CLI.
+> **Porting note:** the remote URLs are Natasha's private repos. On a new
+> account/cluster, create your own private repos and point each nested repo's
+> `origin` at them. `gh` isn't a cluster module (the `gh/0.18.0` module is a
+> different tool) — install the static binary into `~/bin` from
+> https://github.com/cli/cli/releases if you want the `gh` CLI. A fine-grained PAT
+> can't create repos or be seen by `gh`'s API here; git-over-SSH is what the sync
+> uses.
 
 ---
 
@@ -545,8 +554,9 @@ cd .. && bash .claude/hooks/sync-conversations.sh pull
 # --- setup (login node) ---
 source setup_env.sh                     # every session/job
 
-# --- claude conversation sync (login node) ---
-bash .claude/hooks/sync-conversations.sh sync   # bidirectional (or run /sync-conversations)
+# --- claude state sync (login node) ---  (or run the /sync-claude skill)
+bash .claude/hooks/sync-conversations.sh sync   # transcripts: bidirectional pull+push
+bash .claude/hooks/sync-memory.sh sync          # memory:      bidirectional pull+push
 
 # --- data collection ---
 bash collect_data.sh beat_block_hammer demo_randomized 0

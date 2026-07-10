@@ -11,6 +11,8 @@ repo** nested at `.claude/conversations/` (gitignored by the main public fork).
 store at `~/.claude/projects/<path-hash>/`. See `.claude/README.md` for the full
 design.
 
+To sync conversations AND memory together in one step, prefer `/sync-claude`.
+
 Runs from a **login node** (network required); compute nodes are offline.
 
 ## Default action — SYNC (bidirectional: pull AND push)

@@ -37,7 +37,7 @@ cluster/render_check*.png
 *.log
 logs/
 
-# Claude conversation transcripts are tracked in a SEPARATE private repo
-# nested at .claude/conversations/ (see .claude/README.md). Never let them
-# enter this public fork's history.
+# Claude conversations + memory are each tracked in a SEPARATE private repo
+# nested here (see .claude/README.md). Never let them enter this public fork.
 /.claude/conversations/
+/.claude/memory/
