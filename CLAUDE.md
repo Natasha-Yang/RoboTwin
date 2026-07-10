@@ -548,7 +548,18 @@ are thin wrappers. Each supports:
 ```bash
 bash .claude/hooks/sync-conversations.sh sync   # bidirectional: pull + push
 bash .claude/hooks/sync-memory.sh sync          # bidirectional: pull + push
+bash .claude/hooks/sync-claude-config.sh        # .claude/** + CLAUDE.md -> main AND cluster
 ```
+
+The third command is the **config propagator**: the two private stores above never
+enter the public fork, but the tracked Claude utility files (`.claude/**` skills /
+hooks / `settings.json` / statusline, plus `CLAUDE.md`) *do* live in the public repo
+and were only ever committed on the `cluster` branch — so `main` drifted behind.
+`sync-claude-config.sh` commits **only** those config paths onto **both** `main` and
+`cluster` (using a throwaway git worktree for whichever branch isn't checked out) and
+pushes each, without merging unrelated branch work or disturbing your other
+uncommitted changes. `/sync-claude` runs all three. Pass `--no-push` to stage without
+pushing.
 
 **Fresh clone on a new machine** — the main clone contains NEITHER store; clone each
 private repo into place, then pull:
@@ -580,6 +591,7 @@ source setup_env.sh                     # every session/job
 # --- claude state sync (login node) ---  (or run the /sync-claude skill)
 bash .claude/hooks/sync-conversations.sh sync   # transcripts: bidirectional pull+push
 bash .claude/hooks/sync-memory.sh sync          # memory:      bidirectional pull+push
+bash .claude/hooks/sync-claude-config.sh        # .claude/** + CLAUDE.md -> main AND cluster
 
 # --- data collection ---
 bash collect_data.sh beat_block_hammer demo_randomized 0
