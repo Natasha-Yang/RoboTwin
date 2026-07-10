@@ -34,3 +34,10 @@ policy/*/training_data/*
 cluster/render_check*.png
 
 *.out
+*.log
+logs/
+
+# Claude conversation transcripts are tracked in a SEPARATE private repo
+# nested at .claude/conversations/ (see .claude/README.md). Never let them
+# enter this public fork's history.
+/.claude/conversations/
