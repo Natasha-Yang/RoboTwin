@@ -58,9 +58,13 @@ def human(n):
     return f"{n/1000:.1f}k" if n >= 1000 else str(n)
 
 
+# Frequently-used skill hint, shown as a reminder of the slash command.
+SKILL_HINT = "/sync-conversations"
+
 parts = []
 if mode_label:
     parts.append(mode_label)
 parts.append(model)
 parts.append(f"ctx {human(used)}/{human(WINDOW)} ({pct}%)")
+parts.append(SKILL_HINT)
 print(" · ".join(parts))

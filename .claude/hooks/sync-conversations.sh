@@ -60,7 +60,42 @@ copy() { # copy *.jsonl from $1 to $2, only when newer or missing
 case "$DIRECTION" in
   export) copy "$LIVE_DIR" "$REPO_CONV" ;;
   import) copy "$REPO_CONV" "$LIVE_DIR" ;;
-  *) echo "usage: sync-conversations.sh [export|import]" >&2; exit 2 ;;
+
+  # save: export live -> nested repo, then commit + push the PRIVATE repo.
+  # Requires network (run from a login node). No-op commit if nothing changed.
+  save)
+    copy "$LIVE_DIR" "$REPO_CONV"
+    if [ ! -d "$REPO_CONV/.git" ]; then
+      echo "error: $REPO_CONV is not a git repo. Clone the private conversations" >&2
+      echo "       repo there first (see .claude/README.md)." >&2
+      exit 1
+    fi
+    git -C "$REPO_CONV" add -A
+    if git -C "$REPO_CONV" diff --cached --quiet; then
+      echo "conversations: nothing new to save"
+    else
+      git -C "$REPO_CONV" commit -q -m "sync conversations: $(date -u +%Y-%m-%dT%H:%MZ) from $(hostname -s)"
+      echo "conversations: committed."
+    fi
+    if git -C "$REPO_CONV" remote get-url origin >/dev/null 2>&1; then
+      git -C "$REPO_CONV" push -q origin HEAD && echo "conversations: pushed to origin."
+    else
+      echo "conversations: no 'origin' remote set — commit saved locally only." >&2
+    fi
+    ;;
+
+  # pull: fetch the latest from the private repo, then import into the live store.
+  pull)
+    if [ -d "$REPO_CONV/.git" ] && git -C "$REPO_CONV" remote get-url origin >/dev/null 2>&1; then
+      git -C "$REPO_CONV" pull -q --ff-only origin HEAD 2>/dev/null \
+        || git -C "$REPO_CONV" pull -q origin "$(git -C "$REPO_CONV" branch --show-current)" \
+        || echo "conversations: pull skipped (offline or no upstream)"
+    fi
+    copy "$REPO_CONV" "$LIVE_DIR"
+    echo "conversations: imported into live store — use 'claude --resume'."
+    ;;
+
+  *) echo "usage: sync-conversations.sh [export|import|save|pull]" >&2; exit 2 ;;
 esac
 
 exit 0

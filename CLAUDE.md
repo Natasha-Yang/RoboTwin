@@ -25,7 +25,7 @@ must be re-checked are:
 1. **Paths** — the repo currently hardcodes `/project/6028519/natashay/RoboTwin`
    (repo root) and `/project/6028519/natashay/miniforge3` (conda). Grep and update:
    `grep -rn "6028519/natashay" setup_env.sh cluster/ policy/`.
-2. **SLURM account + partition** — `--account=def-florian7_gpu` and
+2. **SLURM account + partition** — `--account=rrg-florian7_gpu` and
    `--gpus-per-node=h100:1` in `cluster/robotwin_gpu.sh` and `cluster/rollout.sh`.
 3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `9.0` (H100 / sm_90).
    Set to your GPU's compute capability (A100 = `8.0`, RTX 4090 = `8.9`, …).
@@ -93,6 +93,23 @@ export FORCE_CUDA=1                # force the CUDA build on the GPU-less login 
 
 Then run the curobo/pytorch3d `pip install` steps. `torch` ships its own CUDA
 runtime, so you do **not** load the cuda module at *run* time — only for compiling.
+
+> **Rorqual only — build curobo with `cuda/12.6`, not `cuda/12.2`.** On Rorqual
+> (H100, driver 580.x) curobo kernels compiled with `cuda/12.2` throw
+> `CUDA error: an illegal instruction was encountered` (CUDA error 715) at kernel
+> launch during `motion_gen.warmup()` — even though the SASS is the correct `sm_90`
+> and plain torch CUDA works fine. Rebuilding the curobo CUDA extensions with
+> `cuda/12.6` fixes it. So on Rorqual, `module load cuda/12.6` for the curobo build
+> above. (This is Rorqual-specific; on Fir `cuda/12.2` was fine. See §7.) To rebuild
+> just curobo in place:
+>
+> ```bash
+> cd envs/curobo
+> module load cuda/12.6; export CUDA_HOME=$EBROOTCUDA
+> export TORCH_CUDA_ARCH_LIST=9.0 FORCE_CUDA=1
+> rm -f src/curobo/curobolib/*.so && rm -rf build   # clean, so no stale kernels linger
+> pip install -e . --no-build-isolation --no-deps --force-reinstall
+> ```
 
 ### 1.3 SAPIEN / Vulkan headless rendering
 
@@ -304,6 +321,37 @@ you want the lint/test tools. You don't need the `third_party/aloha` /
 ALOHA and LIBERO. The resulting `.venv` is what `eval.sh` activates and `finetune.sh`
 runs through `uv run`.
 
+> **`uv sync` gotchas on a CVMFS/Gentoo cluster (hit on Rorqual).** A few deps have
+> no prebuilt wheel for this platform and build from source, and the CVMFS toolchain
+> trips them up. If `uv sync` fails, check these:
+>
+> - **`evdev` (via `lerobot → pynput → evdev`) — needs kernel headers.** `evdev`
+>   is sdist-only, so it compiles against `linux/input.h`, which isn't on the default
+>   include path here (the failure prints *"The 'linux/input.h' … include files are
+>   missing"*). The headers exist in CVMFS — export before syncing (do this **every**
+>   sync; there is no evdev wheel to avoid the source build):
+>   ```bash
+>   export CPATH=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/include:$CPATH
+>   export C_INCLUDE_PATH=$CPATH
+>   ```
+> - **`av==14.4.0` is a broken release — sdist-only, zero wheels on PyPI.** With no
+>   wheel, uv builds PyAV from source against the CVMFS system ffmpeg (4.x), which
+>   lacks `ch_layout` → build error *"'AVCodecParameters' has no member named
+>   'ch_layout'"*. Fix: pin `av` to a version whose manylinux wheels exist (they
+>   bundle their own ffmpeg 7.x, so no system ffmpeg is needed). **14.2.0** is the
+>   newest 14.x with wheels and still satisfies lerobot's `av>=14.2.0`. This repo
+>   pins it via `[tool.uv].override-dependencies` in `pyproject.toml` **and** the
+>   `av` entry in `uv.lock` was edited to 14.2.0 + wheels (see next bullet for why
+>   the lock was hand-edited).
+> - **IPv6 is broken on Rorqual login nodes → `uv lock` hangs.** `curl -6` can't
+>   resolve/route but `curl -4` works; uv (reqwest) stalls on IPv6 while fetching the
+>   `download.pytorch.org` index during resolution, so `uv lock` times out with
+>   *"operation timed out"* on `download.pytorch.org/whl/cu128/...`. Direct wheel
+>   **downloads** still succeed over IPv4, so `uv sync --frozen` (install the lock
+>   as-is, no re-resolution) works fine — which is why the `av` bump was applied by
+>   hand-editing `uv.lock` rather than running `uv lock`. If you must re-resolve,
+>   force IPv4 first.
+
 Training configs are registered in
 `policy/pi05/src/openpi/training/config.py`. Existing RoboTwin entries include
 `pi05_base_aloha_lora`, `pi05_aloha_full_base`, `pi0_base_aloha_robotwin_lora`,
@@ -416,6 +464,13 @@ see the upstream docs for their specific fine-tuning setup.
 - **`setuptools==69.5.1`**: pinned for SAPIEN's `pkg_resources`. Don't upgrade.
 - **Warp cache**: always node-local (`$SLURM_TMPDIR`); a shared cache across
   drivers causes illegal-instruction CUDA crashes.
+- **Rorqual: build curobo with `cuda/12.6`** (H100, driver 580.x). curobo kernels
+  built with `cuda/12.2` throw `CUDA error: an illegal instruction was encountered`
+  (error 715) at launch inside `motion_gen.warmup()` (e.g. `lbfgs_step_cu.forward`),
+  while plain torch CUDA is fine — the `12.2` ptxas emits `sm_90` SASS this driver
+  rejects. Fix = clean-rebuild curobo's CUDA extensions with `cuda/12.6` (§1.2).
+  Note this is a *different* illegal-instruction cause than the Warp cache one above.
+  **Rorqual-specific**; Fir built fine with `cuda/12.2`.
 - **`module load` in a pipe**: never `module load ... | ...` — the pipe subshells it
   and the env is lost.
 - **`$0` under sbatch** is a spooled copy — resolve the repo root via
@@ -426,11 +481,72 @@ see the upstream docs for their specific fine-tuning setup.
 
 ---
 
-## 8. Quick reference
+## 8. Claude Code setup & conversation sync (this fork)
+
+This fork carries its own **project-level Claude Code config** in `.claude/`
+(checked into git, so every clone on every machine behaves the same). See
+`.claude/README.md` for the full write-up. Summary:
+
+- **`.claude/settings.json`** — default model `opus`, default mode `acceptEdits`
+  ("auto", edits apply without a prompt; `Shift+Tab` cycles modes), a custom status
+  line, and `SessionStart`/`SessionEnd` hooks for conversation sync.
+- **Status line** (`.claude/statusline.sh` → `.claude/statusline.py`) renders
+  `mode · model · ctx <used>/200k (pct) · /sync-conversations`. Context usage is
+  read from the transcript's latest token counts; the trailing `/sync-conversations`
+  is a reminder of the frequently-used skill.
+- **Skills** live in `.claude/skills/` (auto-discovered by Claude Code — a root
+  `skills/` would *not* be picked up). Current skill: `sync-conversations`.
+
+### Conversation sync across machines (kept out of the public fork)
+
+`origin` is a **public** GitHub fork, and transcripts leak paths/output/secrets, so
+they must never enter its history. Instead:
+
+- `.claude/conversations/` is a **separate PRIVATE git repo**
+  (`github.com/Natasha-Yang/robotwin-conversations`, SSH remote) and is
+  **gitignored** by the main repo (`/.claude/conversations/`). No submodule, no URL
+  leak, no gitlink churn in the public fork.
+- Claude's live transcripts live in `~/.claude/projects/<path-hash>/` (the hash is
+  derived from the repo's absolute path, so it differs per machine).
+  `.claude/hooks/sync-conversations.sh` bridges the two:
+  - `export` / `import` — plain file copies (network-free; the SessionEnd/SessionStart
+    hooks call these automatically).
+  - `save` — export + commit + **push** the private repo (login node only).
+  - `pull` — fetch the private repo + import into the live store, then `claude --resume`.
+
+**Save/sync from a login node** (or just run the `/sync-conversations` skill):
+
+```bash
+bash .claude/hooks/sync-conversations.sh save   # this machine -> private repo
+bash .claude/hooks/sync-conversations.sh pull   # private repo -> this machine
+```
+
+**Fresh clone on a new machine** — the main clone does NOT contain conversations;
+clone the private repo into place, then pull:
+
+```bash
+git clone <main repo> && cd <repo>
+cd .claude && git clone git@github.com:Natasha-Yang/robotwin-conversations.git conversations
+cd .. && bash .claude/hooks/sync-conversations.sh pull
+```
+
+> **Porting note:** the conversations remote URL is Natasha's private repo. On a new
+> account/cluster, create your own private repo and point
+> `.claude/conversations`'s `origin` at it. `gh` isn't a cluster module (the
+> `gh/0.18.0` module is a different tool) — install the static binary into `~/bin`
+> from https://github.com/cli/cli/releases if you want the `gh` CLI.
+
+---
+
+## 9. Quick reference
 
 ```bash
 # --- setup (login node) ---
 source setup_env.sh                     # every session/job
+
+# --- claude conversation sync (login node) ---
+bash .claude/hooks/sync-conversations.sh save   # or run the /sync-conversations skill
+bash .claude/hooks/sync-conversations.sh pull   # then: claude --resume
 
 # --- data collection ---
 bash collect_data.sh beat_block_hammer demo_randomized 0
