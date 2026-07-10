@@ -79,8 +79,9 @@ propagate_via_worktree() { # make branch $1 match the current config files
         || echo "config[$br]: push failed (offline or remote diverged)." >&2
     fi
   fi
-  git worktree remove -q --force "$wt" 2>/dev/null || rm -rf "$wt"
-  git worktree prune -q 2>/dev/null || true
+  # NB: this git's `worktree remove`/`prune` don't accept `-q` — keep them plain.
+  git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  git worktree prune >/dev/null 2>&1 || true
 }
 
 for br in "${BRANCHES[@]}"; do
