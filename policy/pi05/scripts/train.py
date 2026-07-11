@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import json
 import logging
 import platform
 from typing import Any
@@ -21,6 +22,7 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.episode_selection as _episode_selection
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -223,6 +225,47 @@ def train_step(
     return new_state, info
 
 
+def resolve_episode_subset(config: _config.TrainConfig, *, resuming: bool) -> _config.TrainConfig:
+    """If episodes_per_task is set, select (or reload on resume) the per-task episode subset,
+    log it to the checkpoint dir, and return a config whose data pipeline is restricted to it."""
+    if config.episodes_per_task is None:
+        return config
+
+    repo_id = config.data.repo_id
+    if repo_id is None or repo_id == "fake":
+        raise ValueError(f"--episodes_per_task requires a real LeRobot repo_id, got {repo_id!r}.")
+
+    selection_path = config.checkpoint_dir / "selected_episodes.json"
+    if resuming and selection_path.exists():
+        # Reuse the exact subset from the original run so resumed training sees identical data.
+        payload = json.loads(selection_path.read_text())
+        selected = list(payload["selected_episodes"])
+        logging.info(f"Reloaded episode subset from {selection_path}: {len(selected)} episodes.")
+    else:
+        selected, per_task = _episode_selection.select_episodes_per_task(
+            repo_id, config.episodes_per_task, config.seed
+        )
+        payload = {
+            "repo_id": repo_id,
+            "episodes_per_task": config.episodes_per_task,
+            "seed": config.seed,
+            "num_tasks": len(per_task),
+            "total_selected": len(selected),
+            "selected_episodes": selected,
+            "per_task": {str(k): v for k, v in per_task.items()},
+        }
+        selection_path.write_text(json.dumps(payload, indent=2))
+        logging.info(
+            f"Selected {len(selected)} episodes across {len(per_task)} tasks "
+            f"({config.episodes_per_task}/task, seed={config.seed}) -> {selection_path}"
+        )
+
+    # Inject the subset into the data pipeline via DataConfigFactory.base_config, which
+    # create_base_config() replaces onto without touching `episodes`.
+    new_base = dataclasses.replace(config.data.base_config or _config.DataConfig(), episodes=tuple(selected))
+    return dataclasses.replace(config, data=dataclasses.replace(config.data, base_config=new_base))
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -247,6 +290,11 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    # Optionally restrict training to a random subset of episodes per task_index. This must
+    # run after the checkpoint dir exists (it logs the selection there) and before the data
+    # loader is built (it rewrites the data config the loader reads from).
+    config = resolve_episode_subset(config, resuming=resuming)
 
     data_loader = _data_loader.create_data_loader(
         config,
