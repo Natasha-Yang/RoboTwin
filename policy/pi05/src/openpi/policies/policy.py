@@ -54,14 +54,18 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        # When True (JAX models only), infer() also surfaces the model's raw action-expert
+        # features under "action_features". Off by default so the normal eval path is unchanged;
+        # the SAFE rollout-collection script flips this on. See Pi0.sample_actions(return_features=...).
+        self._return_features = False
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # JAX model setup. `return_features` is static so toggling it triggers a recompile.
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("return_features",))
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -88,18 +92,35 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        # Request raw action features only for JAX models that have opted in; PyTorch
+        # sample_actions does not support the flag.
+        if not self._is_pytorch_model and self._return_features:
+            sample_kwargs["return_features"] = True
+
         start_time = time.monotonic()
+        sample_out = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        model_time = time.monotonic() - start_time
+
+        # sample_actions returns either the action array or (actions, aux_features_dict).
+        if isinstance(sample_out, tuple):
+            actions, aux = sample_out
+        else:
+            actions, aux = sample_out, {}
+
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
-        model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            aux = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), aux)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            aux = jax.tree.map(lambda x: np.asarray(x[0, ...]), aux)
 
         outputs = self._output_transform(outputs)
+        # Attach raw features after the output transform so they bypass action unnormalization.
+        outputs.update(aux)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
