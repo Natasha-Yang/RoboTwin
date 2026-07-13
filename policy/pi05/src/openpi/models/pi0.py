@@ -236,11 +236,11 @@ class Pi0(_model.BaseModel):
 
         If ``critic`` is provided, the denoising is steered by critic gradient guidance,
         following ``critic_ensemble_toy_example/tiny_flow_policy.py::sample_action``: at each
-        step the clean action is estimated, the critic supplies ``dQ/d(action)``, that gradient
-        is rescaled to the velocity norm, and ``guidance_scale`` times it is added to the
-        velocity. ``critic`` must expose ``action_gradient(state, action)`` (numpy in/out);
-        it is invoked on host via ``jax.pure_callback``. This path takes precedence over
-        ``return_features``.
+        step the clean action chunk is estimated, the critic supplies ``d(value)/d(action)``,
+        that gradient is rescaled to the velocity norm, and ``guidance_scale`` times it steers
+        the velocity. ``critic`` must expose ``action_gradient(siglip, state, action)`` (numpy
+        in/out, see ``critic_guidance.py``); it is invoked on host via ``jax.pure_callback``.
+        This path takes precedence over ``return_features``.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -291,28 +291,41 @@ class Pi0(_model.BaseModel):
         if critic is not None:
             # Critic gradient guidance, mirroring
             # critic_ensemble_toy_example/tiny_flow_policy.py::TinyFlowPolicy.sample_action.
-            state = observation.state
+            # The critic conditions on the head-camera SigLIP patch features (the raw
+            # `aux["encoded"]`, 1152-d), which the image tower produces but embed_prefix
+            # discards -- so re-run it once here (constant across denoising steps).
+            state = observation.state.astype(jnp.float32)
+            _, img_aux = self.PaliGemma.img(observation.images["base_0_rgb"], train=False)
+            siglip = img_aux["encoded"].astype(jnp.float32)  # (b, 256, 1152)
 
             def guided_step(carry):
                 x_t, time = carry
                 v_t = self.action_out_proj(action_expert_features(x_t, time))
-                # Estimate the clean action (flow target at t=0): x_0 = x_t - t * v_t.
-                x_0_hat = jnp.clip(x_t - time * v_t, -1.0, 1.0)
-                # Ask the (host-side) critic for dQ/d(action) via an external callback.
+                # Estimate the clean action chunk (flow target at t=0): x_0 = x_t - t * v_t.
+                x_0_hat = (x_t - time * v_t).astype(jnp.float32)
+                # Ask the (host-side) critic for d(value)/d(action) via an external callback.
                 grad = jax.pure_callback(
                     critic.action_gradient,
                     jax.ShapeDtypeStruct(x_t.shape, jnp.float32),
+                    siglip,
                     state,
                     x_0_hat,
                 ).astype(v_t.dtype)
-                # Rescale the critic gradient to the velocity norm, then nudge the velocity.
-                flat = (batch_size, -1)
-                grad_norm = jnp.linalg.norm(grad.reshape(flat), axis=-1)[:, None, None]
-                v_norm = jnp.linalg.norm(v_t.reshape(flat), axis=-1)[:, None, None]
+                # Project grad onto the normal of v_t: keep only the component of the critic
+                # gradient orthogonal to the flow velocity (remove the part parallel to v_t).
+                # Everything reduces over the action-dim axis only (keepdims=True), so each time
+                # step's action is projected/normalized independently rather than as one flat chunk.
+                # v_sq = jnp.sum(v_t * v_t, axis=-1, keepdims=True)
+                # parallel = jnp.sum(grad * v_t, axis=-1, keepdims=True) / (v_sq + 1e-9) * v_t
+                # grad = grad - parallel
+                # Rescale the critic gradient to the velocity norm at each time step, then nudge.
+                grad_norm = jnp.linalg.norm(grad, axis=-1, keepdims=True)
+                v_norm = jnp.linalg.norm(v_t, axis=-1, keepdims=True)
                 grad = v_norm / (grad_norm + 1e-9) * grad
-                # The toy example ascends Q with (v + scale*grad) because it integrates t=0->1
-                # (dt>0). Here time runs t=1->0 with dt<0, so we subtract the gradient: the step
-                # dt*(-grad) then moves the sample along +grad (uphill on the critic).
+                # The toy example ascends the critic with (v + scale*grad) because it integrates
+                # t=0->1 (dt>0). Here time runs t=1->0 with dt<0, so we subtract: the step
+                # dt*(-grad) moves the sample along +grad (uphill on the critic). `guidance_scale`
+                # is signed -- use a negative value if a lower critic value is the better one.
                 return x_t + dt * (v_t - guidance_scale * grad), time + dt
 
             def guided_cond(carry):

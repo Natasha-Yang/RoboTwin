@@ -560,6 +560,37 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # pi05_base 5 tasks, 5 clean expert demos each
+    TrainConfig(
+        name="pi05_base_aloha_lora_5x5",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="NatashaYang/robotwin_demo_clean_5x5_lerobot",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora",
+                                    action_expert_variant="gemma_300m_lora").get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,
+        ema_decay=None,
+    ),
     # pi05_base 5 clean expert demos each
     TrainConfig(
         name="pi05_base_aloha_lora_5",
@@ -622,36 +653,6 @@ _CONFIGS = [
         fsdp_devices=1,
         ema_decay=None,
     ),
-    TrainConfig(
-        name="pi05_base_aloha_lora_10",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotAlohaDataConfig(
-            repo_id="NatashaYang/robotwin_25_lerobot_dataset",  # your datasets repo_id
-            adapt_to_pi=False,
-            repack_transforms=_transforms.Group(inputs=[
-                _transforms.RepackTransform({
-                    "images": {
-                        "cam_high": "observation.images.cam_high",
-                        "cam_left_wrist": "observation.images.cam_left_wrist",
-                        "cam_right_wrist": "observation.images.cam_right_wrist",
-                    },
-                    "state": "observation.state",
-                    "actions": "action",
-                    "prompt": "prompt",
-                })
-            ]),
-            base_config=DataConfig(
-                prompt_from_task=True,  # Set to True for prompt by task_name
-            ),
-        ),
-        freeze_filter=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora",
-                                    action_expert_variant="gemma_300m_lora").get_freeze_filter(),
-        batch_size=32,  # the total batch_size not pre_gpu batch_size
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30000,
-        fsdp_devices=1,
-        ema_decay=None,
-    ),
     # pi05_base by lora
     TrainConfig(
         name="pi05_base_aloha_lora_25",
@@ -688,6 +689,36 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
             repo_id="NatashaYang/robotwin_50_lerobot_dataset",  # your datasets repo_id
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora",
+                                    action_expert_variant="gemma_300m_lora").get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_base_aloha_lora",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="NatashaYang/robotwin_lerobot_dataset",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({

@@ -32,21 +32,29 @@ class PI0:
         self.checkpoint_id = checkpoint_id
 
         config = _config.get_config(self.train_config_name)
+        checkpoint_dir = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}"
 
         # Optional critic gradient guidance for the flow-matching sampler (see
         # critic_guidance.py and Pi0.sample_actions). When a critic checkpoint is given,
-        # its dQ/d(action) steers each denoising step toward higher Q.
+        # its d(value)/d(action) steers each denoising step toward higher critic value.
+        # The critic works in the raw 14-d state/action space, so we hand it this config's
+        # norm stats to un-normalize the sampler's normalized, padded action chunk.
         sample_kwargs = None
         if critic_ckpt:
             from critic_guidance import load_critic
+            from openpi.training import checkpoints as _checkpoints
 
-            critic = load_critic(critic_ckpt)
+            data_config = config.data.create(config.assets_dirs, config.model)
+            norm_stats = _checkpoints.load_norm_stats(
+                os.path.join(checkpoint_dir, "assets"), data_config.asset_id
+            )
+            critic = load_critic(critic_ckpt, norm_stats, data_config.use_quantile_norm)
             sample_kwargs = {"critic": critic, "guidance_scale": float(guidance_scale)}
             print(f"loaded critic for guidance: {critic_ckpt} (guidance_scale={guidance_scale})")
 
         self.policy = _policy_config.create_trained_policy(
             config,
-            f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            checkpoint_dir,
             sample_kwargs=sample_kwargs,
             )
         print("loading model success!")
