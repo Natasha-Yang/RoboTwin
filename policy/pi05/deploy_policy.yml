@@ -10,4 +10,10 @@ instruction_type: unseen
 train_config_name: null
 model_name: null
 checkpoint_id: 30000
-pi0_step: 50
+pi0_step: 10
+
+# Critic gradient guidance for the flow-matching sampler (optional).
+# critic_ckpt: path to a trained critic checkpoint (null disables guidance).
+# guidance_scale: strength of the critic-gradient nudge (0.0 = no effect).
+critic_ckpt: null
+guidance_scale: 0.0

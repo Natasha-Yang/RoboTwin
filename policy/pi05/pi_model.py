@@ -26,15 +26,28 @@ import os
 
 class PI0:
 
-    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step):
+    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step, critic_ckpt=None, guidance_scale=0.0):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
 
         config = _config.get_config(self.train_config_name)
+
+        # Optional critic gradient guidance for the flow-matching sampler (see
+        # critic_guidance.py and Pi0.sample_actions). When a critic checkpoint is given,
+        # its dQ/d(action) steers each denoising step toward higher Q.
+        sample_kwargs = None
+        if critic_ckpt:
+            from critic_guidance import load_critic
+
+            critic = load_critic(critic_ckpt)
+            sample_kwargs = {"critic": critic, "guidance_scale": float(guidance_scale)}
+            print(f"loaded critic for guidance: {critic_ckpt} (guidance_scale={guidance_scale})")
+
         self.policy = _policy_config.create_trained_policy(
             config,
             f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            sample_kwargs=sample_kwargs,
             )
         print("loading model success!")
         self.img_size = (224, 224)

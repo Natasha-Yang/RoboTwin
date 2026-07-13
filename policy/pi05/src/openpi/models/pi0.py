@@ -222,6 +222,8 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         return_features: bool = False,
+        critic=None,
+        guidance_scale: float = 0.0,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
         """Sample an action chunk via flow-matching denoising.
 
@@ -231,6 +233,14 @@ class Pi0(_model.BaseModel):
         (https://vla-safe.github.io/) consumes for uncertainty / failure detection. The return
         becomes ``(actions, {"action_features": feats})`` where ``feats`` has shape
         ``(batch, num_steps, action_horizon, feature_dim)``.
+
+        If ``critic`` is provided, the denoising is steered by critic gradient guidance,
+        following ``critic_ensemble_toy_example/tiny_flow_policy.py::sample_action``: at each
+        step the clean action is estimated, the critic supplies ``dQ/d(action)``, that gradient
+        is rescaled to the velocity norm, and ``guidance_scale`` times it is added to the
+        velocity. ``critic`` must expose ``action_gradient(state, action)`` (numpy in/out);
+        it is invoked on host via ``jax.pure_callback``. This path takes precedence over
+        ``return_features``.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -277,6 +287,41 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             return suffix_out[:, -self.action_horizon :]
+
+        if critic is not None:
+            # Critic gradient guidance, mirroring
+            # critic_ensemble_toy_example/tiny_flow_policy.py::TinyFlowPolicy.sample_action.
+            state = observation.state
+
+            def guided_step(carry):
+                x_t, time = carry
+                v_t = self.action_out_proj(action_expert_features(x_t, time))
+                # Estimate the clean action (flow target at t=0): x_0 = x_t - t * v_t.
+                x_0_hat = jnp.clip(x_t - time * v_t, -1.0, 1.0)
+                # Ask the (host-side) critic for dQ/d(action) via an external callback.
+                grad = jax.pure_callback(
+                    critic.action_gradient,
+                    jax.ShapeDtypeStruct(x_t.shape, jnp.float32),
+                    state,
+                    x_0_hat,
+                ).astype(v_t.dtype)
+                # Rescale the critic gradient to the velocity norm, then nudge the velocity.
+                flat = (batch_size, -1)
+                grad_norm = jnp.linalg.norm(grad.reshape(flat), axis=-1)[:, None, None]
+                v_norm = jnp.linalg.norm(v_t.reshape(flat), axis=-1)[:, None, None]
+                grad = v_norm / (grad_norm + 1e-9) * grad
+                # The toy example ascends Q with (v + scale*grad) because it integrates t=0->1
+                # (dt>0). Here time runs t=1->0 with dt<0, so we subtract the gradient: the step
+                # dt*(-grad) then moves the sample along +grad (uphill on the critic).
+                return x_t + dt * (v_t - guidance_scale * grad), time + dt
+
+            def guided_cond(carry):
+                _, time = carry
+                # robust to floating-point error
+                return time >= -dt / 2
+
+            x_0, _ = jax.lax.while_loop(guided_cond, guided_step, (noise, 1.0))
+            return x_0
 
         if not return_features:
 

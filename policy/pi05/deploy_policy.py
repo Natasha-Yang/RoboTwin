@@ -26,7 +26,10 @@ def encode_obs(observation):
 def get_model(usr_args):
     train_config_name, model_name, checkpoint_id, pi0_step = (usr_args["train_config_name"], usr_args["model_name"],
                                                               usr_args["checkpoint_id"], usr_args["pi0_step"])
-    return PI0(train_config_name, model_name, checkpoint_id, pi0_step)
+    critic_ckpt = usr_args.get("critic_ckpt", None)
+    guidance_scale = usr_args.get("guidance_scale", 0.0)
+    return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
+               critic_ckpt=critic_ckpt, guidance_scale=guidance_scale)
 
 
 def eval(TASK_ENV, model, observation):
