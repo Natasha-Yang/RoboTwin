@@ -127,6 +127,37 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _fix_episode_data_index(dataset: lerobot_dataset.LeRobotDataset) -> None:
+    """Make `episode_data_index` addressable by the *original* global episode index.
+
+    LeRobot has a bug when `episodes` selects a non-contiguous subset: it loads only the
+    selected episodes' frames (which keep their original global `episode_index`, e.g. 1769)
+    but builds `episode_data_index` as a compact array of length ``len(episodes)``. In
+    ``__getitem__`` it then does ``episode_data_index["from"][episode_index]`` with the
+    original index, which is out of bounds for the compact array whenever the selection is not
+    a ``0..N-1`` prefix (e.g. per-task subsets). See LeRobotDataset._get_query_indices.
+
+    Re-expand the index into full-length tensors indexed by the original episode index. The
+    from/to offsets stay in the subset frame space, in the same order the parquet files were
+    concatenated (``dataset.episodes``), so they line up with the loaded hf_dataset. Unselected
+    slots are never accessed (no frame references them).
+    """
+    import itertools
+
+    episodes = list(dataset.episodes)
+    lengths = [dataset.meta.episodes[ep_idx]["length"] for ep_idx in episodes]
+    ends = list(itertools.accumulate(lengths))
+    starts = [0, *ends[:-1]]
+
+    size = max(episodes) + 1
+    from_ = torch.zeros(size, dtype=torch.long)
+    to_ = torch.zeros(size, dtype=torch.long)
+    for ep_idx, start, end in zip(episodes, starts, ends, strict=True):
+        from_[ep_idx] = start
+        to_[ep_idx] = end
+    dataset.episode_data_index = {"from": from_, "to": to_}
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -147,6 +178,9 @@ def create_torch_dataset(
         # only these episode indices are loaded; None loads the whole dataset.
         episodes=list(data_config.episodes) if data_config.episodes is not None else None,
     )
+
+    if data_config.episodes is not None:
+        _fix_episode_data_index(dataset)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
