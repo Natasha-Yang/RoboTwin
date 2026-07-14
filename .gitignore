@@ -34,3 +34,10 @@ policy/*/training_data/*
 cluster/render_check*.png
 
 *.out
+*.log
+logs/
+
+# Claude conversations + memory are each tracked in a SEPARATE private repo
+# nested here (see .claude/README.md). Never let them enter this public fork.
+/.claude/conversations/
+/.claude/memory/

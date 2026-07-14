@@ -5,6 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+import logging
+
 import numpy as np
 import tqdm
 import tyro
@@ -13,6 +16,7 @@ import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.episode_selection as _episode_selection
 import openpi.transforms as transforms
 
 
@@ -86,9 +90,26 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, episodes_per_task: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+
+    # Restrict to the same per-task episode subset that training will use, so the norm stats
+    # match the trained data. The selection is deterministic in (repo_id, episodes_per_task,
+    # seed), so passing the same --episodes-per-task here as to train.py yields the same
+    # episodes. Falls back to the value baked into the config if the flag is omitted.
+    episodes_per_task = episodes_per_task if episodes_per_task is not None else config.episodes_per_task
+    if episodes_per_task is not None:
+        if data_config.repo_id is None or data_config.repo_id == "fake":
+            raise ValueError(f"--episodes_per_task requires a real LeRobot repo_id, got {data_config.repo_id!r}.")
+        selected, per_task = _episode_selection.select_episodes_per_task(
+            data_config.repo_id, episodes_per_task, config.seed
+        )
+        data_config = dataclasses.replace(data_config, episodes=tuple(selected))
+        logging.info(
+            f"Computing norm stats over {len(selected)} episodes across {len(per_task)} tasks "
+            f"({episodes_per_task}/task, seed={config.seed})."
+        )
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(

@@ -17,6 +17,27 @@ new cluster.
 
 ---
 
+## Agent working notes (Claude — read first)
+
+- **Before a non-trivial edit to the simulation code**, invoke the **`/framework`**
+  skill first. It's a fast orientation to how the actual code fits together (task
+  envs in `envs/`, the base task, the motion/actor API, actor point system, configs,
+  and the collect/eval + policy-adapter contracts) so your edit matches existing
+  contracts instead of reinventing them. Load it whenever a request means writing or
+  substantially changing: a task env (`envs/*.py`), `envs/_base_task.py`, the
+  motion/actor utilities (`envs/utils/`, `envs/robot/`), a policy adapter
+  (`policy/*/deploy_policy.py`), a task config, or the collect/eval drivers
+  (`script/collect_data.py`, `script/eval_policy.py`). Skip it for pure
+  cluster/ops/sync changes — this file already covers those.
+- **Log files can be huge — never blindly read one into context.** Before opening
+  anything under `logs/` (or any `*.log` / `*.out` / `slurm-*` output), check its
+  size first (`ls -lh <file>`, `wc -l <file>`). Only read the whole file if it is
+  trivially small or the user explicitly asks for all of it; otherwise `tail` /
+  `head` / `grep` the relevant slice. Loading a multi-MB log burns the context
+  window for no benefit.
+
+---
+
 ## 0. Porting checklist (read first)
 
 When moving to a **new cluster**, the things that are environment-specific and
@@ -25,7 +46,7 @@ must be re-checked are:
 1. **Paths** — the repo currently hardcodes `/project/6028519/natashay/RoboTwin`
    (repo root) and `/project/6028519/natashay/miniforge3` (conda). Grep and update:
    `grep -rn "6028519/natashay" setup_env.sh cluster/ policy/`.
-2. **SLURM account + partition** — `--account=def-florian7_gpu` and
+2. **SLURM account + partition** — `--account=rrg-florian7_gpu` and
    `--gpus-per-node=h100:1` in `cluster/robotwin_gpu.sh` and `cluster/rollout.sh`.
 3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `9.0` (H100 / sm_90).
    Set to your GPU's compute capability (A100 = `8.0`, RTX 4090 = `8.9`, …).
@@ -93,6 +114,23 @@ export FORCE_CUDA=1                # force the CUDA build on the GPU-less login 
 
 Then run the curobo/pytorch3d `pip install` steps. `torch` ships its own CUDA
 runtime, so you do **not** load the cuda module at *run* time — only for compiling.
+
+> **Rorqual only — build curobo with `cuda/12.6`, not `cuda/12.2`.** On Rorqual
+> (H100, driver 580.x) curobo kernels compiled with `cuda/12.2` throw
+> `CUDA error: an illegal instruction was encountered` (CUDA error 715) at kernel
+> launch during `motion_gen.warmup()` — even though the SASS is the correct `sm_90`
+> and plain torch CUDA works fine. Rebuilding the curobo CUDA extensions with
+> `cuda/12.6` fixes it. So on Rorqual, `module load cuda/12.6` for the curobo build
+> above. (This is Rorqual-specific; on Fir `cuda/12.2` was fine. See §7.) To rebuild
+> just curobo in place:
+>
+> ```bash
+> cd envs/curobo
+> module load cuda/12.6; export CUDA_HOME=$EBROOTCUDA
+> export TORCH_CUDA_ARCH_LIST=9.0 FORCE_CUDA=1
+> rm -f src/curobo/curobolib/*.so && rm -rf build   # clean, so no stale kernels linger
+> pip install -e . --no-build-isolation --no-deps --force-reinstall
+> ```
 
 ### 1.3 SAPIEN / Vulkan headless rendering
 
@@ -336,6 +374,37 @@ you want the lint/test tools. You don't need the `third_party/aloha` /
 ALOHA and LIBERO. The resulting `.venv` is what `eval.sh` activates and `finetune.sh`
 runs through `uv run`.
 
+> **`uv sync` gotchas on a CVMFS/Gentoo cluster (hit on Rorqual).** A few deps have
+> no prebuilt wheel for this platform and build from source, and the CVMFS toolchain
+> trips them up. If `uv sync` fails, check these:
+>
+> - **`evdev` (via `lerobot → pynput → evdev`) — needs kernel headers.** `evdev`
+>   is sdist-only, so it compiles against `linux/input.h`, which isn't on the default
+>   include path here (the failure prints *"The 'linux/input.h' … include files are
+>   missing"*). The headers exist in CVMFS — export before syncing (do this **every**
+>   sync; there is no evdev wheel to avoid the source build):
+>   ```bash
+>   export CPATH=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/include:$CPATH
+>   export C_INCLUDE_PATH=$CPATH
+>   ```
+> - **`av==14.4.0` is a broken release — sdist-only, zero wheels on PyPI.** With no
+>   wheel, uv builds PyAV from source against the CVMFS system ffmpeg (4.x), which
+>   lacks `ch_layout` → build error *"'AVCodecParameters' has no member named
+>   'ch_layout'"*. Fix: pin `av` to a version whose manylinux wheels exist (they
+>   bundle their own ffmpeg 7.x, so no system ffmpeg is needed). **14.2.0** is the
+>   newest 14.x with wheels and still satisfies lerobot's `av>=14.2.0`. This repo
+>   pins it via `[tool.uv].override-dependencies` in `pyproject.toml` **and** the
+>   `av` entry in `uv.lock` was edited to 14.2.0 + wheels (see next bullet for why
+>   the lock was hand-edited).
+> - **IPv6 is broken on Rorqual login nodes → `uv lock` hangs.** `curl -6` can't
+>   resolve/route but `curl -4` works; uv (reqwest) stalls on IPv6 while fetching the
+>   `download.pytorch.org` index during resolution, so `uv lock` times out with
+>   *"operation timed out"* on `download.pytorch.org/whl/cu128/...`. Direct wheel
+>   **downloads** still succeed over IPv4, so `uv sync --frozen` (install the lock
+>   as-is, no re-resolution) works fine — which is why the `av` bump was applied by
+>   hand-editing `uv.lock` rather than running `uv lock`. If you must re-resolve,
+>   force IPv4 first.
+
 Training configs are registered in
 `policy/pi05/src/openpi/training/config.py`. Existing RoboTwin entries include
 `pi05_base_aloha_lora`, `pi05_aloha_full_base`, `pi0_base_aloha_robotwin_lora`,
@@ -451,6 +520,13 @@ see the upstream docs for their specific fine-tuning setup.
 - **`setuptools==69.5.1`**: pinned for SAPIEN's `pkg_resources`. Don't upgrade.
 - **Warp cache**: always node-local (`$SLURM_TMPDIR`); a shared cache across
   drivers causes illegal-instruction CUDA crashes.
+- **Rorqual: build curobo with `cuda/12.6`** (H100, driver 580.x). curobo kernels
+  built with `cuda/12.2` throw `CUDA error: an illegal instruction was encountered`
+  (error 715) at launch inside `motion_gen.warmup()` (e.g. `lbfgs_step_cu.forward`),
+  while plain torch CUDA is fine — the `12.2` ptxas emits `sm_90` SASS this driver
+  rejects. Fix = clean-rebuild curobo's CUDA extensions with `cuda/12.6` (§1.2).
+  Note this is a *different* illegal-instruction cause than the Warp cache one above.
+  **Rorqual-specific**; Fir built fine with `cuda/12.2`.
 - **`module load` in a pipe**: never `module load ... | ...` — the pipe subshells it
   and the env is lost.
 - **`$0` under sbatch** is a spooled copy — resolve the repo root via
@@ -461,11 +537,96 @@ see the upstream docs for their specific fine-tuning setup.
 
 ---
 
-## 8. Quick reference
+## 8. Claude Code setup & state sync (this fork)
+
+This fork carries its own **project-level Claude Code config** in `.claude/`
+(checked into git, so every clone on every machine behaves the same). See
+`.claude/README.md` for the full write-up. Summary:
+
+- **`.claude/settings.json`** — default model `opus`, default mode `acceptEdits`
+  ("auto", edits apply without a prompt; `Shift+Tab` cycles modes), a custom status
+  line, and `SessionStart`/`SessionEnd` hooks that import/export both sync stores.
+- **Status line** (`.claude/statusline.sh` → `.claude/statusline.py`) renders
+  `mode · model · ctx <used>/200k (pct) · /sync-claude`. Context usage is read from
+  the transcript's latest token counts; the trailing `/sync-claude` reminds you of
+  the everyday sync skill.
+- **Skills** live in `.claude/skills/` (auto-discovered by Claude Code — a root
+  `skills/` would *not* be picked up): `framework` (fast orientation to the
+  simulation codebase; auto-loaded before non-trivial code edits — see "Agent
+  working notes" at the top), `sync-claude` (both stores), `sync-conversations`,
+  `sync-memory`.
+
+### State sync across machines (kept out of the public fork)
+
+`origin` is a **public** GitHub fork, and both conversation transcripts and memory
+leak paths/output/secrets, so they must never enter its history. Each portable store
+is its **own separate PRIVATE git repo**, nested here and **gitignored** by the main
+repo (no submodule, no URL leak, no gitlink churn):
+
+| Store | Nested path (gitignored) | Live store per machine | Private remote (SSH) |
+|---|---|---|---|
+| conversations | `.claude/conversations/` | `~/.claude/projects/<path-hash>/*.jsonl` | `Natasha-Yang/RoboTwinConvos` |
+| memory | `.claude/memory/` | `~/.claude/projects/<path-hash>/memory/*.md` | `Natasha-Yang/RoboTwinMemory` |
+
+The `<path-hash>` is derived from the repo's absolute path (differs per machine).
+`.claude/hooks/sync-store.sh` is the engine; `sync-conversations.sh` / `sync-memory.sh`
+are thin wrappers. Each supports:
+  - `sync` — **bidirectional (default for the sync skills)**: export local + commit +
+    pull/merge remote + import + **push**. Every call ends with a push.
+  - `save` — push-only (export + commit + push).
+  - `pull` — pull-only (fetch + import into the live store).
+  - `export` / `import` — plain file copies (network-free; the SessionEnd/SessionStart
+    hooks call these automatically for both stores).
+
+**Everyday sync from a login node** (or just run the `/sync-claude` skill):
+
+```bash
+bash .claude/hooks/sync-conversations.sh sync   # bidirectional: pull + push
+bash .claude/hooks/sync-memory.sh sync          # bidirectional: pull + push
+bash .claude/hooks/sync-claude-config.sh        # .claude/** + CLAUDE.md -> main AND cluster
+```
+
+The third command is the **config propagator**: the two private stores above never
+enter the public fork, but the tracked Claude utility files (`.claude/**` skills /
+hooks / `settings.json` / statusline, plus `CLAUDE.md`) *do* live in the public repo
+and were only ever committed on the `cluster` branch — so `main` drifted behind.
+`sync-claude-config.sh` commits **only** those config paths onto **both** `main` and
+`cluster` (using a throwaway git worktree for whichever branch isn't checked out) and
+pushes each, without merging unrelated branch work or disturbing your other
+uncommitted changes. `/sync-claude` runs all three. Pass `--no-push` to stage without
+pushing.
+
+**Fresh clone on a new machine** — the main clone contains NEITHER store; clone each
+private repo into place, then pull:
+
+```bash
+git clone git@github.com:Natasha-Yang/RoboTwin.git && cd RoboTwin
+cd .claude
+git clone git@github.com:Natasha-Yang/RoboTwinConvos.git conversations
+git clone git@github.com:Natasha-Yang/RoboTwinMemory.git  memory
+cd .. && bash .claude/hooks/sync-conversations.sh pull && bash .claude/hooks/sync-memory.sh pull
+```
+
+> **Porting note:** the remote URLs are Natasha's private repos. On a new
+> account/cluster, create your own private repos and point each nested repo's
+> `origin` at them. `gh` isn't a cluster module (the `gh/0.18.0` module is a
+> different tool) — install the static binary into `~/bin` from
+> https://github.com/cli/cli/releases if you want the `gh` CLI. A fine-grained PAT
+> can't create repos or be seen by `gh`'s API here; git-over-SSH is what the sync
+> uses.
+
+---
+
+## 9. Quick reference
 
 ```bash
 # --- setup (login node) ---
 source setup_env.sh                     # every session/job
+
+# --- claude state sync (login node) ---  (or run the /sync-claude skill)
+bash .claude/hooks/sync-conversations.sh sync   # transcripts: bidirectional pull+push
+bash .claude/hooks/sync-memory.sh sync          # memory:      bidirectional pull+push
+bash .claude/hooks/sync-claude-config.sh        # .claude/** + CLAUDE.md -> main AND cluster
 
 # --- data collection ---
 bash collect_data.sh beat_block_hammer demo_randomized 0

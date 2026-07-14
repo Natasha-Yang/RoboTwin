@@ -143,6 +143,9 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # If a per-task episode subset was selected (TrainConfig.episodes_per_task),
+        # only these episode indices are loaded; None loads the whole dataset.
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
     )
 
     if data_config.prompt_from_task:
