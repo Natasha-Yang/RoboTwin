@@ -7,8 +7,8 @@
 #   parallel (default): the batch runs as many tasks concurrently as fit on its
 #             single allocated H100. RoboTwin's render load is tiny (3 D435
 #             cameras, 320x240 RGB, ~2-4 GB VRAM), so the binding limit is CPU,
-#             not the GPU. A Fir H100 node has 48 CPUs / 4 H100s -> ~12 cores per
-#             GPU, and each worker needs ~3, so the job packs 12/3 = 4 workers
+#             not the GPU. A Killarney H100 node has 48 CPUs / 8 H100s -> ~6 cores
+#             per GPU, and each worker needs ~3, so the job packs 6/3 = 2 workers
 #             onto the GPU and requests that GPU's full CPU/RAM fair share
 #             (overriding cluster/robotwin_gpu.sh's defaults).
 #   sequential (--sequential): the batch runs its tasks one after another on the
@@ -30,10 +30,10 @@ set -euo pipefail
 shopt -s nullglob
 
 # --- how many workers fit on one H100 ---
-# Fir H100 node = 48 CPUs / 4 GPUs -> 12 cores/GPU fair share; collection is
+# Killarney H100 node = 48 CPUs / 8 GPUs -> 6 cores/GPU fair share; collection is
 # CPU-bound (curobo planning + PhysX), ~3 cores/worker. VRAM/RAM are not the
-# limit (~2-4 GB VRAM, ~6 GB RAM per worker on an 80 GB / ~288 GB-per-GPU node).
-cpus_per_gpu=12
+# limit (~2-4 GB VRAM, ~6 GB RAM per worker on an 80 GB / ~257 GB-per-GPU node).
+cpus_per_gpu=6
 cpus_per_worker=3
 mem_per_worker_gb=12
 workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 4
@@ -111,10 +111,11 @@ else
     echo "Submitting ${num_batches} sequential batch job(s) for ${task_count} tasks."
 fi
 
-# Only these Fir nodes have successfully initialized SAPIEN's Vulkan renderer
-# in this environment. Other H100 nodes can run CUDA while exposing no usable
-# Vulkan device, which makes collection fail before the task starts.
-render_nodes=fc10508,fc10519,fc10604,fc10612
+# On Killarney every H100 node uses the same NVIDIA driver, so SAPIEN's Vulkan
+# renderer is not pinned to specific nodes (unlike Fir, where only a few nodes
+# had a working Vulkan device). Verify rendering once with the smoke test
+# (sbatch cluster/robotwin_gpu.sh) before a large collection run; if some node
+# turns out to lack a usable Vulkan device, re-add an --exclude/--nodelist here.
 
 for (( b = 0; b < num_batches; b++ )); do
     tasks=${batch_tasks[$b]# }   # strip the leading space
@@ -137,7 +138,6 @@ for (( b = 0; b < num_batches; b++ )); do
         sbatch \
             --job-name="collect-batch-${b}" \
             --output="logs/data_collection/%x-%j.out" \
-            --nodelist="$render_nodes" \
             --cpus-per-task="$cpus" \
             --mem="${mem_gb}G" \
             cluster/robotwin_gpu.sh \
@@ -174,7 +174,6 @@ for (( b = 0; b < num_batches; b++ )); do
         sbatch \
             --job-name="collect-batch-${b}" \
             --output="logs/data_collection/%x-%j.out" \
-            --nodelist="$render_nodes" \
             cluster/robotwin_gpu.sh \
             bash -c '
                 set -uo pipefail

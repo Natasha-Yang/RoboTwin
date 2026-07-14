@@ -137,9 +137,41 @@ bash script/_download_assets.sh   # downloads + unzips assets, then fixes paths
 source setup_env.sh
 ```
 
-This unsets the CVMFS `PYTHONPATH`/`PIP_CONFIG_FILE`, activates the conda env, sets
-`TORCH_CUDA_ARCH_LIST`, and installs the Vulkan shim. **Every** SLURM job script
-sources it (`cluster/robotwin_gpu.sh`, `cluster/rollout.sh`).
+This unsets the CVMFS `PYTHONPATH`/`PIP_CONFIG_FILE`, `module load ffmpeg/7.1.1`
+(see below), activates the conda env, sets `TORCH_CUDA_ARCH_LIST`, and installs the
+Vulkan shim. **Every** SLURM job script sources it (`cluster/robotwin_gpu.sh`,
+`cluster/rollout.sh`).
+
+**ffmpeg (do NOT build from source).** The π0.5 doc's §1.1 tells you to compile
+ffmpeg 7.1 — but that step only exists as a fallback for when `uv sync` fails
+building **PyAV (`av`)** ("if error occured while build av, you should update
+ffmpeg"). On Killarney you don't build anything: `module load ffmpeg/7.1.1` gives
+ffmpeg 7.1.1 built `--enable-shared` with **libx264/libx265** *and* the dev headers
++ pkg-config `.pc` files. `setup_env.sh` loads it (and puts its pkgconfig dir on
+`PKG_CONFIG_PATH`), so `uv sync` in `policy/pi05` compiles `av` cleanly against 7.1.
+
+If you ignore this and try the from-source build, the `nasm/yasm not found or too
+old` error is a **misleading PATH problem, not a version one**: nasm 2.15 / yasm 1.3
+live in the gentoo CVMFS `usr/bin` and are new enough — `module load StdEnv/2023`
+restores them. Just use the module instead.
+
+There is one runtime wrinkle `setup_env.sh` handles for you. The pi05 `av` is built
+`--enable-shared`, so at import its `_core.so` dlopens the module's `libav*.so.61`,
+which in turn need ffmpeg codec libs (`libx264/libx265/libSDL2/libvidstab/libmp3lame`)
+that live in the gentoo `usr/lib64`. Gentoo-interpreter binaries find those via
+`ld.so.cache`, but **uv's standalone Python 3.11 loader does not** → `import av` dies
+with `libx264.so.164: cannot open`. So `setup_env.sh`:
+1. appends `$EBROOTFFMPEG/lib` to `LD_LIBRARY_PATH` (the `libav*.so.61` themselves), and
+2. symlinks **only** those ffmpeg-exclusive codec libs (via an allowlist — never
+   generic libs like `libz`/`libpng`/`libfreetype`, never glibc core) into a private
+   `robotwin_ffmpeglibs` shim on `LD_LIBRARY_PATH`. It's an allowlist because
+   `LD_LIBRARY_PATH` is searched before the system dirs, so shimming a *generic* lib
+   would shadow the version torch/sapien/jax expect (the same hazard as the gpucomp
+   shim below). Regenerate the list for a new ffmpeg build with
+   `ldd $EBROOTFFMPEG/lib/lib*.so.* | grep usr/lib64`.
+
+(The main conda env's own `av` is a bundled wheel and needs none of this; the shim is
+harmless there since it only supplies codec sonames nothing else uses.)
 
 ---
 
@@ -412,7 +444,10 @@ see the upstream docs for their specific fine-tuning setup.
   wheelhouse with a stub `opencv` that breaks `pip install`. `setup_env.sh` unsets
   it (and `PYTHONPATH`). Keep this if your cluster injects a Python env via a module
   system.
-- **No `sudo`**: Vulkan/ffmpeg come from the module system / CVMFS, not `apt`.
+- **No `sudo`**: Vulkan/ffmpeg come from the module system / CVMFS, not `apt`. Use
+  `module load ffmpeg/7.1.1` — don't build ffmpeg from source (the "nasm/yasm not
+  found or too old" configure error is a stripped-PATH red herring, not a real
+  version problem). See §1.5.
 - **`setuptools==69.5.1`**: pinned for SAPIEN's `pkg_resources`. Don't upgrade.
 - **Warp cache**: always node-local (`$SLURM_TMPDIR`); a shared cache across
   drivers causes illegal-instruction CUDA crashes.

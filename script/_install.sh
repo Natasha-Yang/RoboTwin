@@ -1,8 +1,8 @@
 echo "Installing the necessary packages ..."
 pip install -r script/requirements.txt
 
-echo "Installing pytorch3d ..."
-pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
+# echo "Installing pytorch3d ..."
+# pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
 
 echo "Adjusting code in sapien/wrapper/urdf_loader.py ..."
 # location of sapien, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/sapien"
