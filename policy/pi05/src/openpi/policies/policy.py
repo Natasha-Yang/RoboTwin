@@ -65,8 +65,10 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup. `return_features` is static so toggling it triggers a recompile.
+            # `guidance_scale` intentionally remains traced so online schedules can change it
+            # per call without compiling a new sampler for every scalar value.
             self._sample_actions = nnx_utils.module_jit(
-                model.sample_actions, static_argnames=("return_features", "critic", "guidance_scale")
+                model.sample_actions, static_argnames=("return_features", "critic_apply")
             )
             self._rng = rng or jax.random.key(0)
 

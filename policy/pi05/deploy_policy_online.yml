@@ -1,0 +1,56 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Add Parameters You Need
+train_config_name: null
+model_name: null
+checkpoint_id: 30000
+pi0_step: 10
+
+# ===== Online QMFM Value-critic gradient guidance =====
+# The QMFM `Value` ensemble critic is trained ONLINE during the eval rollouts and steers the
+# frozen pi0.5 flow sampler via QMFM denoised-estimate gradient guidance (see qmfm_critic.py
+# and Pi0.sample_actions). guidance_scale is QMFM's steering_coeff (>0 ascends Q; 0 = plain
+# pi0.5 sampling, i.e. the eval.sh baseline). Online eval starts guidance at 0 while the
+# critic is untrained, then linearly ramps to guidance_scale over guidance_ramp_updates TD
+# updates. Set guidance_ramp_updates: 0 to jump to the target after the first TD update.
+online_critic: true
+guidance_scale: 0.3
+guidance_ramp_updates: 256
+
+# Critic network (QMFM Value defaults; CNN encoder over the head SigLIP feature map)
+value_hidden_dims: [512, 512, 512, 512]
+value_layer_norm: true
+num_qs: 10
+cnn_features: [128, 128]
+cnn_out_dim: 128
+
+# TD / RL hyperparameters (mirror QMFM agents/mfm.py get_config)
+discount: 0.99
+rho: 0.5
+tau: 0.005
+lr: 0.0003
+clip_grad: true
+
+# Online loop
+batch_size: 256
+buffer_size: 5000       # fp16 SigLIP maps -> ~1.2 MB/transition (~6 GB at 5000). Lower if RAM-tight.
+start_training: 256     # min buffer fill before TD updates begin
+utd_ratio: 1            # gradient updates per training step
+train_freq: 1           # train every N control-step chunks
+critic_seed: 0
+save_critic: true       # dump the trained critic to the eval_result dir at the end
+
+# W&B logging for online critic training.
+wandb_enabled: true
+wandb_project: qmfm
+wandb_run_name: null
+wandb_ma_window: 20
+
+# Number of successful eval episodes to run (mirrors eval_policy test_num).
+test_num: 100

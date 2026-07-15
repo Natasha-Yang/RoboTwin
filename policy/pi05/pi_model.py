@@ -6,6 +6,7 @@
 import json
 import sys
 import jax
+import jax.numpy as jnp
 import numpy as np
 from openpi.models import model as _model
 from openpi.policies import aloha_policy
@@ -26,31 +27,66 @@ import os
 
 class PI0:
 
-    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step, critic_ckpt=None, guidance_scale=0.0):
+    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
+                 critic_ckpt=None, guidance_scale=0.0,
+                 guidance_ramp_updates=0,
+                 online_critic=False, critic_config=None, critic_seed=0):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
+        self.guidance_scale_target = float(guidance_scale)
+        self.guidance_ramp_updates = max(0, int(guidance_ramp_updates))
+        self.current_guidance_scale = 0.0
 
         config = _config.get_config(self.train_config_name)
         checkpoint_dir = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}"
 
-        # Optional critic gradient guidance for the flow-matching sampler (see
-        # critic_guidance.py and Pi0.sample_actions). When a critic checkpoint is given,
-        # its d(value)/d(action) steers each denoising step toward higher critic value.
-        # The critic works in the raw 14-d state/action space, so we hand it this config's
-        # norm stats to un-normalize the sampler's normalized, padded action chunk.
+        # Online QMFM Value-critic gradient guidance for the flow-matching sampler (see
+        # qmfm_critic.py and Pi0.sample_actions). The critic (an ensemble Q) is trained ONLINE
+        # during eval rollouts; its d(value)/d(action), differentiated through pi0.5's velocity,
+        # steers each denoising step toward higher Q (QMFM denoised-estimate steering).
+        self.online_critic = None
         sample_kwargs = None
-        if critic_ckpt:
-            from critic_guidance import load_critic
-            from openpi.training import checkpoints as _checkpoints
+        if online_critic:
+            from qmfm_critic import OnlineValueCritic
 
-            data_config = config.data.create(config.assets_dirs, config.model)
-            norm_stats = _checkpoints.load_norm_stats(
-                os.path.join(checkpoint_dir, "assets"), data_config.asset_id
+            cc = dict(critic_config or {})
+            cc.setdefault("value_hidden_dims", [512, 512, 512, 512])
+            cc.setdefault("value_layer_norm", True)
+            cc.setdefault("num_qs", 10)
+            cc.setdefault("rho", 0.5)
+            cc.setdefault("discount", 0.99)
+            cc.setdefault("tau", 0.005)
+            cc.setdefault("lr", 3e-4)
+            cc.setdefault("clip_grad", True)
+            cc.setdefault("cnn_features", [128, 128])
+            cc.setdefault("cnn_out_dim", 128)
+            cc.setdefault("batch_size", 256)
+            cc.setdefault("buffer_size", 5000)
+            cc.setdefault("start_training", 256)
+            cc.setdefault("utd_ratio", 1)
+            # Dims derived from the model config (pi0.5: action_dim=32, action_horizon=50).
+            cc["action_dim_flat"] = int(config.model.action_horizon * config.model.action_dim)
+            cc["state_dim"] = int(config.model.action_dim)  # observation.state is padded to action_dim
+            cc["siglip_channels"] = 1152
+            cc["siglip_grid"] = 16
+            cc["horizon"] = int(pi0_step)  # primitive sim steps executed per chunk (gamma^H in TD)
+            self.online_critic = OnlineValueCritic(seed=int(critic_seed), config=cc)
+            sample_kwargs = {
+                "critic_apply": self.online_critic.critic_apply,
+                "guidance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+            }
+            print(f"[pi_model] online QMFM Value critic enabled "
+                  f"(guidance_scale_target={self.guidance_scale_target}, "
+                  f"guidance_ramp_updates={self.guidance_ramp_updates}, "
+                  f"num_qs={cc['num_qs']}, "
+                  f"action_dim_flat={cc['action_dim_flat']})")
+        elif critic_ckpt:
+            raise NotImplementedError(
+                "The offline torch SigLIPCritic guidance path was replaced by the online QMFM "
+                "Value critic. Set online_critic: true (see deploy_policy_online.yml) instead of "
+                "critic_ckpt."
             )
-            critic = load_critic(critic_ckpt, norm_stats, data_config.use_quantile_norm)
-            sample_kwargs = {"critic": critic, "guidance_scale": float(guidance_scale)}
-            print(f"loaded critic for guidance: {critic_ckpt} (guidance_scale={guidance_scale})")
 
         self.policy = _policy_config.create_trained_policy(
             config,
@@ -61,6 +97,14 @@ class PI0:
         self.img_size = (224, 224)
         self.observation_window = None
         self.pi0_step = pi0_step
+
+    def scheduled_guidance_scale(self):
+        if self.online_critic is None or self.online_critic.num_updates <= 0:
+            return 0.0
+        if self.guidance_ramp_updates <= 0:
+            return self.guidance_scale_target
+        progress = min(1.0, self.online_critic.num_updates / float(self.guidance_ramp_updates))
+        return self.guidance_scale_target * progress
 
     # set img_size
     def set_img_size(self, img_size):
@@ -95,6 +139,19 @@ class PI0:
 
     def get_action(self):
         assert self.observation_window is not None, "update observation_window first!"
+        if self.online_critic is not None:
+            # Inject the current (traced) critic params so online updates take effect without an
+            # XLA recompile. The scheduled guidance scale is also traced, so changing it per
+            # call ramps guidance without compiling a sampler for each scalar value.
+            self.current_guidance_scale = self.scheduled_guidance_scale()
+            self.policy._sample_kwargs["critic_params"] = self.online_critic.params
+            self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
+                self.current_guidance_scale, dtype=jnp.float32
+            )
+            # Stash this control step's (obs, action) for the replay buffer.
+            out = self.policy.infer(self.observation_window)
+            self.online_critic.stash(out["critic_obs_img"], out["critic_obs_state"], out["critic_action"])
+            return out["actions"]
         return self.policy.infer(self.observation_window)["actions"]
 
     def reset_obsrvationwindows(self):

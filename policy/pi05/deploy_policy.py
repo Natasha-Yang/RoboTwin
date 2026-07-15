@@ -28,8 +28,23 @@ def get_model(usr_args):
                                                               usr_args["checkpoint_id"], usr_args["pi0_step"])
     critic_ckpt = usr_args.get("critic_ckpt", None)
     guidance_scale = usr_args.get("guidance_scale", 0.0)
+    guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
+    online_critic = usr_args.get("online_critic", False)
+    # Online QMFM Value-critic hyperparameters (forwarded from deploy_policy_online.yml).
+    critic_config = {
+        k: usr_args[k]
+        for k in (
+            "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
+            "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
+            "start_training", "utd_ratio",
+        )
+        if k in usr_args
+    }
+    critic_seed = usr_args.get("critic_seed", usr_args.get("seed", 0) or 0)
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
-               critic_ckpt=critic_ckpt, guidance_scale=guidance_scale)
+               critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
+               guidance_ramp_updates=guidance_ramp_updates,
+               online_critic=online_critic, critic_config=critic_config, critic_seed=critic_seed)
 
 
 def eval(TASK_ENV, model, observation):
@@ -59,3 +74,5 @@ def eval(TASK_ENV, model, observation):
 
 def reset_model(model):
     model.reset_obsrvationwindows()
+    if getattr(model, "online_critic", None) is not None:
+        model.online_critic.reset_episode()

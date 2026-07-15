@@ -222,8 +222,9 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         return_features: bool = False,
-        critic=None,
-        guidance_scale: float = 0.0,
+        critic_apply=None,
+        critic_params=None,
+        guidance_scale: float | at.Float[at.Array, ""] = 0.0,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
         """Sample an action chunk via flow-matching denoising.
 
@@ -234,13 +235,17 @@ class Pi0(_model.BaseModel):
         becomes ``(actions, {"action_features": feats})`` where ``feats`` has shape
         ``(batch, num_steps, action_horizon, feature_dim)``.
 
-        If ``critic`` is provided, the denoising is steered by critic gradient guidance,
-        following ``critic_ensemble_toy_example/tiny_flow_policy.py::sample_action``: at each
-        step the clean action chunk is estimated, the critic supplies ``d(value)/d(action)``,
-        that gradient is rescaled to the velocity norm, and ``guidance_scale`` times it steers
-        the velocity. ``critic`` must expose ``action_gradient(siglip, state, action)`` (numpy
-        in/out, see ``critic_guidance.py``); it is invoked on host via ``jax.pure_callback``.
-        This path takes precedence over ``return_features``.
+        If ``critic_apply``/``critic_params`` are provided, the denoising is steered by QMFM's
+        exact denoised-estimate gradient guidance (``QMFM/agents/mfm.py::compute_flow_actions``,
+        ``steer_use_denoised_estimate=True``): at each step the clean action chunk is estimated
+        (``x1 = x_t - t*v``), the value gradient ``grad_V = d/d(x_t) mean_k Q(obs, x1)`` is taken
+        **through** the velocity field, rescaled to the velocity norm, and ``guidance_scale``
+        (QMFM's ``steering_coeff``) times it steers the velocity. ``critic_apply(params, obs,
+        action)`` is the JAX apply of the QMFM ``Value`` ensemble (``qmfm_critic.py``); ``params``
+        is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
+        traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
+        static arg. Returns ``(actions, {"critic_obs_img", "critic_obs_state", "critic_action"})``
+        for online replay-buffer collection. This path takes precedence over ``return_features``.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -288,44 +293,42 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             return suffix_out[:, -self.action_horizon :]
 
-        if critic is not None:
-            # Critic gradient guidance, mirroring
-            # critic_ensemble_toy_example/tiny_flow_policy.py::TinyFlowPolicy.sample_action.
-            # The critic conditions on the head-camera SigLIP patch features (the raw
+        if critic_apply is not None and critic_params is not None:
+            # QMFM-exact denoised-estimate gradient guidance
+            # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
+            # The Value critic conditions on the head-camera SigLIP patch features (the raw
             # `aux["encoded"]`, 1152-d), which the image tower produces but embed_prefix
-            # discards -- so re-run it once here (constant across denoising steps).
+            # discards -- so re-run it once here (constant across denoising steps) and reshape
+            # to the 16x16 patch grid the CNN encoder expects.
             state = observation.state.astype(jnp.float32)
             _, img_aux = self.PaliGemma.img(observation.images["base_0_rgb"], train=False)
             siglip = img_aux["encoded"].astype(jnp.float32)  # (b, 256, 1152)
+            siglip_map = einops.rearrange(siglip, "b (h w) c -> b h w c", h=16, w=16)
+            critic_obs = (siglip_map, state)
 
             def guided_step(carry):
                 x_t, time = carry
                 v_t = self.action_out_proj(action_expert_features(x_t, time))
-                # Estimate the clean action chunk (flow target at t=0): x_0 = x_t - t * v_t.
-                x_0_hat = (x_t - time * v_t).astype(jnp.float32)
-                # Ask the (host-side) critic for d(value)/d(action) via an external callback.
-                grad = jax.pure_callback(
-                    critic.action_gradient,
-                    jax.ShapeDtypeStruct(x_t.shape, jnp.float32),
-                    siglip,
-                    state,
-                    x_0_hat,
-                ).astype(v_t.dtype)
-                # Project grad onto the normal of v_t: keep only the component of the critic
-                # gradient orthogonal to the flow velocity (remove the part parallel to v_t).
-                # Everything reduces over the action-dim axis only (keepdims=True), so each time
-                # step's action is projected/normalized independently rather than as one flat chunk.
-                # v_sq = jnp.sum(v_t * v_t, axis=-1, keepdims=True)
-                # parallel = jnp.sum(grad * v_t, axis=-1, keepdims=True) / (v_sq + 1e-9) * v_t
-                # grad = grad - parallel
-                # Rescale the critic gradient to the velocity norm at each time step, then nudge.
+
+                def value_fn(a):
+                    # Differentiate mean_k Q(obs, x1) w.r.t. x_t THROUGH the velocity field (QMFM).
+                    v = self.action_out_proj(action_expert_features(a, time))
+                    # Clean action estimate (flow target at t=0): x1 = x_t - t*v. QMFM clips to
+                    # [-1, 1]; pi0.5 normalized actions are ~standardized (not hard-bounded), so we
+                    # skip the clip to avoid distorting the estimate.
+                    x1 = (a - time * v).astype(jnp.float32)
+                    qs = critic_apply(critic_params, critic_obs, x1.reshape(x1.shape[0], -1))
+                    return qs.mean(axis=0).sum()
+
+                # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
+                grad = jax.grad(value_fn)(x_t).astype(v_t.dtype)
+                # Rescale the value gradient to the velocity norm at each step (QMFM steer_use_sigma_t=False).
                 grad_norm = jnp.linalg.norm(grad, axis=-1, keepdims=True)
                 v_norm = jnp.linalg.norm(v_t, axis=-1, keepdims=True)
                 grad = v_norm / (grad_norm + 1e-9) * grad
-                # The toy example ascends the critic with (v + scale*grad) because it integrates
-                # t=0->1 (dt>0). Here time runs t=1->0 with dt<0, so we subtract: the step
-                # dt*(-grad) moves the sample along +grad (uphill on the critic). `guidance_scale`
-                # is signed -- use a negative value if a lower critic value is the better one.
+                # QMFM ascends Q via v + steering_coeff*grad while integrating t=0->1. Here time
+                # runs t=1->0 with dt<0, so the step dt*(-grad) moves the sample along +grad
+                # (uphill on the critic). `guidance_scale` is QMFM's steering_coeff (>0 ascends Q).
                 return x_t + dt * (v_t - guidance_scale * grad), time + dt
 
             def guided_cond(carry):
@@ -334,7 +337,12 @@ class Pi0(_model.BaseModel):
                 return time >= -dt / 2
 
             x_0, _ = jax.lax.while_loop(guided_cond, guided_step, (noise, 1.0))
-            return x_0
+            aux = {
+                "critic_obs_img": siglip_map,
+                "critic_obs_state": state,
+                "critic_action": x_0,
+            }
+            return x_0, aux
 
         if not return_features:
 
