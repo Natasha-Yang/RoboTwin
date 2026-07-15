@@ -562,7 +562,7 @@ class TrainConfig:
 _CONFIGS = [
     # pi05_base 5 tasks, 5 clean expert demos each
     TrainConfig(
-        name="pi05_base_aloha_lora_clean_50x50",
+        name="pi05_base_aloha_lora_clean_50x10",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
             repo_id="NatashaYang/robotwin_demo_clean_50_lerobot",
@@ -587,9 +587,41 @@ _CONFIGS = [
                                     action_expert_variant="gemma_300m_lora").get_freeze_filter(),
         batch_size=32,  # the total batch_size not pre_gpu batch_size
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30000,
+        num_train_steps=6000,
         fsdp_devices=1,
         ema_decay=None,
+        episodes_per_task=10,  # select 10 episodes per RoboTwin task (not per instruction)
+    ),
+    TrainConfig(
+        name="pi05_base_aloha_lora_clean_50x5",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="NatashaYang/robotwin_demo_clean_50_lerobot",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora",
+                                    action_expert_variant="gemma_300m_lora").get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=3000,
+        fsdp_devices=1,
+        ema_decay=None,
+        episodes_per_task=5,  # select 10 episodes per RoboTwin task (not per instruction)
     ),
     TrainConfig(
         name="pi05_base_aloha_lora",
