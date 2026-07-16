@@ -17,6 +17,7 @@ seed=${5}
 gpu_id=${6}
 guidance_scale=${7:-0.3} # optional: target QMFM steering_coeff after the online ramp
 guidance_ramp_updates=${8:-256} # optional: TD updates to ramp 0 -> target; 0 jumps after first update
+cluster=${9:-false} # optional: CriticCluster gradient guidance (true/false)
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -35,4 +36,5 @@ python script/eval_policy_online.py --config policy/$policy_name/deploy_policy_o
     --seed ${seed} \
     --guidance_scale ${guidance_scale} \
     --guidance_ramp_updates ${guidance_ramp_updates} \
+    --cluster ${cluster} \
     --policy_name ${policy_name}

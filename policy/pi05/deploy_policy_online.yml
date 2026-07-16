@@ -22,6 +22,11 @@ pi0_step: 10
 online_critic: true
 guidance_scale: 0.3
 guidance_ramp_updates: 256
+# cluster: apply the CriticCluster gradient (critic_ensemble_toy_example) instead of the plain
+# ensemble-mean gradient -- split the critics into k=2 clusters, take each cluster's pessimistic-Q
+# steering gradient, and keep the one most cosine-aligned with the flow velocity. Costs ~1 extra
+# velocity backward per denoising step.
+cluster: false
 
 # Critic network (QMFM Value defaults; CNN encoder over the head SigLIP feature map)
 value_hidden_dims: [512, 512, 512, 512]

@@ -30,6 +30,10 @@ def get_model(usr_args):
     guidance_scale = usr_args.get("guidance_scale", 0.0)
     guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
     online_critic = usr_args.get("online_critic", False)
+    # CriticCluster gradient guidance toggle. Robust bool parse: CLI `--overrides cluster false`
+    # eval()s to the truthy string "false" otherwise (yaml `cluster: false` is already a bool).
+    cluster = usr_args.get("cluster", False)
+    cluster = cluster.strip().lower() in ("true", "1", "yes") if isinstance(cluster, str) else bool(cluster)
     # Online QMFM Value-critic hyperparameters (forwarded from deploy_policy_online.yml).
     critic_config = {
         k: usr_args[k]
@@ -44,7 +48,8 @@ def get_model(usr_args):
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
                guidance_ramp_updates=guidance_ramp_updates,
-               online_critic=online_critic, critic_config=critic_config, critic_seed=critic_seed)
+               online_critic=online_critic, critic_config=critic_config, critic_seed=critic_seed,
+               cluster=cluster)
 
 
 def eval(TASK_ENV, model, observation):

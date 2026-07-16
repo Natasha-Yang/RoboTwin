@@ -30,7 +30,7 @@ class PI0:
     def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
                  critic_ckpt=None, guidance_scale=0.0,
                  guidance_ramp_updates=0,
-                 online_critic=False, critic_config=None, critic_seed=0):
+                 online_critic=False, critic_config=None, critic_seed=0, cluster=False):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
@@ -75,10 +75,12 @@ class PI0:
             sample_kwargs = {
                 "critic_apply": self.online_critic.critic_apply,
                 "guidance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+                "cluster": bool(cluster),
             }
             print(f"[pi_model] online QMFM Value critic enabled "
                   f"(guidance_scale_target={self.guidance_scale_target}, "
                   f"guidance_ramp_updates={self.guidance_ramp_updates}, "
+                  f"cluster={bool(cluster)}, "
                   f"num_qs={cc['num_qs']}, "
                   f"action_dim_flat={cc['action_dim_flat']})")
         elif critic_ckpt:
