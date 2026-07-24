@@ -43,6 +43,75 @@ def eval_function_decorator(policy_name, model_name):
     except ImportError as e:
         raise e
 
+
+def visualize_debug_obs(observation, step_idx=0, save_dir=None, show=True):
+    """Visualize per-camera depth maps and the merged point cloud of an observation.
+
+    Enabled by `debug: true` in the task config. The observation layout follows
+    ``_base_task.get_obs`` (see envs/_base_task.py):
+      - observation["observation"][camera_name]["rgb"]:   H x W x 3 uint8
+      - observation["observation"][camera_name]["depth"]: H x W float64 depth in mm
+      - observation["pointcloud"]:                         N x 6 (xyz + rgb in [0, 1])
+
+    When ``show`` is True the figures/point-cloud open interactively (blocking, so
+    close each window to step forward). PNG/PLY copies are always written to
+    ``save_dir`` when it is provided, which keeps debug output usable headlessly.
+    """
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")  # no display: render to file only
+    import matplotlib.pyplot as plt
+
+    obs = observation.get("observation", {})
+    # Cameras that carry a depth map (head_camera, left_camera, right_camera, ...).
+    cam_names = [name for name, data in obs.items() if isinstance(data, dict) and "depth" in data]
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
+    # ---- Depth maps (with RGB reference on top) ----
+    if cam_names:
+        n = len(cam_names)
+        fig, axes = plt.subplots(2, n, figsize=(4 * n, 7), squeeze=False)
+        for i, name in enumerate(cam_names):
+            cam = obs[name]
+            if "rgb" in cam:
+                axes[0, i].imshow(cam["rgb"])
+            axes[0, i].set_title(f"{name} rgb")
+            axes[0, i].axis("off")
+            # Depth stored in mm; convert to meters and mask invalid (0) pixels.
+            depth_m = np.asarray(cam["depth"], dtype=np.float32) / 1000.0
+            masked = np.ma.masked_where(depth_m <= 0, depth_m)
+            im = axes[1, i].imshow(masked, cmap="turbo")
+            axes[1, i].set_title(f"{name} depth [m]")
+            axes[1, i].axis("off")
+            fig.colorbar(im, ax=axes[1, i], fraction=0.046, pad=0.04)
+        fig.suptitle(f"step {step_idx}")
+        fig.tight_layout()
+        if save_dir is not None:
+            fig.savefig(os.path.join(save_dir, f"depth_step{step_idx:04d}.png"), dpi=100)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    # ---- Point cloud ----
+    pcd = np.asarray(observation.get("pointcloud", []))
+    if pcd.ndim == 2 and pcd.shape[0] > 0:
+        try:
+            import open3d as o3d
+
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(pcd[:, :3])
+            if pcd.shape[1] >= 6:
+                cloud.colors = o3d.utility.Vector3dVector(np.clip(pcd[:, 3:6], 0.0, 1.0))
+            if save_dir is not None:
+                o3d.io.write_point_cloud(os.path.join(save_dir, f"pcd_step{step_idx:04d}.ply"), cloud)
+            if show:
+                frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+                o3d.visualization.draw_geometries([cloud, frame], window_name=f"pointcloud step {step_idx}")
+        except Exception as e:
+            print(f"[debug] point cloud visualization failed: {e}")
+
 def get_camera_config(camera_type):
     camera_config_path = os.path.join(parent_directory, "../task_config/_camera_config.yml")
 
@@ -124,6 +193,7 @@ def main(usr_args):
 
     save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
     save_dir.mkdir(parents=True, exist_ok=True)
+    args["eval_save_dir"] = str(save_dir)
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
@@ -223,6 +293,14 @@ def eval_policy(task_name,
 
     args["eval_mode"] = True
 
+    # Debug visualization of depth maps / point clouds (see visualize_debug_obs).
+    debug = args.get("debug", False)
+    debug_show = bool(os.environ.get("DISPLAY"))  # only pop up windows when a display exists
+    debug_save_dir = os.path.join(args.get("eval_save_dir", "eval_result"), "debug_vis") if debug else None
+    if debug:
+        print(f"\033[93m[debug] depth/point-cloud visualization ON "
+              f"(interactive={debug_show}, saving to {debug_save_dir})\033[0m")
+
     while succ_seed < test_num:
         render_freq = args["render_freq"]
         args["render_freq"] = 0
@@ -303,6 +381,14 @@ def eval_policy(task_name,
         reset_func(model)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
+            if debug:
+                visualize_debug_obs(
+                    observation,
+                    step_idx=TASK_ENV.take_action_cnt,
+                    save_dir=(os.path.join(debug_save_dir, f"episode{TASK_ENV.test_num}")
+                              if debug_save_dir else None),
+                    show=debug_show,
+                )
             eval_func(TASK_ENV, model, observation)
             if TASK_ENV.eval_success:
                 succ = True
