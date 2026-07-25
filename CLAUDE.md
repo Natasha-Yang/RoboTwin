@@ -255,6 +255,31 @@ bash collect_dataset.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05Ro
   `eval.sh`. Update to the new machine's layout.
 - **CUDA 12.8 requirement** is specific to the RTX 5090 + curobo. On an older GPU you
   may not need the `cuda128` env; drop the `PATH` prepend.
+- **pytorch3d must be rebuilt whenever torch changes — in BOTH envs.** pytorch3d ships
+  a compiled `_C.so` (used by `fps` in `envs/camera/camera.py` for point-cloud
+  downsampling) that is linked against a specific torch ABI. After torch was upgraded
+  to `2.7.0+cu128` (CXX11 ABI) for the 5090, the old build broke with
+  `ImportError: ... _C...so: undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocationESs`.
+  Worse, `camera.py` swallows this in a bare `except:` and prints only
+  `fps error: missing pytorch3d`, so the same message appears whether pytorch3d is
+  ABI-broken *or* simply not installed. The eval pipeline (`eval.sh`) runs in
+  `policy/pi05/.venv` (py3.11), while collection runs in the RoboTwin conda env
+  (py3.10) — **pytorch3d must be built into both**, or the env you happen to run in
+  will fail. Rebuild against the *current* torch with the CUDA 12.8 toolkit and the
+  5090's `sm_120` arch (pin the target interpreter by absolute path so the `cuda128`
+  env's own python does not shadow it):
+
+  ```bash
+  export CUDA_HOME=/home/natasha/miniconda3/envs/cuda128
+  export PATH="$CUDA_HOME/bin:$PATH"      # cuda128 nvcc (12.8); RoboTwin's default nvcc is 12.1 and lacks sm_120
+  export TORCH_CUDA_ARCH_LIST="12.0"      # Blackwell / RTX 5090
+  # RoboTwin conda env (collection):
+  /home/natasha/miniconda3/envs/RoboTwin/bin/python -m pip install --no-build-isolation --no-deps \
+    "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+  # pi05 .venv (eval / policy):
+  /home/natasha/RoboTwin/policy/pi05/.venv/bin/python -m pip install --no-build-isolation --no-deps \
+    "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+  ```
 - **`repo_id` must be consistent** between `generate.sh` (§3b) and the train config's
   `data.repo_id` (§4), or training loads the wrong / no dataset.
 - **HF Hub auth:** rollout-dataset push (§6) and any dataset/checkpoint pull need
