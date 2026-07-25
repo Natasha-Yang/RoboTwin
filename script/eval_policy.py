@@ -45,17 +45,21 @@ def eval_function_decorator(policy_name, model_name):
 
 
 def visualize_debug_obs(observation, step_idx=0, save_dir=None, show=True):
-    """Visualize per-camera depth maps and the merged point cloud of an observation.
+    """Visualize per-camera images (rgb / depth / segmentation) and the point cloud.
 
     Enabled by `debug: true` in the task config. The observation layout follows
-    ``_base_task.get_obs`` (see envs/_base_task.py):
-      - observation["observation"][camera_name]["rgb"]:   H x W x 3 uint8
-      - observation["observation"][camera_name]["depth"]: H x W float64 depth in mm
-      - observation["pointcloud"]:                         N x 6 (xyz + rgb in [0, 1])
+    ``_base_task.get_obs`` (see envs/_base_task.py); each entry is present only when
+    the matching ``data_type`` flag is enabled:
+      - observation["observation"][camera_name]["rgb"]:                H x W x 3 uint8
+      - observation["observation"][camera_name]["depth"]:              H x W float64 depth in mm
+      - observation["observation"][camera_name]["mesh_segmentation"]:  H x W x 3 uint8 (palette-colored)
+      - observation["observation"][camera_name]["actor_segmentation"]: H x W x 3 uint8 (palette-colored)
+      - observation["pointcloud"]:                                     N x 6 (xyz + rgb in [0, 1])
 
-    When ``show`` is True the figures/point-cloud open interactively (blocking, so
-    close each window to step forward). PNG/PLY copies are always written to
-    ``save_dir`` when it is provided, which keeps debug output usable headlessly.
+    Whichever image modalities are present get tiled into one figure (rows = modality,
+    columns = camera). When ``show`` is True the figure/point-cloud open interactively
+    (blocking, so close each window to step forward). PNG/PLY copies are always written
+    to ``save_dir`` when it is provided, which keeps debug output usable headlessly.
     """
     import matplotlib
     if not show:
@@ -63,33 +67,42 @@ def visualize_debug_obs(observation, step_idx=0, save_dir=None, show=True):
     import matplotlib.pyplot as plt
 
     obs = observation.get("observation", {})
-    # Cameras that carry a depth map (head_camera, left_camera, right_camera, ...).
-    cam_names = [name for name, data in obs.items() if isinstance(data, dict) and "depth" in data]
+    # Per-camera image modalities to tile, in display order (rendered when present).
+    image_modalities = ["rgb", "depth", "mesh_segmentation", "actor_segmentation"]
+    cam_names = [name for name, data in obs.items()
+                 if isinstance(data, dict) and any(m in data for m in image_modalities)]
+    # Rows = only the modalities that at least one camera actually carries.
+    rows = [m for m in image_modalities if any(m in obs[name] for name in cam_names)]
 
-    if save_dir is not None:
+    if save_dir is not None and (rows or observation.get("pointcloud", [])):
         os.makedirs(save_dir, exist_ok=True)
 
-    # ---- Depth maps (with RGB reference on top) ----
-    if cam_names:
-        n = len(cam_names)
-        fig, axes = plt.subplots(2, n, figsize=(4 * n, 7), squeeze=False)
-        for i, name in enumerate(cam_names):
+    # ---- Image modalities (rgb / depth / mesh & actor segmentation) ----
+    if cam_names and rows:
+        n, r = len(cam_names), len(rows)
+        fig, axes = plt.subplots(r, n, figsize=(4 * n, 3.5 * r), squeeze=False)
+        for ci, name in enumerate(cam_names):
             cam = obs[name]
-            if "rgb" in cam:
-                axes[0, i].imshow(cam["rgb"])
-            axes[0, i].set_title(f"{name} rgb")
-            axes[0, i].axis("off")
-            # Depth stored in mm; convert to meters and mask invalid (0) pixels.
-            depth_m = np.asarray(cam["depth"], dtype=np.float32) / 1000.0
-            masked = np.ma.masked_where(depth_m <= 0, depth_m)
-            im = axes[1, i].imshow(masked, cmap="turbo")
-            axes[1, i].set_title(f"{name} depth [m]")
-            axes[1, i].axis("off")
-            fig.colorbar(im, ax=axes[1, i], fraction=0.046, pad=0.04)
+            for ri, mod in enumerate(rows):
+                ax = axes[ri, ci]
+                ax.axis("off")
+                if mod not in cam:
+                    continue
+                if mod == "depth":
+                    # Depth stored in mm; convert to meters and mask invalid (0) pixels.
+                    depth_m = np.asarray(cam["depth"], dtype=np.float32) / 1000.0
+                    masked = np.ma.masked_where(depth_m <= 0, depth_m)
+                    im = ax.imshow(masked, cmap="turbo")
+                    ax.set_title(f"{name} depth [m]")
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                else:
+                    # rgb / mesh_segmentation / actor_segmentation are H x W x 3 uint8.
+                    ax.imshow(cam[mod])
+                    ax.set_title(f"{name} {mod}")
         fig.suptitle(f"step {step_idx}")
         fig.tight_layout()
         if save_dir is not None:
-            fig.savefig(os.path.join(save_dir, f"depth_step{step_idx:04d}.png"), dpi=100)
+            fig.savefig(os.path.join(save_dir, f"obs_step{step_idx:04d}.png"), dpi=100)
         if show:
             plt.show()
         plt.close(fig)
