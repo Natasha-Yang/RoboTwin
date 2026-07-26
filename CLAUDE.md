@@ -186,9 +186,12 @@ Run from `policy/pi05` in the RoboTwin conda env; the script `source`s `.venv` a
 
 ```bash
 cd policy/pi05
-bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id>
-# example
+bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
+             [guidance_scale] [guidance_ramp_updates]
+# baseline (no critic guidance)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
+# online critic-guided
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256
 ```
 
 - Driver: `script/eval_policy.py` with `policy/pi05/deploy_policy.yml`.
@@ -198,6 +201,62 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   come from `deploy_policy.yml`.
 - Camera → model mapping (in `deploy_policy.py::encode_obs` / `pi_model.py`):
   `head_camera → cam_high`, `left_camera → cam_left_wrist`, `right_camera → cam_right_wrist`.
+- Results land in `eval_result/<task_name>/<policy_name>/<task_config>/<ckpt_setting>/<timestamp>/`.
+  Alongside `_result.txt` / `_episode_results.csv`, each run snapshots `deploy_policy.yml` and the
+  `critic_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
+  The copies keep their comments but carry the values **actually used** — `eval.sh`'s positional
+  args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
+  as the `null`/default in the source yml.
+
+### 5a. Critic gradient guidance (`guidance_scale` is the on/off switch)
+
+There is **one** eval script and **one** config. `guidance_scale` in `deploy_policy.yml`
+(overridable as `eval.sh`'s 7th positional arg) decides whether a critic steers the frozen
+pi0.5 flow sampler in `Pi0.sample_actions`:
+
+| `guidance_scale` | Behavior |
+|---|---|
+| `0.0` (default) | plain pi0.5 baseline — no critic is built, no replay collection, no TD updates, no W&B |
+| nonzero | an ensemble QMFM `Value` critic is trained **online** by TD during the rollouts; guidance ramps `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+
+The ramp counts TD updates **performed in this run**. A critic warm-started from `critic_ckpt`
+restores the checkpoint's lifetime `num_updates` (an offline-trained one is in the hundreds), so
+using that counter directly would read as "ramp already finished" and apply full guidance from
+the first chunk; `PI0.scheduled_guidance_scale` subtracts the value at load time instead. W&B's
+`critic/update` still reports the lifetime count.
+
+`guidance_scale` defaults to whatever `deploy_policy.yml` says; the positional arg only
+overrides it (pass `0` to force the baseline). The critic's own hyperparameters are **not** in
+`deploy_policy.yml` — it carries `critic_config_path`, and `parse_args_and_config` merges that
+file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
+critic implementation and its config both come from the `multisensory_steering` package
+(editable install at `/home/natasha/multisensory-steering`, config at `cfgs/qmfm.yaml`), which
+imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` (default `/home/natasha/QMFM`, exported by
+`eval.sh`). Only the guided path logs to W&B, collects replay transitions, and honors
+`save_critic` / `critic_ckpt` / the TD hyperparameters; `script/eval_policy.py` keys all of it
+off whether the policy object exposes an `online_critic`.
+
+**The critic must be trained in pi0.5's model space.** `Pi0.sample_actions` scores the chunk
+it is sampling, *before* the output transform runs: **normalized** state `(14,)` and a
+**normalized** action chunk `(50, 14)` → flat `700`. The `14` is `critic_action_dim` — the
+model pads *both* state and actions to `action_dim=32`, but the trailing dims are constant
+zero for aloha, so the padding is stripped back off and only the embodiment's own dims reach
+the critic (`state_dim=14`, not 32).
+
+`critic_action_dim` is the width of `observation["joint_action"]["vector"]` (both arms plus
+grippers), so it follows the embodiment automatically. Nothing knows that width until the sim
+produces its first observation, so `PI0` builds the critic lazily in `_init_critic`, called
+from the first `update_observation_window` — `model.online_critic` is `None` until then.
+Anything needing to know *before* a rollout starts (e.g. whether to open a W&B run) must read
+`model.uses_online_critic` instead; `script/eval_policy.py` re-reads `model.online_critic`
+fresh at each use site for exactly this reason.
+
+Since architecture keys are taken *from* the checkpoint, a critic with the wrong shapes loads
+"successfully" and then fails with an opaque shape error mid-sampler, so `pi_model.py` checks
+`state_dim` / `action_dim_flat` up front and raises. That check catches a wrong embodiment or
+action horizon, but **not** a critic trained on the *raw* columns: those have the same widths
+as their `.model` counterparts and differ only in normalization, so nothing downstream can tell
+them apart. See §6 for collecting the right columns.
 
 For remote / server-based inference see `policy/pi05/docs/remote_inference.md`
 (`scripts/serve_policy.py`).
@@ -221,6 +280,104 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
   - `output_dir: ./rollout_datasets` — local `save_to_disk` location.
   - `push_to_hub: true`, `hub_repo_id: NatashaYang/robotwin_pi05_rollouts_dataset`.
   - `checkpoint_id: 30000`, `pi0_step: 50`, `instruction_type: unseen`.
+  - `collect_critic_obs: true` — also record the policy's **model-space** view of each step.
+  - `collect_siglip: true` — within that, also record the head-camera SigLIP patch features
+    (`siglip.head`); set false to keep the dataset small.
+  - `resume: true` — see below.
+
+Everything **beyond** rgb + qpos is decided by the **task config**, not by `collect_dataset.yml`:
+whatever its `data_type` block turns on reaches `envs/_base_task.py::get_obs`, and
+`extra_obs_columns` records all of it (§6b). `demo_clean` therefore yields only the columns in
+§6a's table, while `demo_clean_privileged` roughly doubles the bytes per row.
+
+Each episode is flushed to its own shard in `<output_dir>/<task>/<config>/<ckpt>_shards` the
+moment it finishes, and the shards are memory-mapped and concatenated into the final dataset at
+the end. A row costs ~1 MB resident (three uncompressed camera frames) plus ~576 KB when
+`collect_siglip` is on and ~1 MB more under a privileged task config, and a long task
+(`put_bottles_dustbin`, `step_lim` 1700, at `pi0_step`
+10) can reach five figures of rows, so accumulating a whole run in memory would run to tens of
+GB. Sharding also means a crashed run keeps its episodes: `progress.json` in the shard dir
+records the seed to resume from — which cannot be recomputed, since the seed sequence depends
+on which seeds the expert check rejected. Rerunning the same command continues from there
+(`resume: false` discards the shards and starts over). The shard dir is removed only after the
+dataset is saved and pushed.
+
+### 6a. Columns, and which ones a steering critic needs
+
+Each row is one policy call (one action chunk), in two different spaces:
+
+| Column | Space | Shape |
+|---|---|---|
+| `frame_index` | primitive sim step (`take_action_cnt`), not a row counter | scalar |
+| `observation.state` | raw env qpos | `(14,)` |
+| `action` | raw robot, unnormalized by the output transform | `(50, 14)` |
+| `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
+| `action.model` | **normalized**, embodiment dims | `(50, 14)` |
+| `siglip.head` | head-camera SigLIP patch features, fp16 | `(256, 1152)` |
+
+Each raw column and its `.model` counterpart have the same width and hold the same quantity in
+different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
+have not. Neither carries the model's internal zero padding to `action_dim=32` — it is stripped
+before the tensors leave the sampler, so `state_dim` is `14`, not `32`. Only `pi0_step` of the
+50 chunk steps are actually executed before the next inference call; the whole chunk is recorded
+because that is what the sampler scores.
+
+`frame_index` is the sim's own `take_action_cnt` at the moment the row's observation was taken,
+so rows are `pi0_step` frames apart (0, 10, 20, … at `pi0_step: 10`) rather than 1. Elapsed time
+is what consumers key off: `multisensory_steering`'s offline trainer discounts by the
+`frame_index` gap between consecutive rows and subsamples on `frame_index % horizon == 0`, so a
+row counter would under-discount by exactly `pi0_step`. Datasets collected this way need no
+`create_dataset.py rescale-frames` pass — and that pass will now refuse to run on them, since it
+checks that the gap is 1 first.
+
+The `.model` columns come from `Pi0.sample_actions(..., return_critic_obs=True)` — the same
+tensors the guided sampler scores — and are only present when `collect_critic_obs` is set. A
+critic intended to steer inside the sampler (§5a) **must** be trained on these; point
+`multisensory_steering`'s `cfgs/train_offline.yaml` at
+`state_col: observation.state.model` / `action_col: action.model`. The raw columns remain for
+behavior cloning and for critics that score executed robot actions.
+
+`siglip.head` is the third thing the critic conditions on, and is written **during collection**
+(`collect_siglip`) from `critic_obs_img` — the exact patch map `Pi0.sample_actions` feeds the
+critic, computed by the same `PaliGemma.img` tower on the same resized frame. It is stored as
+the flat `(256, 1152)` patch sequence (the CNN encoder reshapes to the 16×16 grid itself) in
+fp16, matching the online replay buffer, so it is a drop-in for the column
+`python -m multisensory_steering.create_dataset siglip` used to add in a second pass — point
+`siglip_cols: [siglip.head]` at it and skip that pass. That pass is still the way to add the
+*wrist* views (`siglip.left_wrist` / `siglip.right_wrist`); only the head camera reaches the
+critic inside the sampler. At ~576 KB/row this column dominates dataset size.
+
+### 6b. Extra data types (privileged task configs)
+
+`script/collect_dataset.py::extra_obs_columns` records everything else the observation carries,
+so the dataset follows the task config's `data_type` block automatically. With
+`demo_clean_privileged` (depth / pointcloud / third_view / mesh + actor segmentation all `true`)
+a row gains, per camera `<cam>` ∈ `head` / `left_wrist` / `right_wrist`:
+
+| Column | Type | Shape |
+|---|---|---|
+| `observation.depth.<cam>` | float32, **millimetres** | `(240, 320)` |
+| `observation.mesh_segmentation.<cam>` | PNG image, palette-colored labels | `(240, 320, 3)` |
+| `observation.actor_segmentation.<cam>` | PNG image, palette-colored labels | `(240, 320, 3)` |
+| `observation.camera.<cam>.{intrinsic_cv,extrinsic_cv,cam2world_gl}` | float32 | `(3,3)` / `(4,4)` |
+| `observation.images.third_view` | PNG image, observer camera | `(H, W, 3)` |
+| `observation.pointcloud` | float32, world-frame xyz + rgb | `(pcd_down_sample_num, 6)` |
+| `observation.endpose.{left,right}_endpose` | float32, xyz + quat | `(7,)` |
+| `observation.endpose.{left,right}_gripper` | float32, normalized width | scalar |
+
+Notes:
+- Sim camera names (`head_camera` / `left_camera` / `right_camera`) are shortened to the same
+  suffixes the rgb columns use (`head` / `left_wrist` / `right_wrist`).
+- The camera matrices ride along whenever depth or a point cloud does — depth is not
+  unprojectable without them, and the wrist extrinsics change every step. They are not a
+  `data_type` of their own; `get_obs` always returns them.
+- The schema is inferred from the first collected row (`build_features` / `infer_feature`), so
+  nothing has to be enumerated per data type. ndarrays become fixed-shape `ArrayND` columns; a
+  point cloud with `pcd_down_sample_num: 0` is ragged and falls back to a nested `Sequence`.
+- Measured on-disk cost: **~1.1 MB/row** for `demo_clean` (with `siglip.head`) vs **~2.2 MB/row**
+  for `demo_clean_privileged`. Depth is the bulk of the difference — the segmentation and
+  third-view columns are PNG-compressed. There is no per-column switch here: to collect less,
+  use a task config with fewer `data_type` flags.
 
 ---
 

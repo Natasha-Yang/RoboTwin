@@ -63,24 +63,6 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
-def _top_principal_direction(centered: jax.Array, n_iter: int = 15) -> jax.Array:
-    """Top right singular vector of ``centered`` ``(C, D)`` via power iteration on ``C^T C``.
-
-    A backend-agnostic, jit-friendly stand-in for the toy example's closed-form 2-D PCA
-    (``critic_ensemble_toy_example/critics.py::CriticCluster``), generalized to the flattened
-    pi0.5 action dim. Deterministic init from the largest-norm centered row; degenerate
-    (all-equal) gradients collapse to a zero direction, which the caller handles.
-    """
-    v = centered[jnp.argmax(jnp.linalg.norm(centered, axis=-1))]
-    v = v / (jnp.linalg.norm(v) + 1e-12)
-
-    def body(_, vv):
-        w = centered.T @ (centered @ vv)
-        return w / (jnp.linalg.norm(w) + 1e-12)
-
-    return jax.lax.fori_loop(0, n_iter, body, v)
-
-
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -243,7 +225,8 @@ class Pi0(_model.BaseModel):
         critic_apply=None,
         critic_params=None,
         guidance_scale: float | at.Float[at.Array, ""] = 0.0,
-        cluster: bool = False,
+        return_critic_obs: bool = False,
+        critic_action_dim: int | None = None,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
         """Sample an action chunk via flow-matching denoising.
 
@@ -260,18 +243,19 @@ class Pi0(_model.BaseModel):
         (``x1 = x_t - t*v``), the value gradient ``grad_V = d/d(x_t) mean_k Q(obs, x1)`` is taken
         **through** the velocity field, rescaled to the velocity norm, and ``guidance_scale``
         (QMFM's ``steering_coeff``) times it steers the velocity. ``critic_apply(params, obs,
-        action)`` is the JAX apply of the QMFM ``Value`` ensemble (``qmfm_critic.py``); ``params``
+        action)`` is the JAX apply of the QMFM ``Value`` ensemble (``multisensory_steering``); ``params``
         is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
         traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
         static arg. Returns ``(actions, {"critic_obs_img", "critic_obs_state", "critic_action"})``
         for online replay-buffer collection. This path takes precedence over ``return_features``.
 
-        If ``cluster`` is True, the ensemble gradient is instead formed with the ``CriticCluster``
-        algorithm (``critic_ensemble_toy_example/critics.py::CriticCluster.action_gradient``),
-        ported to JAX: the per-critic value gradients are split into k=2 clusters by the sign of
-        their projection onto the top principal direction, the pessimistic-Q steering gradient
-        (``mean - 0.5*std/sqrt(count)``) of EACH cluster is computed through the velocity, and the
-        one whose gradient best aligns (cosine) with the base velocity ``v_t`` is kept.
+        ``return_critic_obs`` returns that same aux dict from the **unguided** sampler, so
+        rollout-dataset collection records critic training data (model-space state and action
+        chunk, plus the SigLIP patch map) in exactly the space the guided path scores. Both the
+        returned ``critic_action`` (the full-horizon chunk, still *normalized*) and
+        ``critic_obs_state`` are narrowed to ``critic_action_dim`` embodiment dims -- i.e.
+        ``(action_horizon, 14)`` and ``(14,)`` for aloha, versus the unnormalized chunk
+        ``Policy.infer``'s output transform produces.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -319,17 +303,36 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             return suffix_out[:, -self.action_horizon :]
 
-        if critic_apply is not None and critic_params is not None:
-            # QMFM-exact denoised-estimate gradient guidance
-            # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
-            # The Value critic conditions on the head-camera SigLIP patch features (the raw
-            # `aux["encoded"]`, 1152-d), which the image tower produces but embed_prefix
-            # discards -- so re-run it once here (constant across denoising steps) and reshape
-            # to the 16x16 patch grid the CNN encoder expects.
-            state = observation.state.astype(jnp.float32)
+        # The critic works in *embodiment* dims, not the model's padded `action_dim`: AlohaInputs
+        # zero-pads 14 -> 32 on the way in, for both the state and the action chunk, and those
+        # trailing dims normalize to constant zero, so feeding them to the critic only widens its
+        # input with dead weights. `critic_action_dim` is the unpadded width (14 for aloha
+        # agilex, taken from the sim's own joint vector); None keeps the full padded tensors.
+        critic_ad = self.action_dim if critic_action_dim is None else int(critic_action_dim)
+
+        def critic_observation():
+            """The (SigLIP patch map, state) pair the Value critic conditions on.
+
+            The critic reads the head-camera SigLIP patch features (the raw `aux["encoded"]`,
+            1152-d), which the image tower produces but embed_prefix discards -- so re-run it
+            once here (constant across denoising steps) and reshape to the 16x16 patch grid the
+            CNN encoder expects. State is the model-space (normalized) state, narrowed to the
+            same `critic_ad` embodiment dims as the action chunk below.
+            """
+            state = observation.state.astype(jnp.float32)[..., :critic_ad]
             _, img_aux = self.PaliGemma.img(observation.images["base_0_rgb"], train=False)
             siglip = img_aux["encoded"].astype(jnp.float32)  # (b, 256, 1152)
             siglip_map = einops.rearrange(siglip, "b (h w) c -> b h w c", h=16, w=16)
+            return siglip_map, state
+
+        def critic_action_view(actions):
+            """The normalized `(b, action_horizon, critic_ad)` chunk the critic is scored on."""
+            return actions[..., :critic_ad]
+
+        if critic_apply is not None and critic_params is not None:
+            # QMFM-exact denoised-estimate gradient guidance
+            # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
+            siglip_map, state = critic_observation()
             critic_obs = (siglip_map, state)
 
             def guided_step(carry):
@@ -343,62 +346,14 @@ class Pi0(_model.BaseModel):
                     v = self.action_out_proj(action_expert_features(a, time))
                     return (a - time * v).astype(jnp.float32)
 
-                if cluster:
-                    # CriticCluster gradient guidance (critic_ensemble_toy_example/critics.py::
-                    # CriticCluster.action_gradient), ported to JAX.
-                    bsz = x_t.shape[0]
+                def value_fn(a):
+                    # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
+                    # Only the embodiment dims are scored, so the padded tail gets zero gradient.
+                    chunk = critic_action_view(x1_estimate(a))
+                    qs = critic_apply(critic_params, critic_obs, chunk.reshape(a.shape[0], -1))
+                    return qs.mean(axis=0).sum()
 
-                    # (1) Per-critic gradients d Q_c / d x1 at the current x1 (direct critic input;
-                    # critic-only backward -- this is the clustering decision, so stop-gradient).
-                    x1_flat = jax.lax.stop_gradient(x1_estimate(x_t)).reshape(bsz, -1)  # (b, adf)
-
-                    def qc_sum(x1f):
-                        return critic_apply(critic_params, critic_obs, x1f).sum(axis=1)  # (C,)
-
-                    g = jax.jacrev(qc_sum)(x1_flat)  # (C, b, adf)
-                    g = g / (jnp.linalg.norm(g, axis=-1, keepdims=True) + 1e-8)  # unit per critic
-
-                    # (2) k=2 clustering per sample: sign of the projection onto the top principal
-                    # direction of the centered unit gradients.
-                    def cluster_labels(gs):  # gs: (C, adf) -> (C,) bool
-                        centered = gs - gs.mean(axis=0, keepdims=True)
-                        return (centered @ _top_principal_direction(centered)) >= 0
-
-                    labels = jax.vmap(cluster_labels, in_axes=1)(g).T  # (C, b)
-                    mask_a = labels.astype(jnp.float32)
-                    mask_b = 1.0 - mask_a
-
-                    # (3) Pessimistic-Q steering gradient (THROUGH the velocity) over a critic subset.
-                    def pessimistic_grad(mask):  # mask: (C, b), a stop-grad constant
-                        def value_fn(a):
-                            qs = critic_apply(critic_params, critic_obs, x1_estimate(a).reshape(a.shape[0], -1))
-                            cnt = jnp.maximum(mask.sum(axis=0), 1.0)  # (b,)
-                            mean = (mask * qs).sum(axis=0) / cnt
-                            var = (mask * (qs - mean[None]) ** 2).sum(axis=0) / cnt
-                            return (mean - 0.5 * jnp.sqrt(var + 1e-12) / jnp.sqrt(cnt)).sum()
-
-                        return jax.grad(value_fn)(x_t).astype(v_t.dtype)
-
-                    grad_a = pessimistic_grad(mask_a)
-                    grad_b = pessimistic_grad(mask_b)
-
-                    # (4) Keep the cluster whose steering gradient aligns best (cosine) with v_t.
-                    def cos_with_v(gc):
-                        gf = gc.reshape(bsz, -1)
-                        vf = v_t.reshape(bsz, -1)
-                        return (gf * vf).sum(-1) / (
-                            jnp.linalg.norm(gf, axis=-1) * jnp.linalg.norm(vf, axis=-1) + 1e-9)  # (b,)
-
-                    cos_a = jnp.where(mask_a.sum(axis=0) > 0, cos_with_v(grad_a), -jnp.inf)
-                    cos_b = jnp.where(mask_b.sum(axis=0) > 0, cos_with_v(grad_b), -jnp.inf)
-                    grad = jnp.where((cos_a >= cos_b)[:, None, None], grad_a, grad_b)
-                else:
-                    def value_fn(a):
-                        # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
-                        qs = critic_apply(critic_params, critic_obs, x1_estimate(a).reshape(a.shape[0], -1))
-                        return qs.mean(axis=0).sum()
-
-                    grad = jax.grad(value_fn)(x_t).astype(v_t.dtype)
+                grad = jax.grad(value_fn)(x_t).astype(v_t.dtype)
 
                 # Rescale the value gradient to the velocity norm (QMFM steer_use_sigma_t=False,
                 # Eq 129) over the WHOLE flattened action chunk per sample -- matches QMFM's
@@ -422,7 +377,7 @@ class Pi0(_model.BaseModel):
             aux = {
                 "critic_obs_img": siglip_map,
                 "critic_obs_state": state,
-                "critic_action": x_0,
+                "critic_action": critic_action_view(x_0),
             }
             return x_0, aux
 
@@ -439,7 +394,16 @@ class Pi0(_model.BaseModel):
                 return time >= -dt / 2
 
             x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-            return x_0
+            if not return_critic_obs:
+                return x_0
+            # Unguided sampling, but emit the critic's view of this step so rollout collection
+            # can record critic training data in exactly the space the guided path scores.
+            siglip_map, state = critic_observation()
+            return x_0, {
+                "critic_obs_img": siglip_map,
+                "critic_obs_state": state,
+                "critic_action": critic_action_view(x_0),
+            }
 
         # Feature-recording path: accumulate the action-expert features from every denoising step.
         # `num_steps` must be a static Python int here (it is on the eval/rollout path).

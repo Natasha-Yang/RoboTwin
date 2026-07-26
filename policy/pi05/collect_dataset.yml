@@ -1,3 +1,8 @@
+# Which columns the dataset carries beyond rgb + qpos is decided by the *task config's*
+# `data_type` block, not here: everything `envs/_base_task.py::get_obs` puts in the observation
+# is recorded (depth, mesh/actor segmentation, point cloud, third-person view, endpose). So
+# `demo_clean_privileged` produces roughly twice the bytes per row that `demo_clean` does.
+
 # Basic experiment configuration (keep unchanged)
 policy_name: null
 task_name: null
@@ -9,12 +14,26 @@ instruction_type: unseen
 # Add Parameters You Need
 train_config_name: null
 model_name: null
-checkpoint_id: 30000
+checkpoint_id: 15000
 pi0_step: 10
 
 # Dataset collection parameters
-num_episodes: 100          # number of successful expert-checked rollouts to collect
+num_episodes: 50          # number of successful expert-checked rollouts to collect
 expert_check: true        # only roll out on seeds where the expert can solve the task
 output_dir: ./rollout_datasets   # where the HuggingFace dataset is saved (save_to_disk)
-hub_repo_id: NatashaYang/robotwin_pi05_clean_rollouts_dataset         # e.g. "username/robotwin-rollouts"; required if push_to_hub is true
+hub_repo_id: NatashaYang/robotwin_clean_ep25_hanging_mug_rollouts_dataset
 push_to_hub: true        # push the built dataset to the HuggingFace Hub
+
+# Episodes are flushed one shard at a time to `<output_dir>/.../<ckpt>_shards`, so RAM holds a
+# single episode and an interrupted run keeps what it already collected. With resume: true a
+# rerun of the same command continues from the seed recorded in that dir's progress.json; set
+# false to discard leftover shards and start the run over. The shard dir is deleted once the
+# dataset has been saved (and pushed).
+resume: true
+
+# Also record the policy's model-space view of each step as `observation.state.model` /
+# `action.model` (the normalized state and full action chunk, both in the embodiment's own dims
+# with the model's zero padding stripped). Critics meant to steer inside `Pi0.sample_actions`
+# must be trained on these, not on the raw `observation.state` / `action` columns -- point the
+# offline trainer's state_col / action_col at them.
+collect_critic_obs: true

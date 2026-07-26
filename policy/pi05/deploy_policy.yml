@@ -12,8 +12,27 @@ model_name: null
 checkpoint_id: 30000
 pi0_step: 10
 
-# Critic gradient guidance for the flow-matching sampler (optional).
-# critic_ckpt: path to a trained critic checkpoint (null disables guidance).
-# guidance_scale: strength of the critic-gradient nudge (0.0 = no effect).
-critic_ckpt: null
-guidance_scale: 0.0
+# Number of successful eval episodes to run.
+test_num: 50
+
+# ===== Online QMFM Value-critic gradient guidance =====
+# `guidance_scale` is QMFM's steering_coeff AND the on/off switch for the whole online path:
+#   0.0     -> plain pi0.5 sampling (baseline): no critic is built, no replay collection,
+#              no TD updates, no W&B logging.
+#   nonzero -> an ensemble `Value` critic (multisensory_steering) is trained ONLINE by TD
+#              during the eval rollouts and steers the frozen pi0.5 flow sampler via QMFM
+#              denoised-estimate gradient guidance (see `Pi0.sample_actions`).
+# Guidance starts at 0 and ramps linearly to `guidance_scale` over `guidance_ramp_updates` TD
+# updates *of this run* (0 = jump to the target after the first update). A critic warm-started
+# from `critic_ckpt` ramps in the same way -- its restored update counter does not count.
+# Both are overridable as eval.sh's 7th / 8th positional args.
+guidance_scale: 0.1
+guidance_ramp_updates: 256
+# Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
+critic_ckpt: /home/natasha/multisensory-steering/checkpoints/critic_offline/best.pkl
+
+# Everything below only takes effect when guidance_scale != 0.
+# Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
+# (or overridden on the eval.sh command line) wins over it.
+critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm.yaml
+

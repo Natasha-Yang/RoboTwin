@@ -27,14 +27,16 @@ def get_model(usr_args):
     train_config_name, model_name, checkpoint_id, pi0_step = (usr_args["train_config_name"], usr_args["model_name"],
                                                               usr_args["checkpoint_id"], usr_args["pi0_step"])
     critic_ckpt = usr_args.get("critic_ckpt", None)
-    guidance_scale = usr_args.get("guidance_scale", 0.0)
+    # `guidance_scale` is the single switch for the online critic path: 0 (the default) is
+    # plain pi0.5 sampling, anything else builds and TD-trains the online Value critic.
+    # Robust parse: `--overrides guidance_scale 0.3` eval()s to a float, but a malformed
+    # value stays a string, which must not silently read as "guidance on".
+    guidance_scale = float(usr_args.get("guidance_scale", 0.0) or 0.0)
     guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
-    online_critic = usr_args.get("online_critic", False)
-    # CriticCluster gradient guidance toggle. Robust bool parse: CLI `--overrides cluster false`
-    # eval()s to the truthy string "false" otherwise (yaml `cluster: false` is already a bool).
-    cluster = usr_args.get("cluster", False)
-    cluster = cluster.strip().lower() in ("true", "1", "yes") if isinstance(cluster, str) else bool(cluster)
-    # Online QMFM Value-critic hyperparameters (forwarded from deploy_policy_online.yml).
+    online_critic = guidance_scale != 0.0
+    # Online QMFM Value-critic hyperparameters. These reach usr_args via the deploy config's
+    # `critic_config_path` include (see eval_policy.parse_args_and_config), so the critic's
+    # own cfg file stays the source of truth for them.
     critic_config = {
         k: usr_args[k]
         for k in (
@@ -49,7 +51,8 @@ def get_model(usr_args):
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
                guidance_ramp_updates=guidance_ramp_updates,
                online_critic=online_critic, critic_config=critic_config, critic_seed=critic_seed,
-               cluster=cluster)
+               collect_critic_obs=usr_args.get("collect_critic_obs", False),
+               collect_siglip=usr_args.get("collect_siglip", True))
 
 
 def eval(TASK_ENV, model, observation):
@@ -65,16 +68,20 @@ def eval(TASK_ENV, model, observation):
 
     # ======== Get Action ========
 
-    actions = model.get_action()[:model.pi0_step]
+    actions = model.get_action()
 
-    for action in actions:
+    for action in actions[:model.pi0_step]:
         TASK_ENV.take_action(action)
         observation = TASK_ENV.get_obs()
         input_rgb_arr, input_state = encode_obs(observation)
         model.update_observation_window(input_rgb_arr, input_state)
 
     # ============================
-    return actions, initial_obs
+    # Trim the chunk to the embodiment's own action dims, i.e. the width of
+    # observation["joint_action"]["vector"] (1-D: both arms plus grippers). That is the same
+    # width the critic scores -- see PI0._init_critic.
+    action_dim = np.shape(initial_obs[1])[-1]
+    return actions[:, :action_dim], initial_obs
 
 
 def reset_model(model):

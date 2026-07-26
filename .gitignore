@@ -30,3 +30,5 @@ envs/curobo/*
 /*.txt
 
 policy/*/training_data/*
+
+rollout_datasets/*

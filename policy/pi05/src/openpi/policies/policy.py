@@ -68,7 +68,9 @@ class Policy(BasePolicy):
             # `guidance_scale` intentionally remains traced so online schedules can change it
             # per call without compiling a new sampler for every scalar value.
             self._sample_actions = nnx_utils.module_jit(
-                model.sample_actions, static_argnames=("return_features", "critic_apply", "cluster")
+                model.sample_actions,
+                static_argnames=("return_features", "critic_apply", "return_critic_obs",
+                                 "critic_action_dim"),
             )
             self._rng = rng or jax.random.key(0)
 

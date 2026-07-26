@@ -1,5 +1,16 @@
+"""Policy evaluation driver (expert feasibility check, seed loop, per-chunk rollout).
+
+If the policy exposes a ``model.online_critic`` (pi05 builds one only when
+``guidance_scale != 0``), the rollout additionally collects a chunk-level transition after
+every control step and runs TD updates on that critic, which steers the frozen pi0.5 flow
+sampler; the critic persists and keeps learning across episodes for the whole eval run, and
+progress is logged to W&B. With no critic this is the plain baseline rollout. Configure via
+``policy/<policy_name>/deploy_policy.yml``.
+"""
+
 import sys
 import os
+import re
 import subprocess
 
 sys.path.append("./")
@@ -24,6 +35,121 @@ from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+
+
+# ===== Online critic logging =====
+# Only used when the policy exposes a trained-online critic (pi05 with guidance_scale != 0);
+# the plain baseline never reaches any of this, so wandb stays an optional dependency.
+
+
+def init_wandb(usr_args, save_dir, current_time):
+    import wandb
+
+    if not usr_args.get("wandb_enabled", True):
+        wandb.init(mode="disabled")
+        return None
+
+    run_name = usr_args.get("wandb_run_name")
+    if run_name is None:
+        run_name = (
+            f"{usr_args['task_name']}-{usr_args['policy_name']}-"
+            f"{usr_args.get('model_name', 'model')}-seed{usr_args['seed']}-{current_time}"
+        )
+
+    init_kwargs = {
+        "project": usr_args.get("wandb_project", "qmfm"),
+        "name": run_name,
+        "config": {**usr_args, "eval_save_dir": str(save_dir)},
+        "dir": str(save_dir),
+        "tags": ["pi05", "online-critic", "eval"],
+        "entity": "natashayang04-university-of-toronto",
+    }
+    wandb_mode = usr_args.get("wandb_mode", None)
+    if wandb_mode is not None:
+        init_kwargs["mode"] = wandb_mode
+
+    run = wandb.init(**init_kwargs)
+    wandb.define_metric("critic/update")
+    wandb.define_metric("critic/*", step_metric="critic/update")
+    wandb.define_metric("rollout/*", step_metric="critic/update")
+    wandb.define_metric("eval/episode")
+    wandb.define_metric("eval/*", step_metric="eval/episode")
+    return run
+
+
+def _uses_online_critic(model):
+    """Whether this policy intends to run a trained-online critic.
+
+    Distinct from `model.online_critic`, which stays None until the critic is actually built
+    -- pi05 defers that to the first observation, since the critic's action width comes from
+    the embodiment's joint vector.
+    """
+    return bool(getattr(model, "uses_online_critic", getattr(model, "online_critic", None) is not None))
+
+
+def _scalar(value):
+    return float(np.asarray(value))
+
+
+def _window_mean(values):
+    return float(np.mean(values)) if values else 0.0
+
+
+def log_critic_update(wandb_run, online_critic, model, info, chunk_count, episode_idx, action_count):
+    if wandb_run is None or info is None:
+        return
+    buf = online_critic.buffer.size if online_critic.buffer is not None else 0
+    wandb_run.log({
+        "critic/update": int(online_critic.num_updates),
+        "critic/loss": _scalar(info["critic_loss"]),
+        "critic/q_mean": _scalar(info["q_mean"]),
+        "critic/q_max": _scalar(info["q_max"]),
+        "critic/q_min": _scalar(info["q_min"]),
+        "critic/target_q_mean": _scalar(info["target_q_mean"]),
+        "critic/reward_mean": _scalar(info["reward_mean"]),
+        "critic/buffer_size": int(buf),
+        "critic/guidance_scale": float(model.scheduled_guidance_scale()),
+        "critic/guidance_scale_target": float(model.guidance_scale_target),
+        "rollout/chunk_count": int(chunk_count),
+        "rollout/episode": int(episode_idx),
+        "rollout/action_count": int(action_count),
+    })
+
+
+def log_episode(
+    wandb_run,
+    online_critic,
+    model,
+    episode_idx,
+    success,
+    num_steps,
+    episode_reward,
+    success_rate,
+    success_rate_ma,
+    reward_ma,
+    ma_window,
+):
+    if wandb_run is None:
+        return
+    metrics = {
+        "eval/episode": int(episode_idx),
+        "eval/success": float(success),
+        "eval/num_steps": int(num_steps),
+        "eval/reward": float(episode_reward),
+        "eval/success_rate": float(success_rate),
+        "eval/success_rate_ma": float(success_rate_ma),
+        "eval/reward_ma": float(reward_ma),
+        "eval/ma_window": int(ma_window),
+    }
+    if online_critic is not None:
+        buf = online_critic.buffer.size if online_critic.buffer is not None else 0
+        metrics.update({
+            "critic/update": int(online_critic.num_updates),
+            "critic/buffer_size": int(buf),
+            "critic/guidance_scale": float(model.scheduled_guidance_scale()),
+            "critic/guidance_scale_target": float(model.guidance_scale_target),
+        })
+    wandb_run.log(metrics)
 
 
 def class_decorator(task_name):
@@ -144,6 +270,39 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
+def snapshot_config(src_path, values, dst_dir):
+    """Copy a yml config into `dst_dir` with the values actually used written in.
+
+    Comments and layout are preserved; a line is rewritten only when `values` resolves that
+    top-level key differently (a CLI override, or -- in the critic config -- a key the deploy
+    config shadows). Keys whose value opens a block on the next line are skipped: nothing
+    overrides those.
+    """
+    with open(src_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    original = yaml.safe_load("".join(lines)) or {}
+
+    for i, line in enumerate(lines):
+        match = re.match(r"^([A-Za-z_][\w.-]*):[ \t]+(\S[^\n]*?)[ \t]*$", line)
+        if match is None:  # comment, blank, indented, or a key with a block value
+            continue
+        key, raw_value = match.group(1), match.group(2)
+        if key not in values or values[key] == original.get(key):
+            continue
+        # Keep any trailing `# ...` comment, unless the value itself is quoted (a `#` could
+        # then be part of the string rather than the start of a comment).
+        comment = ""
+        if not raw_value.startswith(("'", '"')):
+            hash_at = raw_value.find(" #")
+            if hash_at != -1:
+                comment = "  " + raw_value[hash_at:].lstrip()
+        lines[i] = yaml.safe_dump({key: values[key]}, sort_keys=False).strip() + comment + "\n"
+
+    header = f"# Snapshot of {os.path.abspath(src_path)} as used by this eval run.\n"
+    with open(os.path.join(dst_dir, os.path.basename(src_path)), "w", encoding="utf-8") as f:
+        f.writelines([header] + lines)
+
+
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
@@ -208,6 +367,13 @@ def main(usr_args):
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)
 
+    # Snapshot the deploy config (and the critic config it includes) next to the results, with
+    # the CLI overrides written in, so a run's settings stay readable -- and accurate -- after
+    # the ymls are edited.
+    for config_path in (usr_args.get("_config_path"), usr_args.get("critic_config_path")):
+        if config_path and os.path.isfile(config_path):
+            snapshot_config(config_path, usr_args, save_dir)
+
     if args["eval_video_log"]:
         video_save_dir = save_dir
         camera_config = get_camera_config(args["camera"]["head_camera_type"])
@@ -241,12 +407,22 @@ def main(usr_args):
 
     seed = usr_args["seed"]
 
+    # Online-critic knobs (see deploy_policy.yml) forwarded into the eval loop; inert unless
+    # the policy actually built a critic.
+    args["train_freq"] = usr_args.get("train_freq", 1)
+    args["wandb_ma_window"] = usr_args.get("wandb_ma_window", 20)
+
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = usr_args.get("test_num", 100)
     topk = 1
 
     model = get_model(usr_args)
+    # The policy decides whether guidance is on (pi05: guidance_scale != 0). The critic object
+    # itself may not exist until the first observation (its shape depends on the embodiment),
+    # so W&B keys off the policy's declared intent rather than off `model.online_critic`.
+    wandb_run = init_wandb(usr_args, save_dir, current_time) if _uses_online_critic(model) else None
+
     st_seed, suc_num, episode_results = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -254,7 +430,8 @@ def main(usr_args):
                                    st_seed,
                                    test_num=test_num,
                                    video_size=video_size,
-                                   instruction_type=instruction_type)
+                                   instruction_type=instruction_type,
+                                   wandb_run=wandb_run)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -271,7 +448,16 @@ def main(usr_args):
     episode_results_df = pd.DataFrame(episode_results)
     episode_results_df.to_csv(episode_file_path)
 
+    # Persist the online-trained critic alongside the eval results.
+    online_critic = getattr(model, "online_critic", None)
+    if online_critic is not None and usr_args.get("save_critic", False):
+        critic_path = os.path.join(save_dir, "online_value_critic.pkl")
+        online_critic.save(critic_path)
+        print(f"saved online critic to {critic_path}")
+
     print(f"Data has been saved to {file_path}")
+    if wandb_run is not None:
+        wandb_run.finish()
     # return task_reward
 
 
@@ -282,7 +468,8 @@ def eval_policy(task_name,
                 st_seed,
                 test_num=100,
                 video_size=None,
-                instruction_type=None):
+                instruction_type=None,
+                wandb_run=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -294,7 +481,7 @@ def eval_policy(task_name,
     succ_seed = 0
     suc_test_seed_list = []
 
-    episode_results = {"num_steps": [], "success": []}
+    episode_results = {"num_steps": [], "success": [], "reward": [], "success_rate_ma": [], "reward_ma": []}
 
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
@@ -305,6 +492,18 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+
+    # ===== Online QMFM Value critic (trained across the whole eval run) =====
+    # The critic object is read fresh via `getattr(model, "online_critic", None)` at each use
+    # site rather than captured here: pi05 builds it lazily on the first observation, because
+    # its action width comes from the embodiment. It stays None for the plain baseline, which
+    # makes every critic block below inert.
+    train_freq = int(args.get("train_freq", 1))
+    ma_window = max(1, int(args.get("wandb_ma_window", 20)))
+    success_window = deque(maxlen=ma_window)
+    reward_window = deque(maxlen=ma_window)
+    chunk_count = 0
+    last_info = None
 
     # Debug visualization of depth maps / point clouds (see visualize_debug_obs).
     debug = args.get("debug", False)
@@ -392,6 +591,8 @@ def eval_policy(task_name,
 
         succ = False
         reset_func(model)
+        prev_success = False
+        episode_reward = 0.0
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             if debug:
@@ -403,11 +604,37 @@ def eval_policy(task_name,
                     show=debug_show,
                 )
             eval_func(TASK_ENV, model, observation)
-            if TASK_ENV.eval_success:
+            success_now = bool(TASK_ENV.eval_success)
+            reward = 1.0 if (success_now and not prev_success) else 0.0
+            episode_reward += reward
+
+            # Online critic: close the chunk transition (SARSA), then run a TD update.
+            online_critic = getattr(model, "online_critic", None)
+            if online_critic is not None:
+                done = success_now or (TASK_ENV.take_action_cnt >= TASK_ENV.step_lim)
+                online_critic.commit(reward, done)
+                chunk_count += 1
+                if chunk_count % train_freq == 0:
+                    info = online_critic.train_step()
+                    if info is not None:
+                        last_info = info
+                        log_critic_update(
+                            wandb_run,
+                            online_critic,
+                            model,
+                            info,
+                            chunk_count,
+                            TASK_ENV.test_num,
+                            TASK_ENV.take_action_cnt,
+                        )
+
+            prev_success = success_now
+            if success_now:
                 succ = True
                 break
         episode_results["num_steps"].append(TASK_ENV.take_action_cnt)
         episode_results["success"].append(succ)
+        episode_results["reward"].append(episode_reward)
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
@@ -418,6 +645,23 @@ def eval_policy(task_name,
         else:
             print("\033[91mFail!\033[0m")
 
+        # Online-critic diagnostics.
+        online_critic = getattr(model, "online_critic", None)
+        if online_critic is not None:
+            buf = online_critic.buffer.size if online_critic.buffer is not None else 0
+            guidance = model.scheduled_guidance_scale()
+            if last_info is not None:
+                print(f"\033[96m[critic]\033[0m buffer={buf} updates={online_critic.num_updates} "
+                      f"guidance={guidance:.4g}/{model.guidance_scale_target:.4g} "
+                      f"loss={float(last_info['critic_loss']):.4f} "
+                      f"q_mean={float(last_info['q_mean']):.3f} "
+                      f"target_q={float(last_info['target_q_mean']):.3f} "
+                      f"reward_mean={float(last_info['reward_mean']):.3f}")
+            else:
+                print(f"\033[96m[critic]\033[0m buffer={buf} "
+                      f"guidance={guidance:.4g}/{model.guidance_scale_target:.4g} "
+                      f"(warming up, no update yet)")
+
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
 
@@ -425,10 +669,32 @@ def eval_policy(task_name,
             TASK_ENV.viewer.close()
 
         TASK_ENV.test_num += 1
+        success_window.append(float(succ))
+        reward_window.append(float(episode_reward))
+        success_rate = TASK_ENV.suc / TASK_ENV.test_num
+        success_rate_ma = _window_mean(success_window)
+        reward_ma = _window_mean(reward_window)
+        episode_results["success_rate_ma"].append(success_rate_ma)
+        episode_results["reward_ma"].append(reward_ma)
+        log_episode(
+            wandb_run,
+            online_critic,
+            model,
+            TASK_ENV.test_num,
+            succ,
+            TASK_ENV.take_action_cnt,
+            episode_reward,
+            success_rate,
+            success_rate_ma,
+            reward_ma,
+            ma_window,
+        )
 
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
-            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
+            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(success_rate*100, 1)}%\033[0m "
+            f"(MA{ma_window}: \033[95m{round(success_rate_ma*100, 1)}%\033[0m, reward={reward_ma:.3f}), "
+            f"current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
         now_seed += 1
@@ -444,6 +710,16 @@ def parse_args_and_config():
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    # Policy-specific hyperparameters may be factored out into a file that ships with the
+    # implementation they configure (e.g. the critic config in the multisensory_steering
+    # repo, so it stays in sync with the critic that reads it). Merge it in *underneath* the
+    # deploy config: precedence is CLI overrides > deploy config > included file.
+    include_path = config.get("critic_config_path")
+    if include_path:
+        with open(include_path, "r", encoding="utf-8") as f:
+            included = yaml.safe_load(f) or {}
+        config = {**included, **config}
 
     # Parse overrides
     def parse_override_pairs(pairs):
@@ -461,6 +737,9 @@ def parse_args_and_config():
     if args.overrides:
         overrides = parse_override_pairs(args.overrides)
         config.update(overrides)
+
+    # Kept so `main` can copy the deploy config into the eval_result dir.
+    config["_config_path"] = args.config
 
     return config
 
