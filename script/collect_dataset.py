@@ -268,7 +268,7 @@ def collect_rollouts(usr_args, start=None):
             # so the indices run 0, 10, 20, ... at pi0_step=10. Consumers read elapsed time off
             # this column (multisensory_steering's offline trainer discounts by the gap between
             # consecutive rows), and a row counter would understate it by exactly that factor.
-            frame_index = TASK_ENV.take_action_cnt
+            frame_index = TASK_ENV.take_action_cnt * TASK_ENV.pi0_step
             # Record the first observation seen before this inference call.
             observation = TASK_ENV.get_obs()
 
