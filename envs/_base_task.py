@@ -98,6 +98,11 @@ class Base_Task(gym.Env):
 
         self.now_obs = {}
         self.take_action_cnt = 0
+        # Per-primitive-step end-effector contact wrench (see `_log_step_wrench`). Off by
+        # default: it queries every contact in the scene once per `take_action`, and only
+        # rollout-dataset collection records it.
+        self.record_step_wrench = kwags.get("record_step_wrench", False)
+        self.step_wrench = []
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
         self.save_freq = kwags.get("save_freq")
@@ -1504,6 +1509,27 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
+    def _log_step_wrench(self):
+        """Record the end-effector contact wrench left by the step that just finished.
+
+        One `{arm: (6,)}` sample per executed `take_action`, i.e. per primitive control step,
+        in the world frame (`envs/utils/wrench.py`). Enabled by `record_step_wrench`; a
+        `take_action` that returns without stepping the scene logs nothing.
+        """
+        if not self.record_step_wrench:
+            return
+        self.step_wrench.append(tcp_wrench_vector(self))
+
+    def pop_step_wrench(self):
+        """Return the wrench samples logged since the last call, and clear the log.
+
+        Called once per policy inference by `script/collect_dataset.py`, so what comes back is
+        the wrench at every primitive step the chunk just executed (at most `pi0_step` of them
+        — fewer when the episode ended mid-chunk).
+        """
+        samples, self.step_wrench = self.step_wrench, []
+        return samples
+
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
@@ -1685,10 +1711,12 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
+                self._log_step_wrench()
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
+        self._log_step_wrench()
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()

@@ -3,10 +3,11 @@
 Given a checkpoint (via the policy's ``deploy_policy`` interface), a task config and a
 task name, this collects rollout episodes and stores, for every policy inference step,
 the observations from the three cameras (head / left wrist / right wrist), the action
-chunk executed, and whether the episode ultimately succeeded. Whatever else the task
-config's ``data_type`` block enables -- depth, segmentation, point cloud, third-person
-view, end-effector poses -- is recorded alongside them (see extra_obs_columns), so
-``demo_clean_privileged`` yields a much wider dataset than ``demo_clean``.
+chunk executed, the end-effector contact wrench at every primitive step of that chunk, and
+whether the episode ultimately succeeded. Whatever else the task config's ``data_type``
+block enables -- depth, segmentation, point cloud, third-person view, end-effector poses --
+is recorded alongside them (see extra_obs_columns), so ``demo_clean_privileged`` yields a
+much wider dataset than ``demo_clean``.
 
 Model loading stays policy-specific: we reuse the ``get_model`` / ``eval`` / ``encode_obs``
 / ``reset_model`` interface defined in ``policy/<policy_name>/deploy_policy.py`` (the same
@@ -40,6 +41,7 @@ from PIL import Image
 import datasets
 
 from envs.utils.create_actor import UnStableError
+from envs.utils.wrench import WRENCH_COMPONENTS
 from generate_episode_instructions import *
 
 # Reuse env-setup helpers from the evaluation entrypoint so the two stay in sync.
@@ -65,8 +67,33 @@ def camera_suffix(name):
     return name[:-len("_camera")] if name.endswith("_camera") else name
 
 
-def extra_obs_columns(observation, fixed_pcd=True):
-    """Columns for whatever extra data types the task config enabled.
+def wrench_columns(step_wrench, num_steps):
+    """Per-arm end-effector contact wrench, one sample per primitive step of the chunk.
+
+    `step_wrench` is what `_base_task.pop_step_wrench` collected while the chunk was executing:
+    a `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame.
+    It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use --
+    the only difference is the rate: `eval_policy.py` samples once per policy call, here every
+    step in between is kept.
+
+    Padded to `(num_steps, 6)` (i.e. `(pi0_step, 6)`) with NaN, so the column has one fixed
+    shape across the dataset. Only an episode's last chunk is ever short -- `take_action` stops
+    stepping once the task succeeds or `step_lim` is hit -- and NaN marks those steps as never
+    executed, where zeros would read as the arm touching nothing.
+    """
+    if not step_wrench:
+        return {}
+    cols = {}
+    for arm in step_wrench[0]:
+        samples = np.asarray([sample[arm] for sample in step_wrench], dtype=np.float32)[:num_steps]
+        padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
+        padded[:len(samples)] = samples
+        cols[f"observation.wrench.{arm}"] = padded
+    return cols
+
+
+def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
+    """Columns for whatever extra data types the task config enabled, plus the contact wrench.
 
     The `data_type` block of `task_config/*.yml` decides what `_base_task.get_obs` puts in the
     observation (see `envs/_base_task.py::get_obs`): `depth`, `mesh_segmentation` and
@@ -77,9 +104,11 @@ def extra_obs_columns(observation, fixed_pcd=True):
     without them and the wrist cameras move every step.
 
     Driven off what the observation actually contains rather than off the flags, so a data type
-    added upstream is picked up without a change here.
+    added upstream is picked up without a change here. The wrench is the exception: contacts are
+    a scene query rather than part of the observation, so it is sampled during the rollout and
+    handed in as `step_wrench` (see wrench_columns).
     """
-    cols = {}
+    cols = wrench_columns(step_wrench, num_steps)
     cameras = observation.get("observation", {})
     wants_geometry = len(observation.get("pointcloud", [])) > 0 or any(
         "depth" in cam_obs for cam_obs in cameras.values())
@@ -203,12 +232,18 @@ def collect_rollouts(usr_args, start=None):
 
     args, TASK_ENV = build_env_args(usr_args)
     args["eval_mode"] = True
+    # Have the env log the end-effector contact wrench after every primitive step, so each row
+    # carries the whole (pi0_step, 6) trace of the chunk it executed (see wrench_columns).
+    args["record_step_wrench"] = True
     clear_cache_freq = args["clear_cache_freq"]
     # Point clouds are only a fixed-shape column when the sim downsamples them to a set number
     # of points (see extra_obs_columns).
     fixed_pcd = int(args.get("pcd_down_sample_num", 0)) > 0
 
     model = get_model(usr_args)
+    # Actions actually executed per inference call, i.e. how many wrench samples a full chunk
+    # produces. The model's own value wins: it is what deploy_policy slices the chunk with.
+    pi0_step = int(getattr(model, "pi0_step", usr_args["pi0_step"]))
 
     st_seed = 100000 * (1 + usr_args["seed"])
     now_seed = st_seed
@@ -263,16 +298,21 @@ def collect_rollouts(usr_args, start=None):
         frame_records = []
         reset_func(model)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
-            # The sim's own step counter, i.e. the primitive time step this observation was
-            # taken at -- NOT a count of inference calls. Each call executes `pi0_step` actions,
-            # so the indices run 0, 10, 20, ... at pi0_step=10. Consumers read elapsed time off
-            # this column (multisensory_steering's offline trainer discounts by the gap between
-            # consecutive rows), and a row counter would understate it by exactly that factor.
-            frame_index = TASK_ENV.take_action_cnt * TASK_ENV.pi0_step
+            # Actions taken so far, NOT inference calls: `_base_task.take_action` bumps
+            # `take_action_cnt` once per call and `deploy_policy.eval` calls it once per action,
+            # `pi0_step` times per chunk -- so the indices run 0, 10, 20, ... at pi0_step=10 (as
+            # the collected datasets show). Consumers read elapsed time off this column
+            # (multisensory_steering's offline trainer discounts by the gap between consecutive
+            # rows), so a row counter would understate it by exactly that factor -- and scaling
+            # this one by pi0_step would overstate it by the same factor.
+            frame_index = TASK_ENV.take_action_cnt
             # Record the first observation seen before this inference call.
             observation = TASK_ENV.get_obs()
 
             actions, initial_obs = eval_func(TASK_ENV, model, observation)
+            # Everything the env logged while the chunk was executing: one wrench sample per
+            # primitive step. Popped per inference call, so it never spans two rows.
+            step_wrench = TASK_ENV.pop_step_wrench()
 
             input_rgb_arr, input_state = initial_obs
             head_rgb, right_rgb, left_rgb = input_rgb_arr
@@ -287,9 +327,11 @@ def collect_rollouts(usr_args, start=None):
                 "task": instruction,
             }
 
-            # Whatever else the task config's data_type block turned on -- depth, segmentation,
-            # point cloud, third-person view, end-effector poses. Empty for the plain configs.
-            record.update(extra_obs_columns(observation, fixed_pcd=fixed_pcd))
+            # The per-step contact wrench, plus whatever else the task config's data_type block
+            # turned on -- depth, segmentation, point cloud, third-person view, end-effector
+            # poses (those are empty for the plain configs).
+            record.update(extra_obs_columns(observation, step_wrench=step_wrench,
+                                            num_steps=pi0_step, fixed_pcd=fixed_pcd))
 
             # Model-space copies of the same step, for critics that score the policy's own
             # normalized action chunk (as `Pi0.sample_actions` does when steering). The columns
