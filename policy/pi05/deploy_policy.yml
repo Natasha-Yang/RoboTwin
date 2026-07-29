@@ -9,7 +9,7 @@ instruction_type: unseen
 # Add Parameters You Need
 train_config_name: null
 model_name: null
-checkpoint_id: 30000
+checkpoint_id: 15000
 pi0_step: 10
 
 # Number of successful eval episodes to run.
@@ -26,7 +26,7 @@ test_num: 50
 # updates *of this run* (0 = jump to the target after the first update). A critic warm-started
 # from `critic_ckpt` ramps in the same way -- its restored update counter does not count.
 # Both are overridable as eval.sh's 7th / 8th positional args.
-guidance_scale: 0.1
+guidance_scale: 0
 guidance_ramp_updates: 256
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
 critic_ckpt: /home/natasha/multisensory-steering/checkpoints/critic_offline/best.pkl
