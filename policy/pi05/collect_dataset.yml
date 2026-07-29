@@ -37,3 +37,10 @@ resume: true
 # must be trained on these, not on the raw `observation.state` / `action` columns -- point the
 # offline trainer's state_col / action_col at them.
 collect_critic_obs: true
+
+# Within that, also record the SigLIP patch features the sampler's own image tower produces --
+# one `siglip.<view>` column per camera the policy sees, i.e. head plus both wrists for aloha
+# agilex. This is what a steering critic conditions on, and at ~576 KB/row *per view* it is what
+# dominates the dataset's size. `true` records every view, `false` none, or list the ones you
+# want: `collect_siglip: [head, left_wrist]`.
+collect_siglip: true

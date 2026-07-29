@@ -41,7 +41,8 @@ from PIL import Image
 import datasets
 
 from envs.utils.create_actor import UnStableError
-from envs.utils.wrench import WRENCH_COMPONENTS
+from envs.utils.obs_modalities import camera_suffix
+from envs.utils.wrench import stack_step_wrench
 from generate_episode_instructions import *
 
 # Reuse env-setup helpers from the evaluation entrypoint so the two stay in sync.
@@ -56,17 +57,6 @@ from envs import CONFIGS_PATH
 import yaml
 
 
-# Cameras keep their sim names in the observation dict (`head_camera`, `left_camera`, ...);
-# the dataset uses the short suffixes the rgb columns already use.
-CAMERA_SUFFIX = {"head_camera": "head", "left_camera": "left_wrist", "right_camera": "right_wrist"}
-
-
-def camera_suffix(name):
-    if name in CAMERA_SUFFIX:
-        return CAMERA_SUFFIX[name]
-    return name[:-len("_camera")] if name.endswith("_camera") else name
-
-
 def wrench_columns(step_wrench, num_steps):
     """Per-arm end-effector contact wrench, one sample per primitive step of the chunk.
 
@@ -74,22 +64,12 @@ def wrench_columns(step_wrench, num_steps):
     a `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame.
     It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use --
     the only difference is the rate: `eval_policy.py` samples once per policy call, here every
-    step in between is kept.
-
-    Padded to `(num_steps, 6)` (i.e. `(pi0_step, 6)`) with NaN, so the column has one fixed
-    shape across the dataset. Only an episode's last chunk is ever short -- `take_action` stops
-    stepping once the task succeeds or `step_lim` is hit -- and NaN marks those steps as never
-    executed, where zeros would read as the arm touching nothing.
+    step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`,
+    one fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online
+    view of the same modality (`envs/utils/obs_modalities.py`).
     """
-    if not step_wrench:
-        return {}
-    cols = {}
-    for arm in step_wrench[0]:
-        samples = np.asarray([sample[arm] for sample in step_wrench], dtype=np.float32)[:num_steps]
-        padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
-        padded[:len(samples)] = samples
-        cols[f"observation.wrench.{arm}"] = padded
-    return cols
+    return {f"observation.wrench.{arm}": samples
+            for arm, samples in stack_step_wrench(step_wrench, num_steps).items()}
 
 
 def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
@@ -344,12 +324,12 @@ def collect_rollouts(usr_args, start=None):
             if critic_obs is not None:
                 record["observation.state.model"] = critic_obs["state"].tolist()
                 record["action.model"] = critic_obs["action"].tolist()
-                # Head-camera SigLIP patch features, straight from the sampler's own image
-                # tower -- the third thing the critic conditions on. Kept as a numpy array
-                # (an Array2D column, see build_dataset) rather than a nested list: at
-                # 256x1152 per row, `.tolist()` would cost ~24 MB of Python floats a step.
-                if "siglip" in critic_obs:
-                    record["siglip.head"] = critic_obs["siglip"]
+                # SigLIP patch features for each camera view the policy sees, straight from the
+                # sampler's own image tower -- what the critic conditions on, keyed by the same
+                # `siglip.<view>` names it uses online. Kept as numpy arrays (Array2D columns,
+                # see build_features) rather than nested lists: at 256x1152 per view per row,
+                # `.tolist()` would cost ~24 MB of Python floats a view a step.
+                record.update(critic_obs.get("siglip", {}))
 
             frame_records.append(record)
 
@@ -434,13 +414,14 @@ def build_features(record):
     if "action.model" in record:
         features["observation.state.model"] = datasets.Sequence(datasets.Value("float32"))
         features["action.model"] = datasets.Sequence(datasets.Sequence(datasets.Value("float32")))
-    # Head-camera SigLIP patch features (collect_siglip): the same (256, 1152) column
+    # Per-camera SigLIP patch features (collect_siglip): the same (256, 1152) columns
     # `multisensory_steering.create_dataset siglip` used to add in a second pass, produced here
-    # by the sampler's own image tower. Array2D keeps it a compact fixed-shape ndarray column
-    # instead of a nested-list Sequence, which is what makes storing it inline affordable.
-    if "siglip.head" in record:
-        siglip = np.asarray(record["siglip.head"])
-        features["siglip.head"] = datasets.Array2D(shape=siglip.shape, dtype=str(siglip.dtype))
+    # by the sampler's own image tower. Array2D keeps them compact fixed-shape ndarray columns
+    # instead of nested-list Sequences, which is what makes storing them inline affordable.
+    for key, value in record.items():
+        if key.startswith("siglip."):
+            value = np.asarray(value)
+            features[key] = datasets.Array2D(shape=value.shape, dtype=str(value.dtype))
     # Everything the task config's data_type block added (depth / segmentation / pointcloud /
     # third view / endpose), typed from the value itself.
     for key, value in record.items():
@@ -471,7 +452,7 @@ def main(usr_args):
 
     # Each episode is flushed to its own on-disk shard the moment it finishes, so RAM holds one
     # episode (tens of MB) rather than the whole run: a row costs ~1 MB resident (three
-    # uncompressed camera frames, plus ~576 KB when siglip.head is collected, and ~1 MB more
+    # uncompressed camera frames, plus ~576 KB per SigLIP view collected, and ~1 MB more
     # under a privileged task config -- depth alone is a float32 map per camera), and a long
     # task at 100 episodes runs to five figures of rows. It also means an interrupted run keeps the
     # episodes it already paid for -- `progress.json` records the seed to resume from, since the

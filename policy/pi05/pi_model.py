@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi.models import model as _model
+from openpi.models.pi0 import SIGLIP_MODALITIES
 from openpi.policies import aloha_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import download
@@ -44,10 +45,11 @@ class PI0:
         # Rollout-dataset collection: record the critic's model-space view of each control
         # step (see get_action / last_critic_obs). Independent of guidance.
         self.collect_critic_obs = bool(collect_critic_obs)
-        # Also keep the head-camera SigLIP patch features the critic conditions on. They are
-        # by far the largest thing per row (256x1152 fp16 = 576 KB), so they can be dropped
-        # while still recording the state/action columns.
-        self.collect_siglip = self.collect_critic_obs and bool(collect_siglip)
+        # Also keep the SigLIP patch features the critic conditions on, one column per camera
+        # view. They are by far the largest thing per row (256x1152 fp16 = 576 KB *per view*),
+        # so `collect_siglip` also takes a list of views to record a subset -- see
+        # _siglip_views. Empty tuple = record none, and the state/action columns still go in.
+        self.collect_siglip = self._siglip_views(collect_siglip) if self.collect_critic_obs else ()
         self.last_critic_obs = None
 
         config = _config.get_config(self.train_config_name)
@@ -69,6 +71,12 @@ class PI0:
         self.uses_online_critic = bool(online_critic)
         self.online_critic = None
         self.critic_action_dim = None
+        # Sensor modalities from the sim observation (depth / point cloud / contact wrench --
+        # see envs/utils/obs_modalities.py), handed in by deploy_policy.eval. The model itself
+        # only produces `state` and a `siglip.<view>` map per camera; everything else the critic
+        # conditions on arrives this way. Populated only when a critic is actually running.
+        self.critic_obs_extra = {}
+        self._critic_extra_shapes = {}
         self._critic_updates_at_start = 0
         self._critic_ckpt = critic_ckpt
         self._critic_config = dict(critic_config or {})
@@ -89,6 +97,28 @@ class PI0:
         self.img_size = (224, 224)
         self.observation_window = None
         self.pi0_step = pi0_step
+
+    @staticmethod
+    def _siglip_views(collect_siglip):
+        """`collect_siglip` -> the SigLIP modalities to record, in the policy's camera order.
+
+        `true` takes every view the policy sees (head plus both wrists for aloha agilex),
+        `false` none. A list records a subset -- each 256x1152 fp16 map is ~576 KB/row, so the
+        three of them are what dominates a rollout dataset's size -- named either the short way
+        (`head`, `left_wrist`) or as the modality itself (`siglip.head`).
+        """
+        views = tuple(SIGLIP_MODALITIES.values())
+        if collect_siglip is None or isinstance(collect_siglip, bool):
+            return views if collect_siglip else ()
+        if isinstance(collect_siglip, str):
+            collect_siglip = [collect_siglip]
+        wanted = {v if str(v).startswith("siglip.") else f"siglip.{v}" for v in collect_siglip}
+        if unknown := sorted(wanted - set(views)):
+            raise ValueError(
+                f"collect_siglip names camera view(s) the policy does not have: {unknown}. "
+                f"Available: {[v.split('.', 1)[1] for v in views]} (or true / false)."
+            )
+        return tuple(view for view in views if view in wanted)
 
     def _init_critic(self, state):
         """Set up the critic path now that the embodiment's action width is known.
@@ -111,7 +141,8 @@ class PI0:
                     "return_critic_obs": True,
                     "critic_action_dim": self.critic_action_dim,
                 })
-                siglip = "with head-camera SigLIP patch features" if self.collect_siglip else "no SigLIP"
+                siglip = (f"with SigLIP patch features: {', '.join(self.collect_siglip)}"
+                          if self.collect_siglip else "no SigLIP")
                 print(f"[pi_model] recording model-space critic observations for dataset "
                       f"collection (action chunk={chunk}, {siglip})")
             return
@@ -124,7 +155,29 @@ class PI0:
         cc["state_dim"] = self.critic_action_dim
         cc["siglip_channels"] = 1152
         cc["siglip_grid"] = 16
+        # Everything the critic *may* condition on this run: the modalities the sampler produces
+        # itself -- the state and one SigLIP patch map per camera the policy is given, the wrist
+        # views as well as the head -- plus whichever sensors the task config's `data_type`
+        # turned on (they are in `critic_obs_extra` because the first observation has already
+        # been handed in). Which of them it actually uses is decided downstream, by the critic's
+        # own `encoder_modalities` config -- this side just declares what is on offer, and the
+        # critic raises if it was configured for something the sim is not producing.
+        siglip_shape = (cc["siglip_grid"], cc["siglip_grid"], cc["siglip_channels"])
+        cc["obs_shapes"] = {
+            **{view: siglip_shape for view in SIGLIP_MODALITIES.values()},
+            "state": (self.critic_action_dim,),
+            **{key: tuple(np.shape(value)) for key, value in self.critic_obs_extra.items()},
+        }
         self.online_critic = load_critic(cc, self._critic_ckpt)
+        # The subset that has to be shipped into the sampler on every call (the other two are
+        # built in there). Their shapes are fixed here and enforced per step: a point cloud
+        # collected with `pcd_down_sample_num: 0` has a different N every step, which would
+        # otherwise surface as an XLA recompile per control step.
+        self._critic_extra_shapes = {
+            key: cc["obs_shapes"][key]
+            for key in self.online_critic.obs_keys
+            if key in self.critic_obs_extra
+        }
         # A warm-started critic restores its lifetime update counter from the checkpoint (an
         # offline-trained one is in the hundreds/thousands), so the ramp has to be measured
         # against where *this* run started -- otherwise it reads as already finished and
@@ -155,12 +208,16 @@ class PI0:
         })
         warm = (f"warm-started from {self._critic_ckpt} at "
                 f"{self._critic_updates_at_start} updates" if self._critic_ckpt else "from scratch")
+        unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
         print(f"[pi_model] online QMFM Value critic enabled ({warm}, "
               f"guidance_scale_target={self.guidance_scale_target}, "
               f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
               f"TD update), "
               f"num_qs={cc['num_qs']}, action chunk={chunk} "
               f"-> action_dim_flat={cc['action_dim_flat']})")
+        print(f"[pi_model] critic observation: "
+              + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
+              + (f" (available but unused: {', '.join(unused)})" if unused else ""))
 
     def scheduled_guidance_scale(self):
         """Guidance ramps 0 -> target over the first `guidance_ramp_updates` TD updates.
@@ -190,9 +247,19 @@ class PI0:
         print(f"successfully set instruction:{instruction}")
 
     # Update the observation window buffer
-    def update_observation_window(self, img_arr, state):
+    def update_observation_window(self, img_arr, state, critic_obs=None):
+        """Set the observation the next `get_action` runs on.
+
+        `critic_obs` is the sim's sensor modalities for this control step (depth / point cloud /
+        contact wrench, from `envs/utils/obs_modalities.py`). It is only passed on the call that
+        precedes a `get_action`; the refreshes inside the policy's action loop leave the last
+        one in place rather than paying to rebuild it for a step that never scores anything.
+        """
+        if critic_obs is not None:
+            self.critic_obs_extra = critic_obs
         if self.critic_action_dim is None:
-            # First observation of the run: the embodiment's action width is now known.
+            # First observation of the run: the embodiment's action width is now known, and so
+            # is the set of sensor modalities the task config produces.
             self._init_critic(state)
         img_front, img_right, img_left, puppet_arm = (
             img_arr[0],
@@ -214,6 +281,34 @@ class PI0:
             "prompt": self.instruction,
         }
 
+    def _critic_extra_obs(self):
+        """This step's sensor modalities, in the fixed shapes `_init_critic` pinned down.
+
+        Returned unbatched (the sampler's kwargs bypass `Policy.infer`'s batching, so the caller
+        adds the leading axis), in the dtype they arrive in -- camera frames stay uint8 rather
+        than becoming four times the bytes to cross into XLA -- and NaN and all: an early-ended
+        chunk pads its wrench trace with NaN, and mapping that to something finite is the
+        encoders' job.
+        """
+        obs = {}
+        for key, shape in self._critic_extra_shapes.items():
+            value = self.critic_obs_extra.get(key)
+            if value is None:
+                raise KeyError(
+                    f"critic modality {key!r} was present on the first observation but is "
+                    f"missing now; the observation only carries "
+                    f"{sorted(self.critic_obs_extra)}."
+                )
+            value = np.asarray(value)
+            if value.shape != shape:
+                raise ValueError(
+                    f"critic modality {key!r} changed shape from {shape} to {value.shape}. "
+                    f"A point cloud does this when `pcd_down_sample_num: 0` leaves it "
+                    f"un-downsampled -- the critic needs a fixed-size observation."
+                )
+            obs[key] = value
+        return obs
+
     def get_action(self):
         assert self.observation_window is not None, "update observation_window first!"
         if self.online_critic is not None:
@@ -225,9 +320,18 @@ class PI0:
             self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
                 self.current_guidance_scale, dtype=jnp.float32
             )
-            # Stash this control step's (obs, action) for the replay buffer.
+            extra = self._critic_extra_obs()
+            self.policy._sample_kwargs["critic_obs_extra"] = {
+                key: jnp.asarray(value)[None, ...] for key, value in extra.items()
+            }
+            # Stash this control step's (obs, action) for the replay buffer. Every SigLIP view
+            # the sampler produced is offered; `stash` keeps only the critic's own
+            # `encoder_modalities`, so an unused view costs the buffer nothing.
             out = self.policy.infer(self.observation_window)
-            self.online_critic.stash(out["critic_obs_img"], out["critic_obs_state"], out["critic_action"])
+            self.online_critic.stash(
+                {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra},
+                out["critic_action"],
+            )
             self._stash_critic_obs(out)
             return out["actions"]
         out = self.policy.infer(self.observation_window)
@@ -242,11 +346,13 @@ class PI0:
         embodiment dims -- the tensors the critic is scored on. ``out["actions"]`` is the same
         chunk after the output transform has unnormalized it.
 
-        ``critic_obs_img`` is the head-camera SigLIP patch map the critic's CNN encoder reads,
-        as produced by ``Pi0.sample_actions``' own image tower -- so recording it here makes the
-        separate ``multisensory_steering.create_dataset siglip`` pass unnecessary. It is stored
-        as the flat ``(256, 1152)`` patch sequence that pass wrote (the encoders reshape to the
-        16x16 grid themselves) and in fp16, matching the online replay buffer's ``stash``.
+        ``critic_obs_siglip`` holds the SigLIP patch maps the critic's CNN encoders read, one
+        per camera view, as produced by ``Pi0.sample_actions``' own image tower -- so recording
+        them here makes the separate ``multisensory_steering.create_dataset siglip`` pass
+        unnecessary for every view, not just the head. Each is stored under its modality name
+        (``siglip.head``, ``siglip.left_wrist``, ...) as the flat ``(256, 1152)`` patch sequence
+        that pass wrote (the encoders reshape to the 16x16 grid themselves) and in fp16,
+        matching the online replay buffer's ``stash``.
         """
         if not self.collect_critic_obs or "critic_action" not in out:
             return
@@ -254,9 +360,12 @@ class PI0:
             "state": np.asarray(out["critic_obs_state"], dtype=np.float32),
             "action": np.asarray(out["critic_action"], dtype=np.float32),
         }
-        if self.collect_siglip and "critic_obs_img" in out:
-            siglip = np.asarray(out["critic_obs_img"], dtype=np.float16)  # (16, 16, 1152)
-            self.last_critic_obs["siglip"] = siglip.reshape(-1, siglip.shape[-1])
+        maps = out.get("critic_obs_siglip") or {}
+        self.last_critic_obs["siglip"] = {
+            view: np.asarray(maps[view], dtype=np.float16).reshape(-1, np.shape(maps[view])[-1])
+            for view in self.collect_siglip
+            if view in maps
+        }
 
     def reset_obsrvationwindows(self):
         self.instruction = None

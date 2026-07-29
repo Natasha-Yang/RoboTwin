@@ -78,3 +78,28 @@ def tcp_wrench_vector(task_env):
         arm: np.concatenate([force, torque])
         for arm, (force, torque) in compute_tcp_wrench(task_env).items()
     }
+
+
+def stack_step_wrench(step_wrench, num_steps):
+    """Stack the per-step samples of one action chunk into ``{arm: (num_steps, 6)}``.
+
+    ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected while the chunk executed:
+    one ``tcp_wrench_vector`` dict per ``take_action``. Padded to ``num_steps`` (i.e.
+    ``pi0_step``) with **NaN**, so the result has one fixed shape whether or not the chunk ran
+    to completion — only an episode's last chunk is ever short, since ``take_action`` stops
+    stepping once the task succeeds or ``step_lim`` is hit. NaN rather than zero, because zero
+    is a meaningful reading (the arm touching nothing); consumers that cannot take NaN should
+    map it to zero explicitly.
+
+    Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
+    all zero".
+    """
+    if not step_wrench:
+        return {}
+    stacked = {}
+    for arm in step_wrench[0]:
+        samples = np.asarray([sample[arm] for sample in step_wrench], dtype=np.float32)[:num_steps]
+        padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
+        padded[:len(samples)] = samples
+        stacked[arm] = padded
+    return stacked

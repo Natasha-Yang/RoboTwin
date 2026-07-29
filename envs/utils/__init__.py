@@ -9,3 +9,4 @@ from .transforms import *
 from .pkl2hdf5 import *
 from .images_to_video import *
 from .wrench import *
+from .obs_modalities import *

@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.join(parent_directory, "src"))
 
 from pi_model import *
 
+from envs.utils.obs_modalities import obs_modalities
+
 
 # Encode observation for the model
 def encode_obs(observation):
@@ -21,6 +23,28 @@ def encode_obs(observation):
     input_state = observation["joint_action"]["vector"]
 
     return input_rgb_arr, input_state
+
+
+def critic_obs_modalities(TASK_ENV, model, observation):
+    """The sim's sensor modalities for this control step, or None when nothing consumes them.
+
+    Only the guided path has a critic, so the baseline and dataset-collection runs skip this
+    entirely rather than copying depth maps for nobody.
+
+    The contact-wrench trace is the one thing here that is not part of the observation: it is
+    logged per primitive step by the env and drained here, which means what a control step sees
+    is the trace of the *previous* chunk -- the steps between the last observation and this one.
+    That is the only wrench a policy could ever condition on (the current chunk has not been
+    executed yet), and it is the same array a rollout dataset stores one row earlier, so a
+    critic trained offline on `observation.wrench.*` has to be trained against the *next* row's
+    state/action to match what it sees here.
+    """
+    if not getattr(model, "uses_online_critic", False):
+        return None
+    # Draining here is what keeps the log bounded during eval. Rollout collection drains it
+    # itself, after the chunk has run -- it wants the trace the chunk just produced, which is
+    # still accumulating at this point, so the two consumers do not compete.
+    return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.pi0_step)
 
 
 def get_model(usr_args):
@@ -43,6 +67,8 @@ def get_model(usr_args):
             "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
             "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
             "start_training", "utd_ratio",
+            # Which observation modalities the critic conditions on, and with what encoders.
+            "encoder_modalities",
         )
         if k in usr_args
     }
@@ -64,7 +90,8 @@ def eval(TASK_ENV, model, observation):
     input_rgb_arr, input_state = encode_obs(observation)
     initial_obs = (input_rgb_arr, input_state)
 
-    model.update_observation_window(input_rgb_arr, input_state)
+    model.update_observation_window(input_rgb_arr, input_state,
+                                    critic_obs=critic_obs_modalities(TASK_ENV, model, observation))
 
     # ======== Get Action ========
 

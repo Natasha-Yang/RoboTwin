@@ -15,6 +15,17 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+# The critic's name for each camera view the model sees. These are the names RoboTwin's own
+# sensor modalities and the rollout dataset's columns use (`envs/utils/obs_modalities.py`), so
+# `siglip.left_wrist` means the same view online (inside the sampler) as it does in a dataset
+# column a critic was pretrained on. A view the embodiment does not have is filled in by the
+# input transform as a black frame -- it still gets encoded, and still reads as one.
+SIGLIP_MODALITIES = {
+    "base_0_rgb": "siglip.head",
+    "left_wrist_0_rgb": "siglip.left_wrist",
+    "right_wrist_0_rgb": "siglip.right_wrist",
+}
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -102,27 +113,46 @@ class Pi0(_model.BaseModel):
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
+    def embed_images(self, obs: _model.Observation) -> tuple[dict[str, at.Array], dict[str, at.Array]]:
+        """Run the SigLIP image tower once per camera view.
+
+        Returns both of the tower's outputs per view: the tokens projected to the LLM width,
+        which is all the prefix needs, and the raw pre-projection patch features
+        (``aux["encoded"]``, 1152-d) the critic conditions on, which ``embed_prefix`` otherwise
+        throws away. Keeping both here is what lets a run that wants the critic's view of every
+        camera pay for the tower exactly once (see ``sample_actions``).
+        """
+        tokens, encoded = {}, {}
+        for name, image in obs.images.items():
+            image_tokens, aux = self.PaliGemma.img(image, train=False)
+            tokens[name] = image_tokens
+            encoded[name] = aux["encoded"]
+        return tokens, encoded
+
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, *, image_tokens: dict[str, at.Array] | None = None
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images
+        # embed images -- reusing the tower output the caller already ran, if it kept one
+        # (`sample_actions` does, since the critic wants the same tower's patch features).
+        if image_tokens is None:
+            image_tokens, _ = self.embed_images(obs)
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            view_tokens = image_tokens[name]
 
-            tokens.append(image_tokens)
+            tokens.append(view_tokens)
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
                     "b -> b s",
-                    s=image_tokens.shape[1],
+                    s=view_tokens.shape[1],
                 )
             )
             # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+            ar_mask += [False] * view_tokens.shape[1]
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -224,6 +254,7 @@ class Pi0(_model.BaseModel):
         return_features: bool = False,
         critic_apply=None,
         critic_params=None,
+        critic_obs_extra: dict[str, jax.Array] | None = None,
         guidance_scale: float | at.Float[at.Array, ""] = 0.0,
         return_critic_obs: bool = False,
         critic_action_dim: int | None = None,
@@ -246,12 +277,24 @@ class Pi0(_model.BaseModel):
         action)`` is the JAX apply of the QMFM ``Value`` ensemble (``multisensory_steering``); ``params``
         is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
         traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
-        static arg. Returns ``(actions, {"critic_obs_img", "critic_obs_state", "critic_action"})``
-        for online replay-buffer collection. This path takes precedence over ``return_features``.
+        static arg. Returns ``(actions, {"critic_obs_siglip", "critic_obs_state",
+        "critic_action"})`` for online replay-buffer collection, where ``critic_obs_siglip`` is
+        itself a ``{modality: patch map}`` dict, one entry per camera view. This path takes
+        precedence over ``return_features``.
+
+        ``obs`` is a ``{modality: array}`` dict. This model produces the state and one SigLIP
+        map per camera view itself -- ``"state"``, ``"siglip.head"``, ``"siglip.left_wrist"``,
+        ``"siglip.right_wrist"`` (see ``critic_observation``) -- and anything else the critic
+        conditions on comes from outside the model, through ``critic_obs_extra``: the sensor
+        modalities the sim observation carries (depth maps, point cloud, contact wrench; see
+        ``envs/utils/obs_modalities.py``), already **batched** and already narrowed to the keys
+        that critic actually wants. Which keys those are is the critic's business, not this
+        sampler's -- it just merges the dict and hands it over. Changing the set of keys changes
+        the pytree structure and therefore recompiles, so it must stay fixed for a run.
 
         ``return_critic_obs`` returns that same aux dict from the **unguided** sampler, so
         rollout-dataset collection records critic training data (model-space state and action
-        chunk, plus the SigLIP patch map) in exactly the space the guided path scores. Both the
+        chunk, plus the SigLIP patch maps) in exactly the space the guided path scores. Both the
         returned ``critic_action`` (the full-horizon chunk, still *normalized*) and
         ``critic_obs_state`` are narrowed to ``critic_action_dim`` embodiment dims -- i.e.
         ``(action_horizon, 14)`` and ``(14,)`` for aloha, versus the unnormalized chunk
@@ -265,8 +308,11 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # first fill KV cache with a forward pass of the prefix. The image tower runs here (once
+        # per camera view) and its raw patch features are what the critic sees, so they are taken
+        # from this pass rather than re-encoding a frame further down.
+        image_tokens, image_encoded = self.embed_images(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, image_tokens=image_tokens)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -311,29 +357,55 @@ class Pi0(_model.BaseModel):
         critic_ad = self.action_dim if critic_action_dim is None else int(critic_action_dim)
 
         def critic_observation():
-            """The (SigLIP patch map, state) pair the Value critic conditions on.
+            """The `{modality: array}` observation the Value critic conditions on.
 
-            The critic reads the head-camera SigLIP patch features (the raw `aux["encoded"]`,
-            1152-d), which the image tower produces but embed_prefix discards -- so re-run it
-            once here (constant across denoising steps) and reshape to the 16x16 patch grid the
-            CNN encoder expects. State is the model-space (normalized) state, narrowed to the
-            same `critic_ad` embodiment dims as the action chunk below.
+            The modalities the model itself supplies are one SigLIP patch map per camera view
+            it was given -- the raw `aux["encoded"]` (1152-d) the prefix pass above computed and
+            embed_prefix discards, reshaped to the 16x16 patch grid the CNN encoder expects, and
+            named `siglip.head` / `siglip.left_wrist` / `siglip.right_wrist` (SIGLIP_MODALITIES)
+            -- plus the model-space (normalized) state, narrowed to the same `critic_ad`
+            embodiment dims as the action chunk below. `critic_obs_extra` adds the sim's own
+            sensor modalities on top.
+
+            All views are offered whatever the critic ends up reading: they are already computed
+            (the prefix needs them), and which ones are actually encoded is the critic's own
+            configuration. The ones it ignores cost nothing here -- they are dead code inside the
+            guidance gradient -- only the round trip in `aux`.
             """
             state = observation.state.astype(jnp.float32)[..., :critic_ad]
-            _, img_aux = self.PaliGemma.img(observation.images["base_0_rgb"], train=False)
-            siglip = img_aux["encoded"].astype(jnp.float32)  # (b, 256, 1152)
-            siglip_map = einops.rearrange(siglip, "b (h w) c -> b h w c", h=16, w=16)
-            return siglip_map, state
+            siglip = {
+                SIGLIP_MODALITIES[name]: einops.rearrange(
+                    encoded.astype(jnp.float32), "b (h w) c -> b h w c", h=16, w=16
+                )
+                for name, encoded in image_encoded.items()
+                if name in SIGLIP_MODALITIES
+            }
+            return {**siglip, "state": state, **(critic_obs_extra or {})}
 
         def critic_action_view(actions):
             """The normalized `(b, action_horizon, critic_ad)` chunk the critic is scored on."""
             return actions[..., :critic_ad]
 
+        def critic_aux(critic_obs, x_0):
+            """What the caller gets back: the model-produced modalities plus the scored chunk.
+
+            Only the model's own modalities are echoed back -- the caller passed
+            `critic_obs_extra` in, so it already has the rest (and they are numpy on the host,
+            not worth a round trip). The SigLIP maps come back as a `{modality: array}` dict so
+            the replay buffer and the dataset collector can key them by view.
+            """
+            return {
+                "critic_obs_siglip": {
+                    name: critic_obs[name] for name in SIGLIP_MODALITIES.values() if name in critic_obs
+                },
+                "critic_obs_state": critic_obs["state"],
+                "critic_action": critic_action_view(x_0),
+            }
+
         if critic_apply is not None and critic_params is not None:
             # QMFM-exact denoised-estimate gradient guidance
             # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
-            siglip_map, state = critic_observation()
-            critic_obs = (siglip_map, state)
+            critic_obs = critic_observation()
 
             def guided_step(carry):
                 x_t, time = carry
@@ -374,12 +446,7 @@ class Pi0(_model.BaseModel):
                 return time >= -dt / 2
 
             x_0, _ = jax.lax.while_loop(guided_cond, guided_step, (noise, 1.0))
-            aux = {
-                "critic_obs_img": siglip_map,
-                "critic_obs_state": state,
-                "critic_action": critic_action_view(x_0),
-            }
-            return x_0, aux
+            return x_0, critic_aux(critic_obs, x_0)
 
         if not return_features:
 
@@ -398,12 +465,7 @@ class Pi0(_model.BaseModel):
                 return x_0
             # Unguided sampling, but emit the critic's view of this step so rollout collection
             # can record critic training data in exactly the space the guided path scores.
-            siglip_map, state = critic_observation()
-            return x_0, {
-                "critic_obs_img": siglip_map,
-                "critic_obs_state": state,
-                "critic_action": critic_action_view(x_0),
-            }
+            return x_0, critic_aux(critic_observation(), x_0)
 
         # Feature-recording path: accumulate the action-expert features from every denoising step.
         # `num_steps` must be a static Python int here (it is on the eval/rollout path).

@@ -278,6 +278,55 @@ action horizon, but **not** a critic trained on the *raw* columns: those have th
 as their `.model` counterparts and differ only in normalization, so nothing downstream can tell
 them apart. See §6 for collecting the right columns.
 
+#### What the critic observes
+
+The critic is not restricted to the SigLIP map and the state. Everything the sim produces this
+run is offered to it, and **which modalities it uses is decided in the critic's own config**
+(`multisensory_steering`'s `cfgs/qmfm.yaml`, key `encoder_modalities`) — not here:
+
+| Modality | Source | Shape |
+|---|---|---|
+| `siglip.{head,left_wrist,right_wrist}` | pi0.5's own image tower, inside `sample_actions` | `(16, 16, 1152)` each |
+| `state` | normalized model state, embodiment dims | `(14,)` |
+| `images.{head,left_wrist,right_wrist}` | task config `data_type.rgb` | `(240, 320, 3)` uint8 |
+| `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
+| `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
+| `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
+| `wrench.{left,right}` | per-step contact wrench, logged by the env | `(pi0_step, 6)` |
+
+The names are the §6a dataset columns minus their `observation.` prefix, so a critic trained
+offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
+flattens an observation into them (shared by both paths); `deploy_policy.py::critic_obs_modalities`
+calls it once per control step and only when a critic exists, so the baseline and collection
+runs copy nothing. `pi_model.py::_init_critic` declares the whole set as `obs_shapes`, the
+critic picks its subset (`OnlineValueCritic.obs_keys`), and only that subset is shipped into
+`Pi0.sample_actions(critic_obs_extra=...)` and into the replay buffer. Naming a modality the
+task config does not enable raises at startup, listing what *is* available.
+
+Three things to keep in mind:
+
+- **All three SigLIP views come free, but only in compute.** The image tower already runs once
+  per camera to build the prefix, so `Pi0.embed_images` keeps its raw `aux["encoded"]` for every
+  view and `embed_prefix` reuses the tokens — the wrist maps cost no extra tower pass, and the
+  head map no longer costs the second one it used to. What they do cost is the replay buffer:
+  each configured view is another ~1.15 MB/transition (see the last bullet). Unconfigured views
+  are dropped by `OnlineValueCritic.stash`, so they only ride back from the device in `aux`.
+- **The wrench a control step sees is the previous chunk's trace** — the steps between the last
+  observation and this one, which is the only wrench that exists before the current chunk has
+  been executed. In a rollout dataset the same array sits one row *earlier* (there it is the
+  trace the row's own chunk produced), so offline training on `observation.wrench.*` must pair
+  it with the *next* row's state/action. The env's per-step logging is switched by the task
+  config's `data_type.wrench` (§6a) — a critic configured for `wrench.*` against a config that
+  has it off fails at startup. The guided path drains the log before the chunk runs, collection
+  drains it after, so the two never compete.
+- **Modalities are an architecture key.** They go into the checkpoint, and a warm start rebuilds
+  the same encoder stack; changing the list makes an existing critic checkpoint refuse to load
+  (loudly, leaf by leaf). Offline pretraining takes the same names — `multisensory_steering`'s
+  `cfgs/train_offline.yaml` maps them to dataset columns under `dataset.modalities` — and a
+  checkpoint only warm-starts a run whose list matches. Each modality is also stored twice per
+  transition (obs and next_obs) — each `siglip.*` view is ~1.15 MB/transition (so all three come
+  to ~3.5 MB), a depth camera ~0.6 MB, so `buffer_size` needs revisiting when adding one.
+
 For remote / server-based inference see `policy/pi05/docs/remote_inference.md`
 (`scripts/serve_policy.py`).
 
@@ -301,8 +350,9 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
   - `push_to_hub: true`, `hub_repo_id: NatashaYang/robotwin_pi05_rollouts_dataset`.
   - `checkpoint_id: 30000`, `pi0_step: 50`, `instruction_type: unseen`.
   - `collect_critic_obs: true` — also record the policy's **model-space** view of each step.
-  - `collect_siglip: true` — within that, also record the head-camera SigLIP patch features
-    (`siglip.head`); set false to keep the dataset small.
+  - `collect_siglip: true` — within that, also record the SigLIP patch features of **every**
+    camera the policy sees (`siglip.head`, `siglip.left_wrist`, `siglip.right_wrist`). Set
+    `false` to keep the dataset small, or list the views you want (`[head, left_wrist]`).
   - `resume: true` — see below.
 
 Everything **beyond** rgb + qpos is decided by the **task config**, not by `collect_dataset.yml`:
@@ -312,8 +362,8 @@ whatever its `data_type` block turns on reaches `envs/_base_task.py::get_obs`, a
 
 Each episode is flushed to its own shard in `<output_dir>/<task>/<config>/<ckpt>_shards` the
 moment it finishes, and the shards are memory-mapped and concatenated into the final dataset at
-the end. A row costs ~1 MB resident (three uncompressed camera frames) plus ~576 KB when
-`collect_siglip` is on and ~1 MB more under a privileged task config, and a long task
+the end. A row costs ~1 MB resident (three uncompressed camera frames) plus ~576 KB per SigLIP
+view `collect_siglip` records and ~1 MB more under a privileged task config, and a long task
 (`put_bottles_dustbin`, `step_lim` 1700, at `pi0_step`
 10) can reach five figures of rows, so accumulating a whole run in memory would run to tens of
 GB. Sharding also means a crashed run keeps its episodes: `progress.json` in the shard dir
@@ -333,7 +383,8 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action` | raw robot, unnormalized by the output transform | `(50, 14)` |
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
-| `siglip.head` | head-camera SigLIP patch features, fp16 | `(256, 1152)` |
+| `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
+| `observation.wrench.{left,right}` | world-frame TCP contact wrench, one row per executed step | `(pi0_step, 6)` |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
 different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
@@ -357,15 +408,37 @@ critic intended to steer inside the sampler (§5a) **must** be trained on these;
 `state_col: observation.state.model` / `action_col: action.model`. The raw columns remain for
 behavior cloning and for critics that score executed robot actions.
 
-`siglip.head` is the third thing the critic conditions on, and is written **during collection**
-(`collect_siglip`) from `critic_obs_img` — the exact patch map `Pi0.sample_actions` feeds the
-critic, computed by the same `PaliGemma.img` tower on the same resized frame. It is stored as
-the flat `(256, 1152)` patch sequence (the CNN encoder reshapes to the 16×16 grid itself) in
-fp16, matching the online replay buffer, so it is a drop-in for the column
-`python -m multisensory_steering.create_dataset siglip` used to add in a second pass — point
-`siglip_cols: [siglip.head]` at it and skip that pass. That pass is still the way to add the
-*wrist* views (`siglip.left_wrist` / `siglip.right_wrist`); only the head camera reaches the
-critic inside the sampler. At ~576 KB/row this column dominates dataset size.
+The `siglip.*` columns are the visual thing the critic conditions on, and are written **during
+collection** (`collect_siglip`) from `critic_obs_siglip` — the exact patch maps
+`Pi0.sample_actions` feeds the critic, computed by the same `PaliGemma.img` tower on the same
+resized frames. There is one per camera the policy sees, under the same names the critic uses
+online (`Pi0.SIGLIP_MODALITIES`), each stored as the flat `(256, 1152)` patch sequence (the CNN
+encoder reshapes to the 16×16 grid itself) in fp16, matching the online replay buffer. They are
+drop-in replacements for the columns `python -m multisensory_steering.create_dataset siglip`
+used to add in a second pass — point `siglip_cols: [siglip.head, siglip.left_wrist,
+siglip.right_wrist]` at them and skip that pass entirely. At ~576 KB/row **each**, these columns
+dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well as
+`true`/`false`, and dropping the wrists is the cheapest way to shrink a run.
+
+`observation.wrench.left` / `.right` are the **same quantity** §5's debug GIF plots — net contact
+wrench on that arm's end-effector links, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
+about the TCP — computed by the shared `envs/utils/wrench.py::tcp_wrench_vector` so the eval and
+collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
+call, while collection samples after **every** primitive step, so a row carries the whole
+`(pi0_step, 6)` trace of the chunk it executed rather than a single vector. The env does the
+logging (`_base_task.py::_log_step_wrench`); the rollout loop drains it with `pop_step_wrench()`
+once per inference call, and `envs/utils/wrench.py::stack_step_wrench` does the stacking, shared
+with the critic's online view of the same modality. An episode's last chunk stops early —
+`take_action` is a no-op once the task succeeds or `step_lim` is hit — and the unexecuted steps
+are padded with **NaN**, not zeros, since zero is a meaningful reading (the arm touching
+nothing). At 480 B/row they are the cheapest column here.
+
+`wrench` is a `data_type` like the others, but it is the one the env cannot pick up from the
+flag itself: contacts are a scene query, not part of `get_obs`. So each driver reads
+`data_type.wrench` and passes `record_step_wrench` into the env — `collect_data.py`,
+`collect_dataset.py` and `eval_policy.py` all do, and nothing logs a wrench with the flag off.
+Turning it off drops these columns from the dataset entirely (and makes a `wrench.*` critic
+modality unavailable, §5a).
 
 ### 6b. Extra data types (privileged task configs)
 
@@ -394,7 +467,8 @@ Notes:
 - The schema is inferred from the first collected row (`build_features` / `infer_feature`), so
   nothing has to be enumerated per data type. ndarrays become fixed-shape `ArrayND` columns; a
   point cloud with `pcd_down_sample_num: 0` is ragged and falls back to a nested `Sequence`.
-- Measured on-disk cost: **~1.1 MB/row** for `demo_clean` (with `siglip.head`) vs **~2.2 MB/row**
+- Measured on-disk cost: **~1.1 MB/row** for `demo_clean` (with `siglip.head` only; each further
+  SigLIP view adds ~0.56 MB, so all three make it ~2.2 MB) vs **~2.2 MB/row**
   for `demo_clean_privileged`. Depth is the bulk of the difference — the segmentation and
   third-view columns are PNG-compressed. There is no per-column switch here: to collect less,
   use a task config with fewer `data_type` flags.

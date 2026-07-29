@@ -1526,8 +1526,17 @@ class Base_Task(gym.Env):
 
         Called once per policy inference by `script/collect_dataset.py`, so what comes back is
         the wrench at every primitive step the chunk just executed (at most `pi0_step` of them
-        — fewer when the episode ended mid-chunk).
+        — fewer when the episode ended mid-chunk). The guided eval path drains it too, but
+        *before* the chunk runs, so what it sees is the trace of the previous one (see
+        `policy/pi05/deploy_policy.py::critic_obs_modalities`).
+
+        With recording on, an empty log yields one sample taken now rather than nothing at all:
+        no steps have run since the last pop at the start of an episode, and a consumer that
+        asked for the wrench should get the current contact state instead of a missing
+        modality. Recording off yields `[]`.
         """
+        if self.record_step_wrench and not self.step_wrench:
+            return [tcp_wrench_vector(self)]
         samples, self.step_wrench = self.step_wrench, []
         return samples
 
