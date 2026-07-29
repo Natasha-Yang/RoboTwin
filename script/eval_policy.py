@@ -726,6 +726,12 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    # The contact wrench is one of the sensor modalities a guided critic can condition on, and
+    # the only one the env has to be told to log -- every other one rides along in the
+    # observation. Switched by the task config's `data_type.wrench` like the rest of them; a
+    # critic configured for `wrench.*` against a config that has it off fails at startup,
+    # saying which modalities the run does provide.
+    args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
 
     # ===== Online QMFM Value critic (trained across the whole eval run) =====
     # The critic object is read fresh via `getattr(model, "online_critic", None)` at each use

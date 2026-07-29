@@ -208,6 +208,26 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
   as the `null`/default in the source yml.
 
+Setting `debug: true` in the **task config** turns on extra per-episode diagnostics
+(`script/eval_policy.py::visualize_debug_obs`), all written into `debug_vis/episode<N>/`
+under that same result dir:
+
+| Output | File (under `debug_vis/episode<N>/`) | Notes |
+|---|---|---|
+| TCP wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), left and right arm overlaid |
+| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); the wrench traces with a step cursor on the right |
+| Raw series | `wrench_episode<N>.npz` | `step`, `left`, `right` — `(num_samples, 6)` each |
+| Depth / segmentation tiles, point clouds | `obs_step<S>.png` / `pcd_step<S>.ply` | only for the modalities the task config's `data_type` enables |
+
+The wrench is computed by `envs/utils/wrench.py` (shared with the rollout-dataset collector, §6a).
+It is the **net contact wrench on the end-effector links** (wrist link + gripper
+fingers + any `fix_gripper_name` links), summed from `scene.get_contacts()` impulses divided
+by the sim timestep, with torque taken about the TCP origin. Both vectors are resolved in the
+**world** frame (N and N·m) — only the moment arm is TCP-relative, so a trace stays comparable
+across steps as the gripper rotates. It is contact-only: an arm moving through free space reads exactly
+zero — this is not a joint-torque estimate. One sample is taken per policy call (so
+`pi0_step` sim frames apart), paired with that call's head-camera frame.
+
 ### 5a. Critic gradient guidance (`guidance_scale` is the on/off switch)
 
 There is **one** eval script and **one** config. `guidance_scale` in `deploy_policy.yml`

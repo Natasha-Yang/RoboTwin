@@ -99,8 +99,9 @@ class Base_Task(gym.Env):
         self.now_obs = {}
         self.take_action_cnt = 0
         # Per-primitive-step end-effector contact wrench (see `_log_step_wrench`). Off by
-        # default: it queries every contact in the scene once per `take_action`, and only
-        # rollout-dataset collection records it.
+        # default: it queries every contact in the scene once per `take_action`. The drivers
+        # set it from the task config's `data_type.wrench`, which cannot reach it the way the
+        # other data types do -- contacts are a scene query, not part of `get_obs`.
         self.record_step_wrench = kwags.get("record_step_wrench", False)
         self.step_wrench = []
         self.eval_video_path = kwags.get("eval_video_save_dir", None)

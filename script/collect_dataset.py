@@ -232,9 +232,11 @@ def collect_rollouts(usr_args, start=None):
 
     args, TASK_ENV = build_env_args(usr_args)
     args["eval_mode"] = True
-    # Have the env log the end-effector contact wrench after every primitive step, so each row
-    # carries the whole (pi0_step, 6) trace of the chunk it executed (see wrench_columns).
-    args["record_step_wrench"] = True
+    # `data_type.wrench` has the env log the end-effector contact wrench after every primitive
+    # step, so each row carries the whole (pi0_step, 6) trace of the chunk it executed (see
+    # wrench_columns). It is a task-config switch like the other data types, but it has to be
+    # passed explicitly because contacts are a scene query rather than part of the observation.
+    args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
     clear_cache_freq = args["clear_cache_freq"]
     # Point clouds are only a fixed-shape column when the sim downsamples them to a set number
     # of points (see extra_obs_columns).

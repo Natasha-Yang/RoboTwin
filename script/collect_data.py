@@ -99,6 +99,10 @@ def main(task_name=None, task_config=None):
 
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
+    # Per-primitive-step end-effector contact wrench (envs/utils/wrench.py). A task-config
+    # switch like the other data types, but passed explicitly because contacts are a scene
+    # query rather than part of the observation, so `get_obs` never sees it.
+    args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
     args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
     run(task, args)
 
