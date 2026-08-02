@@ -47,6 +47,30 @@ class lift_pot(Base_Task):
         self.info["info"] = {"{A}": f"{self.model_name}/base{self.model_id}"}
         return self.info
 
+    # The contact points `play_once` grasps with -- the same ids `check_success` measures
+    # against, so the privileged observations below describe exactly the grasp being scored.
+    GRASP_CONTACT_POINT = {"left": 0, "right": 1}
+
+    def get_object_poses(self):
+        """The pot's world pose (`data_type.object_poses`): xyz + wxyz quaternion."""
+        pose = self.pot.get_pose()
+        return {"pot": np.concatenate([np.asarray(pose.p), np.asarray(pose.q)]).astype(np.float32)}
+
+    def get_grasp_points(self):
+        """Signed TCP-to-grasp offset per arm (`data_type.grasp_points`): ``tcp - grasp``.
+
+        World frame, metres — the same two quantities `check_success` thresholds (it wants both
+        norms under 3 cm), kept signed and per-axis so they say which way a gripper is off
+        rather than only how far. Position only: a contact point is a full 6-DoF pose, but a
+        component-wise difference of quaternions is not a rotation, so orientation stays in
+        `get_object_poses`.
+        """
+        tcp = {"left": self.robot.get_left_tcp_pose(), "right": self.robot.get_right_tcp_pose()}
+        return {
+            arm: (np.array(tcp[arm][:3]) - np.array(self.pot.get_contact_point(idx)[:3])).astype(np.float32)
+            for arm, idx in self.GRASP_CONTACT_POINT.items()
+        }
+
     def check_success(self):
         pot_pose = self.pot.get_pose()
         left_end = np.array(self.robot.get_left_tcp_pose()[:3])

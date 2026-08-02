@@ -10,6 +10,8 @@ in the online (eval) and offline (rollout-dataset) paths:
     ``depth.head``      ``depth.left_wrist``   ``depth.right_wrist``   (H, W) float32, mm
     ``pointcloud``      (N, 6) float32, world-frame xyz + rgb
     ``wrench.left``     ``wrench.right``       (num_steps, 6) float32, world-frame TCP wrench
+    ``object_poses.<name>``                    (7,) float32, world xyz + wxyz quaternion
+    ``grasp_points.<arm>``                     (3,) float32, signed world-frame tcp - grasp
 
 The names are the rollout dataset's column names minus their ``observation.`` prefix (see
 `script/collect_dataset.py::extra_obs_columns`), which is what lets a critic trained offline on
@@ -68,6 +70,15 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     pointcloud = observation.get("pointcloud", [])
     if len(pointcloud) > 0:
         mods["pointcloud"] = np.asarray(pointcloud, dtype=np.float32)
+
+    # Privileged task state (`data_type.object_poses` / `grasp_points`), one entry per object
+    # and per arm. Keyed by the task's own names, so which keys exist is a property of the task
+    # rather than of the embodiment -- `object_poses.pot` only exists for lift_pot.
+    for name, pose in observation.get("object_poses", {}).items():
+        mods[f"object_poses.{name}"] = np.asarray(pose, dtype=np.float32)
+
+    for arm, offset in observation.get("grasp_points", {}).items():
+        mods[f"grasp_points.{arm}"] = np.asarray(offset, dtype=np.float32)
 
     for arm, samples in stack_step_wrench(step_wrench, num_steps).items():
         mods[f"wrench.{arm}"] = samples

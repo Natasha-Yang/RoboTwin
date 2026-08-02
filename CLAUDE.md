@@ -328,6 +328,19 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
 | `wrench.{left,right}` | per-step contact wrench, logged by the env | `(pi0_step, 6)` |
+| `object_poses.<object>` | task config `data_type.object_poses` | `(7,)` xyz + wxyz quat |
+| `grasp_points.<arm>` | task config `data_type.grasp_points` | `(3,)` signed `tcp - grasp` |
+
+The last two are **privileged task state**, not sensors: which actors count as "the objects"
+and what the grasp is are the task's own business, so they come from per-task hooks
+(`_base_task.py::get_object_poses` / `get_grasp_points`) rather than from `get_obs`'s cameras,
+and their keys are the task's own — `object_poses.pot` and `grasp_points.{left,right}` exist for
+`lift_pot` (`envs/lift_pot.py`) and nowhere else. A task that does not implement the hook raises
+on the first observation rather than quietly dropping the column. Both default to the `vector`
+encoder (straight into the value head, like `state`), so a critic configured for exactly
+`state` + `object_poses.pot` + `grasp_points.{left,right}` sees the flat
+`concat(state, pot_pose, left_offset, right_offset, action_chunk)` — `Value.__call__` appends
+the action to whatever the encoder returns.
 
 The names are the §6a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -527,6 +540,30 @@ Notes:
   for `demo_clean_privileged`. Depth is the bulk of the difference — the segmentation and
   third-view columns are PNG-compressed. There is no per-column switch here: to collect less,
   use a task config with fewer `data_type` flags.
+
+### 6c. Privileged task state (`object_poses` / `grasp_points`)
+
+Two more `data_type` flags, but unlike everything above they are **not sensors** — they are
+ground truth about the task, so what they mean depends on the task and each one implements them
+itself. `demo_clean_lift_pot_privileged` (`demo_clean_privileged` plus these two) therefore only
+works with `lift_pot`; any other task raises on the first observation rather than silently
+dropping the columns.
+
+| Column | Type | Shape |
+|---|---|---|
+| `observation.object_poses.<object>` | float32, world xyz + wxyz quat | `(7,)` |
+| `observation.grasp_points.<arm>` | float32, world-frame signed `tcp − grasp`, metres | `(3,)` |
+
+For `lift_pot` (`envs/lift_pot.py`) that is `object_poses.pot` — the pot's world pose — and
+`grasp_points.{left,right}`, each arm's TCP minus the contact point it is meant to grasp
+(ids 0/1, the ones `play_once` grasps with and `check_success` thresholds at 3 cm). The offsets
+are kept signed and per-axis, so they say which way a gripper is off rather than only how far;
+orientation stays in `object_poses`, since a component-wise difference of quaternions is not a
+rotation. Both are added by `_base_task.py::get_obs` from the `get_object_poses` /
+`get_grasp_points` hooks — the base implementations raise with the task name and the flag to
+drop — and reach the critic under the same names minus the `observation.` prefix (§5a).
+
+At 40 B/row the pair is free next to the camera columns.
 
 ---
 

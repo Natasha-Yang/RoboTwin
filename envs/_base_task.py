@@ -526,9 +526,42 @@ class Base_Task(gym.Env):
         # pointcloud
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("combine", False))
+        # privileged task state: where the task's own objects are, and how far each gripper is
+        # from the grasp it is supposed to reach. Unlike everything above these are not sensor
+        # readings -- which actors count as "the objects" and what "the grasp" is are the task's
+        # own business -- so they come from per-task hooks rather than from the cameras.
+        if self.data_type.get("object_poses", False):
+            pkl_dic["object_poses"] = self.get_object_poses()
+        if self.data_type.get("grasp_points", False):
+            pkl_dic["grasp_points"] = self.get_grasp_points()
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
+
+    def get_object_poses(self):
+        """Privileged object poses: ``{name: (7,)}``, world xyz + wxyz quaternion.
+
+        Enabled by the task config's ``data_type.object_poses``, and implemented per task (see
+        `envs/lift_pot.py`) because there is no generic answer to which actors matter. Raising
+        rather than returning nothing keeps a config that asks a task for a modality it cannot
+        produce a loud startup failure instead of a silently missing dataset column / critic
+        input.
+        """
+        raise NotImplementedError(
+            f"task {self.task_name!r} does not implement get_object_poses(), so it cannot run "
+            f"with `data_type.object_poses: true`. Implement it on the task (see "
+            f"envs/lift_pot.py) or drop the flag from the task config.")
+
+    def get_grasp_points(self):
+        """Signed per-arm TCP-to-grasp offsets: ``{arm: (3,)}``, world frame, metres.
+
+        The task's counterpart to `get_object_poses`, under ``data_type.grasp_points``: for each
+        arm, ``tcp_xyz - grasp_xyz`` against whichever contact point that arm is meant to take.
+        """
+        raise NotImplementedError(
+            f"task {self.task_name!r} does not implement get_grasp_points(), so it cannot run "
+            f"with `data_type.grasp_points: true`. Implement it on the task (see "
+            f"envs/lift_pot.py) or drop the flag from the task config.")
 
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()

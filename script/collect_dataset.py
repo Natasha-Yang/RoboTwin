@@ -81,7 +81,9 @@ def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
     level. So `demo_clean` yields nothing here while `demo_clean_privileged` yields all of them.
     `rgb` and `qpos` are already recorded as the image and state columns, and camera intrinsics
     / extrinsics come along whenever depth or a point cloud does, since depth is not unprojectable
-    without them and the wrist cameras move every step.
+    without them and the wrist cameras move every step. `object_poses` / `grasp_points` are the
+    privileged task state, and land at the top level too -- they come from per-task hooks rather
+    than from a sensor, so only a task that implements them can be collected with them on.
 
     Driven off what the observation actually contains rather than off the flags, so a data type
     added upstream is picked up without a change here. The wrench is the exception: contacts are
@@ -128,6 +130,16 @@ def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
     for key, value in observation.get("endpose", {}).items():
         value = np.asarray(value, dtype=np.float32)
         cols[f"observation.endpose.{key}"] = value.tolist() if value.ndim else float(value)
+
+    # Privileged task state: the pose of each of the task's objects, and each arm's signed
+    # offset from the grasp it is meant to take. Named exactly as the critic's online
+    # modalities are (envs/utils/obs_modalities.py), so a critic pretrained on these columns
+    # sees the same thing when it is warm-started into the sampler.
+    for name, pose in observation.get("object_poses", {}).items():
+        cols[f"observation.object_poses.{name}"] = np.asarray(pose, dtype=np.float32).tolist()
+
+    for arm, offset in observation.get("grasp_points", {}).items():
+        cols[f"observation.grasp_points.{arm}"] = np.asarray(offset, dtype=np.float32).tolist()
 
     return cols
 
