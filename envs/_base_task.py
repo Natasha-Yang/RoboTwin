@@ -1524,11 +1524,12 @@ class Base_Task(gym.Env):
     def pop_step_wrench(self):
         """Return the wrench samples logged since the last call, and clear the log.
 
-        Called once per policy inference by `script/collect_dataset.py`, so what comes back is
-        the wrench at every primitive step the chunk just executed (at most `pi0_step` of them
-        — fewer when the episode ended mid-chunk). The guided eval path drains it too, but
-        *before* the chunk runs, so what it sees is the trace of the previous one (see
-        `policy/pi05/deploy_policy.py::critic_obs_modalities`).
+        Drained once per policy inference, *before* the chunk runs — by
+        `script/collect_dataset.py` and by `policy/pi05/deploy_policy.py::critic_obs_modalities`
+        alike — so what comes back is the trace of the chunk *before* this one: the wrench at
+        every primitive step executed since the last observation (at most `pi0_step` of them,
+        fewer when that chunk ended early). That is the only wrench that exists before the
+        current chunk has run, which is what lets it be an observation rather than an outcome.
 
         With recording on, an empty log yields one sample taken now rather than nothing at all:
         no steps have run since the last pop at the start of an episode, and a consumer that

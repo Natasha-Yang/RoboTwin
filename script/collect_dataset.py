@@ -58,15 +58,15 @@ import yaml
 
 
 def wrench_columns(step_wrench, num_steps):
-    """Per-arm end-effector contact wrench, one sample per primitive step of the chunk.
+    """Per-arm end-effector contact wrench, one sample per primitive step since the last row.
 
-    `step_wrench` is what `_base_task.pop_step_wrench` collected while the chunk was executing:
-    a `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame.
-    It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use --
-    the only difference is the rate: `eval_policy.py` samples once per policy call, here every
-    step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`,
-    one fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online
-    view of the same modality (`envs/utils/obs_modalities.py`).
+    `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
+    `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame. It
+    comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use -- the
+    only difference is the rate: `eval_policy.py` samples once per policy call, here every step
+    in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
+    fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online view
+    of the same modality (`envs/utils/obs_modalities.py`).
     """
     return {f"observation.wrench.{arm}": samples
             for arm, samples in stack_step_wrench(step_wrench, num_steps).items()}
@@ -290,11 +290,16 @@ def collect_rollouts(usr_args, start=None):
             frame_index = TASK_ENV.take_action_cnt
             # Record the first observation seen before this inference call.
             observation = TASK_ENV.get_obs()
+            # Drained *before* the chunk runs, so what the row carries is the wrench the
+            # PREVIOUS chunk produced -- the steps between the last observation and this one.
+            # That is the only wrench that exists at the moment the row's action is chosen,
+            # which makes the column a genuine observation rather than an outcome, and makes it
+            # identical to what the online critic reads (deploy_policy.py::critic_obs_modalities
+            # drains it at the same point). An episode's first row has no previous chunk and
+            # falls back to a single sample of the current contact state (pop_step_wrench).
+            step_wrench = TASK_ENV.pop_step_wrench()
 
             actions, initial_obs = eval_func(TASK_ENV, model, observation)
-            # Everything the env logged while the chunk was executing: one wrench sample per
-            # primitive step. Popped per inference call, so it never spans two rows.
-            step_wrench = TASK_ENV.pop_step_wrench()
 
             input_rgb_arr, input_state = initial_obs
             head_rgb, right_rgb, left_rgb = input_rgb_arr
@@ -513,8 +518,12 @@ def main(usr_args):
         repo_id = usr_args.get("hub_repo_id")
         if not repo_id:
             raise SystemExit("push_to_hub is true but hub_repo_id is not set.")
-        dataset.push_to_hub(repo_id)
-        print(f"Pushed dataset to https://huggingface.co/datasets/{repo_id}")
+        # Private unless the config opts out: this only takes effect when the repo is created,
+        # so a repo that already exists keeps whatever visibility it has.
+        private = usr_args.get("hub_private", True)
+        dataset.push_to_hub(repo_id, private=private)
+        print(f"Pushed {'private' if private else 'PUBLIC'} dataset to "
+              f"https://huggingface.co/datasets/{repo_id}")
 
     # Only now that everything is written (and pushed) are the shards redundant; a failure
     # above leaves them in place so the run can be resumed or salvaged.

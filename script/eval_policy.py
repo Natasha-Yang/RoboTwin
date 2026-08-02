@@ -4,7 +4,9 @@ If the policy exposes a ``model.online_critic`` (pi05 builds one only when
 ``guidance_scale != 0``), the rollout additionally collects a chunk-level transition after
 every control step and runs TD updates on that critic, which steers the frozen pi0.5 flow
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
-progress is logged to W&B. With no critic this is the plain baseline rollout. Configure via
+progress is logged to W&B. Setting ``train_critic_online: false`` keeps the guidance but leaves
+the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
+no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
 """
 
@@ -86,6 +88,16 @@ def _uses_online_critic(model):
     the embodiment's joint vector.
     """
     return bool(getattr(model, "uses_online_critic", getattr(model, "online_critic", None) is not None))
+
+
+def _trains_online_critic(model):
+    """Whether that critic is also *learning* here, or is frozen at its checkpoint.
+
+    pi05's `train_critic_online: false` keeps the guidance but skips the replay collection and
+    the TD updates below, which is how an offline-trained critic is evaluated as-is. Policies
+    that do not know the knob keep the historical behavior (train).
+    """
+    return _uses_online_critic(model) and bool(getattr(model, "train_critic_online", True))
 
 
 def _scalar(value):
@@ -682,12 +694,18 @@ def main(usr_args):
     episode_results_df = pd.DataFrame(episode_results)
     episode_results_df.to_csv(episode_file_path)
 
-    # Persist the online-trained critic alongside the eval results.
+    # Persist the online-trained critic alongside the eval results. A frozen one has nothing to
+    # persist -- it is a byte-for-byte copy of `critic_ckpt`, which the snapshotted config
+    # already names -- so the file is skipped rather than written misleadingly.
     online_critic = getattr(model, "online_critic", None)
     if online_critic is not None and usr_args.get("save_critic", False):
-        critic_path = save_dir / "online_value_critic.pkl"
-        online_critic.save(critic_path)
-        print(f"saved online critic to {critic_path}")
+        if _trains_online_critic(model):
+            critic_path = save_dir / "online_value_critic.pkl"
+            online_critic.save(critic_path)
+            print(f"saved online critic to {critic_path}")
+        else:
+            print("train_critic_online is off -- not saving the critic (unchanged from "
+                  f"{usr_args.get('critic_ckpt')})")
 
     print(f"Data has been saved to {file_path}")
     if wandb_run is not None:
@@ -738,6 +756,12 @@ def eval_policy(task_name,
     # site rather than captured here: pi05 builds it lazily on the first observation, because
     # its action width comes from the embodiment. It stays None for the plain baseline, which
     # makes every critic block below inert.
+    #
+    # `train_critic` is the second switch: with `train_critic_online: false` the critic still
+    # steers the sampler, but it is frozen at `critic_ckpt`, so no transition is collected and
+    # no TD update runs. Unlike the critic object this is known up front -- it is a
+    # construction-time property of the policy, not something built on the first observation.
+    train_critic = _trains_online_critic(model)
     train_freq = int(args.get("train_freq", 1))
     ma_window = max(1, int(args.get("wandb_ma_window", 20)))
     success_window = deque(maxlen=ma_window)
@@ -857,8 +881,9 @@ def eval_policy(task_name,
             reward = 1.0 if (success_now and not prev_success) else 0.0
             episode_reward += reward
 
-            # Online critic: close the chunk transition (SARSA), then run a TD update.
-            online_critic = getattr(model, "online_critic", None)
+            # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped
+            # for a frozen critic -- it guides, but its parameters and buffer stay untouched.
+            online_critic = getattr(model, "online_critic", None) if train_critic else None
             if online_critic is not None:
                 done = success_now or (TASK_ENV.take_action_cnt >= TASK_ENV.step_lim)
                 online_critic.commit(reward, done)
@@ -901,7 +926,11 @@ def eval_policy(task_name,
         if online_critic is not None:
             buf = online_critic.buffer.size if online_critic.buffer is not None else 0
             guidance = model.scheduled_guidance_scale()
-            if last_info is not None:
+            if not train_critic:
+                print(f"\033[96m[critic]\033[0m frozen at {online_critic.num_updates} updates "
+                      f"guidance={guidance:.4g}/{model.guidance_scale_target:.4g} "
+                      f"(train_critic_online is off: no replay collection, no TD updates)")
+            elif last_info is not None:
                 print(f"\033[96m[critic]\033[0m buffer={buf} updates={online_critic.num_updates} "
                       f"guidance={guidance:.4g}/{model.guidance_scale_target:.4g} "
                       f"loss={float(last_info['critic_loss']):.4f} "

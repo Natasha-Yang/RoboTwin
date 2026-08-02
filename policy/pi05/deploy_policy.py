@@ -35,16 +35,34 @@ def critic_obs_modalities(TASK_ENV, model, observation):
     logged per primitive step by the env and drained here, which means what a control step sees
     is the trace of the *previous* chunk -- the steps between the last observation and this one.
     That is the only wrench a policy could ever condition on (the current chunk has not been
-    executed yet), and it is the same array a rollout dataset stores one row earlier, so a
-    critic trained offline on `observation.wrench.*` has to be trained against the *next* row's
-    state/action to match what it sees here.
+    executed yet), and rollout collection drains it at the same point, so `observation.wrench.*`
+    in a dataset is the same array against the same row's state and action.
     """
     if not getattr(model, "uses_online_critic", False):
         return None
-    # Draining here is what keeps the log bounded during eval. Rollout collection drains it
-    # itself, after the chunk has run -- it wants the trace the chunk just produced, which is
-    # still accumulating at this point, so the two consumers do not compete.
+    # Draining here is also what keeps the log bounded during eval. Rollout collection has its
+    # own drain at its own observation, and never runs a critic, so the two never compete.
     return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.pi0_step)
+
+
+def _as_bool(value, default):
+    """A config flag that may arrive as a CLI override string.
+
+    The yml gives real booleans, but `--overrides train_online false` reaches here as
+    the *string* `"false"` (eval() raises NameError on it and the parser keeps the text), and
+    `bool("false")` is True -- exactly backwards for a switch. Anything unrecognised raises
+    rather than defaulting, so a typo cannot silently turn a flag on.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return bool(value)
+    text = value.strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0", ""):
+        return False
+    raise ValueError(f"expected a boolean, got {value!r}")
 
 
 def get_model(usr_args):
@@ -58,6 +76,15 @@ def get_model(usr_args):
     guidance_scale = float(usr_args.get("guidance_scale", 0.0) or 0.0)
     guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
     online_critic = guidance_scale != 0.0
+    # Whether that critic keeps learning during the rollouts. False freezes it at whatever
+    # `critic_ckpt` holds: it still steers the sampler, but nothing is stashed into the replay
+    # buffer and no TD update runs. Only meaningful when a critic exists at all.
+    #
+    # It is a critic-side knob, so it lives in the `critic_config_path` file as `train_online`
+    # (next to `freeze_encoder`, which is the same idea one level down -- freeze the encoder
+    # and keep training the value head) and reaches usr_args through that include. The attribute
+    # keeps the longer name on this side, where "online" alone would not say online *what*.
+    train_critic_online = _as_bool(usr_args.get("train_online"), True)
     # Online QMFM Value-critic hyperparameters. These reach usr_args via the deploy config's
     # `critic_config_path` include (see eval_policy.parse_args_and_config), so the critic's
     # own cfg file stays the source of truth for them.
@@ -67,6 +94,8 @@ def get_model(usr_args):
             "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
             "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
             "start_training", "utd_ratio",
+            # Train the value head only, keeping the checkpoint's observation encoder.
+            "freeze_encoder",
             # Which observation modalities the critic conditions on, and with what encoders.
             "encoder_modalities",
         )
@@ -76,7 +105,8 @@ def get_model(usr_args):
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
                guidance_ramp_updates=guidance_ramp_updates,
-               online_critic=online_critic, critic_config=critic_config, critic_seed=critic_seed,
+               online_critic=online_critic, train_critic_online=train_critic_online,
+               critic_config=critic_config, critic_seed=critic_seed,
                collect_critic_obs=usr_args.get("collect_critic_obs", False),
                collect_siglip=usr_args.get("collect_siglip", True))
 

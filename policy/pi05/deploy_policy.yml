@@ -26,10 +26,18 @@ test_num: 50
 # updates *of this run* (0 = jump to the target after the first update). A critic warm-started
 # from `critic_ckpt` ramps in the same way -- its restored update counter does not count.
 # Both are overridable as eval.sh's 7th / 8th positional args.
-guidance_scale: 0
+#
+# Whether that critic also *learns* here is `train_online` in the `critic_config_path` file
+# below, with `freeze_encoder` next to it for the half-way point (keep the checkpoint's
+# observation encoder, keep training the value head). `train_online: false` freezes the critic
+# at `critic_ckpt` entirely: it still steers, but nothing is stashed into the replay buffer and
+# no TD update runs, so guidance sits at `guidance_scale` from the first chunk (there are no
+# updates to ramp against) and `guidance_ramp_updates` is ignored. Overridable as eval.sh's 9th
+# positional arg, or by setting `train_online` here -- this file wins over the included one.
+guidance_scale: 0.1
 guidance_ramp_updates: 256
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
-critic_ckpt: /home/natasha/multisensory-steering/checkpoints/critic_offline/best.pkl
+critic_ckpt: /home/natasha/multisensory-steering/checkpoints/put_object_cabinet_modality_ablation_stratified/siglip_wrench/best.pkl
 
 # Everything below only takes effect when guidance_scale != 0.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above

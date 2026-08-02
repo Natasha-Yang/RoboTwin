@@ -237,7 +237,40 @@ pi0.5 flow sampler in `Pi0.sample_actions`:
 | `guidance_scale` | Behavior |
 |---|---|
 | `0.0` (default) | plain pi0.5 baseline — no critic is built, no replay collection, no TD updates, no W&B |
-| nonzero | an ensemble QMFM `Value` critic is trained **online** by TD during the rollouts; guidance ramps `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+| nonzero | an ensemble QMFM `Value` critic steers the sampler; by default it is also trained **online** by TD during the rollouts, and guidance ramps `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+
+How much of the critic online TD is then allowed to move is decided by two keys in the
+**critic config** (`critic_config_path`, i.e. `cfgs/qmfm.yaml` — not `deploy_policy.yml`, though
+that file and the CLI can override them like any other critic key). Both only mean anything once
+guidance is on:
+
+| Key | Default | Behavior |
+|---|---|---|
+| `train_online: true` | ✔ | as above — transitions are stashed into the replay buffer after every control step, TD updates run, `save_critic` writes the result |
+| `train_online: false` | | the critic is **frozen** at `critic_ckpt`: it still steers the sampler, but nothing is stashed, no TD update runs, and the ramp is skipped (guidance sits at `guidance_scale` from the first chunk, since there are no updates to count). W&B still opens and logs the eval metrics |
+| `freeze_encoder: true` | | the half-way point: TD still runs, but only on the value head — the observation encoder (`MultiModalEncoder`, or the legacy single SigLIP CNN) keeps the checkpoint's weights |
+
+Freezing is for warm starts. `train_online: false` evaluates an offline-trained critic as-is,
+with no eval-time drift in its values; `freeze_encoder` keeps the representation a large offline
+dataset paid for — the part a few thousand online transitions are least able to improve — while
+letting TD refit the MLP on top of it.
+
+`train_online: false` requires a `critic_ckpt`: a frozen critic never leaves its initialization,
+so with none it would guide on the gradients of a random network, and `pi_model.py` raises at
+startup rather than running it. The replay buffer is allocated lazily on the first stash, so a
+frozen run never pays its memory either, and `save_critic` is skipped — the critic is
+byte-identical to the checkpoint the snapshotted config names. `eval.sh`'s 9th positional arg
+overrides `train_online` for a one-off run.
+
+`freeze_encoder` is implemented in `qmfm.py::freeze_encoder_tx` as an `optax.multi_transform`
+that zeroes the updates of everything under the params tree's `encoder` key, rather than as a
+`stop_gradient` inside the module: `critic_def` stays one pure function, so the guidance path —
+which differentiates Q with respect to the *action*, a branch that never enters the encoder — is
+unaffected either way, and the zeroed gradients are dead code in the jitted update. Only the
+online params are pinned; the target network keeps its Polyak update, which against a constant
+encoder just converges it to the same frozen weights. Unlike `encoder_modalities` it is **not**
+an architecture key — it changes no shapes, so the config's value wins over a checkpoint's and
+either setting loads either checkpoint.
 
 The ramp counts TD updates **performed in this run**. A critic warm-started from `critic_ckpt`
 restores the checkpoint's lifetime `num_updates` (an offline-trained one is in the hundreds), so
@@ -254,7 +287,9 @@ critic implementation and its config both come from the `multisensory_steering` 
 imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` (default `/home/natasha/QMFM`, exported by
 `eval.sh`). Only the guided path logs to W&B, collects replay transitions, and honors
 `save_critic` / `critic_ckpt` / the TD hyperparameters; `script/eval_policy.py` keys all of it
-off whether the policy object exposes an `online_critic`.
+off whether the policy object exposes an `online_critic`, and the collection/updates
+additionally off `model.train_critic_online` (`_trains_online_critic`), which — unlike the
+critic object — is known before the first observation.
 
 **The critic must be trained in pi0.5's model space.** `Pi0.sample_actions` scores the chunk
 it is sampling, *before* the output transform runs: **normalized** state `(14,)` and a
@@ -313,12 +348,12 @@ Three things to keep in mind:
   are dropped by `OnlineValueCritic.stash`, so they only ride back from the device in `aux`.
 - **The wrench a control step sees is the previous chunk's trace** — the steps between the last
   observation and this one, which is the only wrench that exists before the current chunk has
-  been executed. In a rollout dataset the same array sits one row *earlier* (there it is the
-  trace the row's own chunk produced), so offline training on `observation.wrench.*` must pair
-  it with the *next* row's state/action. The env's per-step logging is switched by the task
-  config's `data_type.wrench` (§6a) — a critic configured for `wrench.*` against a config that
-  has it off fails at startup. The guided path drains the log before the chunk runs, collection
-  drains it after, so the two never compete.
+  been executed. Rollout collection drains the log at the same point in its loop, so a dataset's
+  `observation.wrench.*` holds exactly this against exactly this row's state and action, and a
+  critic trained offline on it needs no realignment. (Datasets collected before 2026-07-30 store
+  the *following* chunk's trace instead — see §6a.) The env's per-step logging is switched by the
+  task config's `data_type.wrench` (§6a); a critic configured for `wrench.*` against a config
+  that has it off fails at startup.
 - **Modalities are an architecture key.** They go into the checkpoint, and a warm start rebuilds
   the same encoder stack; changing the list makes an existing critic checkpoint refuse to load
   (loudly, leaf by leaf). Offline pretraining takes the same names — `multisensory_steering`'s
@@ -348,6 +383,12 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
   - `expert_check: true` — only roll out on seeds the expert can solve.
   - `output_dir: ./rollout_datasets` — local `save_to_disk` location.
   - `push_to_hub: true`, `hub_repo_id: NatashaYang/robotwin_pi05_rollouts_dataset`.
+  - `hub_private: true` — create the hub repo private. This is the **default when the key is
+    absent**, so a run cannot publish a dataset by omission; set it `false` to deliberately
+    create a public repo. It is honored only when the push *creates* the repo — an existing
+    repo keeps whatever visibility it already has, so this cannot retroactively hide (or
+    expose) a dataset that has been pushed before. To change an existing repo, use
+    `HfApi().update_repo_settings(repo_id, repo_type="dataset", private=...)`.
   - `checkpoint_id: 30000`, `pi0_step: 50`, `instruction_type: unseen`.
   - `collect_critic_obs: true` — also record the policy's **model-space** view of each step.
   - `collect_siglip: true` — within that, also record the SigLIP patch features of **every**
@@ -424,14 +465,28 @@ dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well
 wrench on that arm's end-effector links, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
 about the TCP — computed by the shared `envs/utils/wrench.py::tcp_wrench_vector` so the eval and
 collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
-call, while collection samples after **every** primitive step, so a row carries the whole
-`(pi0_step, 6)` trace of the chunk it executed rather than a single vector. The env does the
-logging (`_base_task.py::_log_step_wrench`); the rollout loop drains it with `pop_step_wrench()`
-once per inference call, and `envs/utils/wrench.py::stack_step_wrench` does the stacking, shared
-with the critic's online view of the same modality. An episode's last chunk stops early —
-`take_action` is a no-op once the task succeeds or `step_lim` is hit — and the unexecuted steps
-are padded with **NaN**, not zeros, since zero is a meaningful reading (the arm touching
-nothing). At 480 B/row they are the cheapest column here.
+call, while collection samples after **every** primitive step, so a row carries a whole
+`(pi0_step, 6)` trace rather than a single vector.
+
+Which trace matters: it is the one the **previous** chunk produced — the steps between the
+previous row's observation and this one. The env logs a sample after each `take_action`
+(`_base_task.py::_log_step_wrench`, so the reading belongs to the action that just executed),
+and the rollout loop drains the log with `pop_step_wrench()` **before** running the chunk, at
+the same point in the loop the guided eval path drains it (§5a). The column is therefore an
+observation — something the policy could have conditioned on — not the outcome of the row's own
+action, and offline training pairs it with the row's state/action as-is.
+
+> Datasets collected before 2026-07-30 drained the log *after* the chunk, so their
+> `observation.wrench.*` is the trace of the row's **own** chunk. To train on one, shift the
+> column a row later within each episode — `multisensory_steering`'s `dataset.modalities`
+> takes `{column: ..., shift: 1}` for exactly this.
+
+`envs/utils/wrench.py::stack_step_wrench` does the stacking, shared with the critic's online
+view of the same modality. A trace can be short — an episode's first row has no previous chunk
+and carries a single sample of the contact state at that instant, and a chunk cut off by success
+or `step_lim` contributes only the steps it ran — so the tail is padded with **NaN**, not zeros,
+since zero is a meaningful reading (the arm touching nothing). At 480 B/row they are the
+cheapest column here.
 
 `wrench` is a `data_type` like the others, but it is the one the env cannot pick up from the
 flag itself: contacts are a scene query, not part of `get_obs`. So each driver reads

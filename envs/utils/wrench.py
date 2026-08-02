@@ -83,13 +83,14 @@ def tcp_wrench_vector(task_env):
 def stack_step_wrench(step_wrench, num_steps):
     """Stack the per-step samples of one action chunk into ``{arm: (num_steps, 6)}``.
 
-    ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected while the chunk executed:
-    one ``tcp_wrench_vector`` dict per ``take_action``. Padded to ``num_steps`` (i.e.
-    ``pi0_step``) with **NaN**, so the result has one fixed shape whether or not the chunk ran
-    to completion — only an episode's last chunk is ever short, since ``take_action`` stops
-    stepping once the task succeeds or ``step_lim`` is hit. NaN rather than zero, because zero
-    is a meaningful reading (the arm touching nothing); consumers that cannot take NaN should
-    map it to zero explicitly.
+    ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected over the chunk that ran
+    since the last drain: one ``tcp_wrench_vector`` dict per ``take_action``. Padded to
+    ``num_steps`` (i.e. ``pi0_step``) with **NaN**, so the result has one fixed shape whether or
+    not that chunk ran to completion — an episode's first drain has no chunk behind it and
+    carries a single sample of the current contact state, and a chunk cut short by success or
+    ``step_lim`` yields fewer than ``num_steps``. NaN rather than zero, because zero is a
+    meaningful reading (the arm touching nothing); consumers that cannot take NaN should map it
+    to zero explicitly.
 
     Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
     all zero".

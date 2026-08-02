@@ -34,7 +34,8 @@ class PI0:
     def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
                  critic_ckpt=None, guidance_scale=0.0,
                  guidance_ramp_updates=0,
-                 online_critic=False, critic_config=None, critic_seed=0,
+                 online_critic=False, train_critic_online=True,
+                 critic_config=None, critic_seed=0,
                  collect_critic_obs=False, collect_siglip=True):
         self.train_config_name = train_config_name
         self.model_name = model_name
@@ -68,7 +69,14 @@ class PI0:
         # update_observation_window (see _init_critic), not here. `uses_online_critic` states
         # up front whether one is coming, because the eval driver has to decide about W&B
         # before any rollout starts.
+        #
+        # `train_critic_online` decides whether that critic keeps learning here. False freezes
+        # it at the checkpoint's parameters: it is still built and still steers the sampler, but
+        # nothing is stashed into the replay buffer and the eval driver runs no TD update -- an
+        # offline-trained critic evaluated as-is, with no eval-time distribution shift in the
+        # values. It only makes sense against a `critic_ckpt` (see below).
         self.uses_online_critic = bool(online_critic)
+        self.train_critic_online = bool(train_critic_online)
         self.online_critic = None
         self.critic_action_dim = None
         # Sensor modalities from the sim observation (depth / point cloud / contact wrench --
@@ -88,6 +96,15 @@ class PI0:
             # critic_ckpt configured while running it is a normal A/B thing to do.
             print(f"[pi_model] guidance_scale is 0 -- ignoring critic_ckpt {critic_ckpt} "
                   f"and running the plain pi0.5 baseline")
+        if online_critic and not self.train_critic_online and not critic_ckpt:
+            # A frozen critic never leaves its initialization, so this would steer the sampler
+            # by the gradients of a randomly initialized network for the whole run.
+            raise ValueError(
+                "train_critic_online is false and critic_ckpt is null: the critic would stay at "
+                "its random initialization and guide the sampler with meaningless gradients. "
+                "Point critic_ckpt at an offline-trained critic, or set train_critic_online "
+                "true to train one during the rollouts."
+            )
 
         self.policy = _policy_config.create_trained_policy(
             config,
@@ -208,11 +225,13 @@ class PI0:
         })
         warm = (f"warm-started from {self._critic_ckpt} at "
                 f"{self._critic_updates_at_start} updates" if self._critic_ckpt else "from scratch")
+        ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
+                f"TD update), " if self.train_critic_online else "no ramp (frozen critic), ")
+        mode = "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
         unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
-        print(f"[pi_model] online QMFM Value critic enabled ({warm}, "
+        print(f"[pi_model] QMFM Value critic guidance enabled, critic {mode} ({warm}, "
               f"guidance_scale_target={self.guidance_scale_target}, "
-              f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
-              f"TD update), "
+              f"{ramp}"
               f"num_qs={cc['num_qs']}, action chunk={chunk} "
               f"-> action_dim_flat={cc['action_dim_flat']})")
         print(f"[pi_model] critic observation: "
@@ -226,9 +245,15 @@ class PI0:
         in exactly like one trained from scratch: its values are trained on a different
         (offline) state distribution, so easing the sampler into them is worth doing even
         though the network is not random.
+
+        A frozen critic (`train_critic_online: false`) has no TD updates to count -- the ramp
+        would pin guidance at 0 for the entire run -- so it guides at the target from the first
+        chunk. Its values never move either, so there is nothing to ease into.
         """
         if self.online_critic is None:
             return 0.0
+        if not self.train_critic_online:
+            return self.guidance_scale_target
         updates = self.online_critic.num_updates - self._critic_updates_at_start
         if updates <= 0:
             return 0.0
@@ -326,12 +351,15 @@ class PI0:
             }
             # Stash this control step's (obs, action) for the replay buffer. Every SigLIP view
             # the sampler produced is offered; `stash` keeps only the critic's own
-            # `encoder_modalities`, so an unused view costs the buffer nothing.
+            # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
+            # skips this entirely -- nothing would ever train on the transitions, and the buffer
+            # is allocated lazily, so it never costs the run any memory.
             out = self.policy.infer(self.observation_window)
-            self.online_critic.stash(
-                {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra},
-                out["critic_action"],
-            )
+            if self.train_critic_online:
+                self.online_critic.stash(
+                    {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra},
+                    out["critic_action"],
+                )
             self._stash_critic_obs(out)
             return out["actions"]
         out = self.policy.infer(self.observation_window)
