@@ -27,6 +27,7 @@ data_type:
   observer: false
   endpose: true
   qpos: true
+  wrench: true
   mesh_segmentation: false
   actor_segmentation: false
 pcd_down_sample_num: 1024
@@ -35,3 +36,7 @@ save_path: ./data
 clear_cache_freq: 5
 collect_data: true
 eval_video_log: true
+# Eval debug output (see visualize_debug_obs in script/eval_policy.py): TCP wrench
+# histograms + a rollout/wrench GIF per episode, alongside the episode videos. Depth /
+# point-cloud dumps are added on top when the data_type flags above enable them.
+debug: false
