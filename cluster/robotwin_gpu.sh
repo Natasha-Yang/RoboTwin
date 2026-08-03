@@ -15,9 +15,6 @@
 #SBATCH --account=def-florian7_gpu
 #SBATCH --job-name=robotwin
 #SBATCH --gpus-per-node=h100:1
-# fc10512 currently exposes the H100 to CUDA but cannot create a Vulkan
-# device, so SAPIEN rendering fails before collection starts.
-#SBATCH --exclude=fc10512
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=3:00:00
