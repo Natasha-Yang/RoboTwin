@@ -28,6 +28,10 @@ class open_microwave(Base_Task):
         self.add_prohibit_area(self.microwave)
         self.prohibited_area.append([-0.25, -0.25, 0.25, 0.1])
 
+        limits = self.microwave.get_qlimits()[0]
+        qpos = self.microwave.get_qpos()
+        self.last_openness = qpos[0] - limits[0]
+
     def play_once(self):
         arm_tag = ArmTag("left")
 
@@ -103,3 +107,11 @@ class open_microwave(Base_Task):
         limits = self.microwave.get_qlimits()
         qpos = self.microwave.get_qpos()
         return qpos[0] >= limits[0][1] * target
+
+    def step_reward(self):
+        limits = self.microwave.get_qlimits()[0]
+        qpos = self.microwave.get_qpos()
+        cur_openness = qpos[0] - limits[0]
+        reward = (cur_openness - self.last_openness) / (limits[1] - limits[0])
+        self.last_openness = cur_openness
+        return reward

@@ -6,6 +6,8 @@ import math
 
 class lift_pot(Base_Task):
 
+    POT_HEIGHT_WEIGHT = 5.0
+
     def setup_demo(self, is_test=False, **kwags):
         super()._init_task_env_(**kwags)
 
@@ -24,6 +26,17 @@ class lift_pot(Base_Task):
         )
         x, y = self.pot.get_pose().p[0], self.pot.get_pose().p[1]
         self.prohibited_area.append([x - 0.3, y - 0.1, x + 0.3, y + 0.1])
+
+        pot_pose = self.pot.get_pose()
+        left_end = np.array(self.robot.get_left_tcp_pose()[:3])
+        right_end = np.array(self.robot.get_right_tcp_pose()[:3])
+        left_grasp = np.array(self.pot.get_contact_point(0)[:3])
+        right_grasp = np.array(self.pot.get_contact_point(1)[:3])
+        self.last_pot_dir = get_face_prod(pot_pose.q, [0, 0, 1], [0, 0, 1])
+
+        self.last_pot_pose = pot_pose.p[2]
+        self.last_left_dist = np.sqrt(np.sum((left_end - left_grasp)**2))
+        self.last_right_dist = np.sqrt(np.sum((right_end - right_grasp)**2))
 
     def play_once(self):
         left_arm_tag = ArmTag("left")
@@ -56,3 +69,30 @@ class lift_pot(Base_Task):
         pot_dir = get_face_prod(pot_pose.q, [0, 0, 1], [0, 0, 1])
         return (pot_pose.p[2] > 0.82 and np.sqrt(np.sum((left_end - left_grasp)**2)) < 0.03
                 and np.sqrt(np.sum((right_end - right_grasp)**2)) < 0.03 and pot_dir > 0.8)
+
+    def step_reward(self):
+        pot_pose = self.pot.get_pose()
+        left_end = np.array(self.robot.get_left_tcp_pose()[:3])
+        right_end = np.array(self.robot.get_right_tcp_pose()[:3])
+        left_grasp = np.array(self.pot.get_contact_point(0)[:3])
+        right_grasp = np.array(self.pot.get_contact_point(1)[:3])
+        pot_dir = get_face_prod(pot_pose.q, [0, 0, 1], [0, 0, 1])
+
+        left_dist = np.sqrt(np.sum((left_end - left_grasp)**2))
+        right_dist = np.sqrt(np.sum((right_end - right_grasp)**2))
+
+        reward = 0.0
+        d_pot_pose = pot_pose.p[2] - self.last_pot_pose
+        d_left_dist = left_dist - self.last_left_dist
+        d_right_dist = right_dist - self.last_right_dist
+        d_pot_dir = pot_dir - self.last_pot_dir
+        reward += np.clip(self.POT_HEIGHT_WEIGHT * d_pot_pose, -0.05, 0.05)
+        reward += np.clip(-d_left_dist, -0.05, 0.05)
+        reward += np.clip(-d_right_dist, -0.05, 0.05)
+        reward += np.clip(d_pot_dir, -0.05, 0.05)
+
+        self.last_pot_pose = pot_pose.p[2]
+        self.last_left_dist = left_dist
+        self.last_right_dist = right_dist
+        self.last_pot_dir = pot_dir
+        return reward

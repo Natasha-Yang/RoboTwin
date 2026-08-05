@@ -146,6 +146,11 @@ def log_critic_update(wandb_run, online_critic, model, info, chunk_count, episod
         "critic/q_min": _scalar(info["q_min"]),
         "critic/target_q_mean": _scalar(info["target_q_mean"]),
         "critic/reward_mean": _scalar(info["reward_mean"]),
+        # The rate this update was actually taken at: the critic's Adam warms up over
+        # `lr_warmup_steps` and cosine-decays over `lr_decay_steps` (cfgs/qmfm.yaml), both
+        # counted in updates of this run, so the curve doubles as a check that the schedule
+        # covers the update budget the run really has.
+        "critic/lr": _scalar(info["lr"]),
         "critic/buffer_size": int(buf),
         "critic/guidance_scale": float(model.scheduled_guidance_scale()),
         "critic/guidance_scale_target": float(model.guidance_scale_target),
@@ -913,7 +918,7 @@ def eval_policy(task_name,
                 )
             eval_func(TASK_ENV, model, observation)
             success_now = bool(TASK_ENV.eval_success)
-            reward = 1.0 if (success_now and not prev_success) else 0.0
+            reward = 1.0 if (success_now and not prev_success) else getattr(TASK_ENV, "step_reward", lambda: 0.0)()
             episode_reward += reward
 
             # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped
