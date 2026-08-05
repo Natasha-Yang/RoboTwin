@@ -92,6 +92,10 @@ def get_model(usr_args):
         k: usr_args[k]
         for k in (
             "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
+            # The rest of the Adam schedule around that peak `lr` (make_lr_schedule): without
+            # these the critic silently falls back to QMFM's paper defaults (500 / 3e5 / 0.1x),
+            # whatever the cfg file says.
+            "lr_warmup_steps", "lr_decay_steps", "lr_final_frac",
             "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
             "start_training", "utd_ratio",
             # Train the value head only, keeping the checkpoint's observation encoder.

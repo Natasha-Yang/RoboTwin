@@ -471,14 +471,15 @@ rollout dataset, for when you want the distribution over a whole run rather than
 
 ### 6.2 Critic gradient guidance (`guidance_scale` is the on/off switch)
 
-> **Status on Rorqual: not runnable out of the box.** `multisensory_steering` is checked
-> out at `/lustre09/project/6028519/natashay/multisensory-steering`, but the **QMFM repo
-> is not staged on this cluster** — `pi_model.py` imports its `ReplayBuffer` via
-> `$QMFM_ROOT`, so a guided run fails at import until you clone it and export
-> `QMFM_ROOT`. `deploy_policy.yml` therefore ships `guidance_scale: 0.0` and
-> `critic_ckpt: null` here, so a plain eval runs unmodified. To turn guidance on:
-> clone QMFM, `export QMFM_ROOT=<path>`, stage a critic checkpoint, and set
-> `guidance_scale` (or pass it as `eval.sh`'s 7th arg). Everything below then applies.
+> **Status on Rorqual: both dependencies are staged.** `multisensory_steering` is checked
+> out at `/lustre09/project/6028519/natashay/multisensory-steering`, and the **QMFM repo**
+> it imports `ReplayBuffer` from (by explicit path, `$QMFM_ROOT/utils/datasets.py`) at
+> `/home/natashay/links/projects/def-florian7/natashay/QMFM`. `eval.sh` exports that as the
+> `QMFM_ROOT` default — override the env var to point elsewhere. It also forces
+> `WANDB_MODE=offline`: compute nodes have no internet, and the guided path opens a W&B run
+> per eval, so an online `wandb.init()` times out (90 s) and can take the job down. Sync the
+> offline runs from a login node afterwards (`cluster/wandb_sync.sh`). To turn guidance on,
+> stage a critic checkpoint and set `guidance_scale` (or pass it as `eval.sh`'s 7th arg).
 >
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
@@ -501,7 +502,7 @@ guidance is on:
 
 | Key | Default | Behavior |
 |---|---|---|
-| `train_online: true` | ✔ | as above — transitions are stashed into the replay buffer after every control step, TD updates run, `save_critic` writes the result |
+| `train_online: true` | ✔ | as above — transitions are stashed into the replay buffer after every control step, TD updates run, `save_critic` writes the result (see the checkpointing note below) |
 | `train_online: false` | | the critic is **frozen** at `critic_ckpt`: it still steers the sampler, but nothing is stashed, no TD update runs, and the ramp is skipped (guidance sits at `guidance_scale` from the first chunk, since there are no updates to count). W&B still opens and logs the eval metrics |
 | `freeze_encoder: true` | | the half-way point: TD still runs, but only on the value head — the observation encoder (`MultiModalEncoder`, or the legacy single SigLIP CNN) keeps the checkpoint's weights |
 
@@ -516,6 +517,18 @@ startup rather than running it. The replay buffer is allocated lazily on the fir
 frozen run never pays its memory either, and `save_critic` is skipped — the critic is
 byte-identical to the checkpoint the snapshotted config names. `eval.sh`'s 9th positional arg
 overrides `train_online` for a one-off run.
+
+Under `save_critic`, that critic is written to `online_value_critic.pkl` in the run's result dir
+**after every episode**, not once at the end — a 100-episode guided eval is many hours, and
+losing all of its TD training to a SLURM time limit is the expensive failure. There is one file
+per run, overwritten each time, so nothing accumulates; to resume, point the next run's
+`critic_ckpt` at it (the checkpoint carries `num_updates`, so the guidance ramp picks up where
+it left off — `PI0.scheduled_guidance_scale` still counts only *this* run's updates, §6.2).
+`script/eval_policy.py::save_online_critic` pickles into a sibling `.tmp` and `os.replace`s it
+into position, so a kill mid-write leaves the previous complete checkpoint rather than a
+truncated one — writing in place at this rate would otherwise make the interrupt this is meant
+to survive destroy the checkpoint too. There is **no** separate end-of-run save: a run that
+finishes got its last write from its last episode, so `main` only prints where the file is.
 
 `freeze_encoder` is implemented in `qmfm.py::freeze_encoder_tx` as an `optax.multi_transform`
 that zeroes the updates of everything under the params tree's `encoder` key, rather than as a
@@ -539,8 +552,8 @@ overrides it (pass `0` to force the baseline). The critic's own hyperparameters 
 file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
 critic implementation and its config both come from the `multisensory_steering` package
 (editable install at `/lustre09/project/6028519/natashay/multisensory-steering`, config at
-`cfgs/qmfm.yaml`), which imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` — **not staged on
-Rorqual yet**, see the status note at the top of this section. Only the guided path logs to W&B, collects replay transitions, and honors
+`cfgs/qmfm.yaml`), which imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` — see the status note
+at the top of this section for where both are staged. Only the guided path logs to W&B, collects replay transitions, and honors
 `save_critic` / `critic_ckpt` / the TD hyperparameters; `script/eval_policy.py` keys all of it
 off whether the policy object exposes an `online_critic`, and the collection/updates
 additionally off `model.train_critic_online` (`_trains_online_critic`), which — unlike the
@@ -851,12 +864,15 @@ Notes:
   built against their own torch. `camera.py` swallows the ABI error in a bare `except:`
   and prints only `fps error: missing pytorch3d` — the same message you get when it
   simply isn't installed, so don't read that as "not installed".
-- **The critic path came from a workstation branch.** `guidance_scale != 0` needs the
-  `multisensory_steering` package (present at
-  `/lustre09/project/6028519/natashay/multisensory-steering`) **and** the QMFM repo it
-  imports `ReplayBuffer` from via `$QMFM_ROOT` — **QMFM is not staged on Rorqual**. The
-  defaults here are the plain baseline (`guidance_scale: 0.0`, `critic_ckpt: null`); see
-  §6.2 before turning it on.
+- **The critic path needs two out-of-repo checkouts.** `guidance_scale != 0` needs the
+  `multisensory_steering` package (`/lustre09/project/6028519/natashay/multisensory-steering`)
+  **and** the QMFM repo it imports `ReplayBuffer` from via `$QMFM_ROOT`
+  (`/home/natashay/links/projects/def-florian7/natashay/QMFM`). Both are staged on Rorqual and
+  `policy/pi05/eval.sh` exports the `QMFM_ROOT` default; on a new cluster re-point that export
+  and `critic_config_path`. See §6.2 before turning guidance on.
+- **W&B must be offline on compute nodes.** No internet there, so `wandb.init()` blocks for 90 s
+  and can kill the job. `cluster/finetune_pi05.sh` and `policy/pi05/eval.sh` both export
+  `WANDB_MODE=offline`; push the runs later with `cluster/wandb_sync.sh` from a login node.
 
 ---
 

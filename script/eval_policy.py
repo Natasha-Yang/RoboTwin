@@ -4,7 +4,9 @@ If the policy exposes a ``model.online_critic`` (pi05 builds one only when
 ``guidance_scale != 0``), the rollout additionally collects a chunk-level transition after
 every control step and runs TD updates on that critic, which steers the frozen pi0.5 flow
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
-progress is logged to W&B. Setting ``train_critic_online: false`` keeps the guidance but leaves
+progress is logged to W&B. Under ``save_critic`` it is written to the result directory after
+every episode, so an interrupted run leaves a checkpoint the next one can resume from via
+``critic_ckpt``. Setting ``train_critic_online: false`` keeps the guidance but leaves
 the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
 no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
@@ -98,6 +100,30 @@ def _trains_online_critic(model):
     that do not know the knob keep the historical behavior (train).
     """
     return _uses_online_critic(model) and bool(getattr(model, "train_critic_online", True))
+
+
+CRITIC_CKPT_NAME = "online_value_critic.pkl"
+
+
+def save_online_critic(online_critic, save_dir):
+    """Write the critic checkpoint into `save_dir`, atomically. Returns the path written.
+
+    `OnlineValueCritic.save` pickles straight into its destination, which is fine for a single
+    write at the end of a run. This is called after *every* episode instead, so that an
+    interrupted eval -- a SLURM time limit is the usual one -- still leaves a checkpoint the
+    next run can warm-start from via `critic_ckpt`. Overwriting in place at that rate means a
+    kill mid-write would destroy the last good checkpoint along with the new one, so pickle
+    into a sibling temp file and `os.replace` it into position: the rename is atomic on POSIX,
+    so the destination is always either the previous complete checkpoint or this one.
+    """
+    path = Path(save_dir) / CRITIC_CKPT_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        online_critic.save(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace; cleans up after a failed one
+    return path
 
 
 def _scalar(value):
@@ -657,6 +683,7 @@ def main(usr_args):
     # the policy actually built a critic.
     args["train_freq"] = usr_args.get("train_freq", 1)
     args["wandb_ma_window"] = usr_args.get("wandb_ma_window", 20)
+    args["save_critic"] = usr_args.get("save_critic", False)
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
@@ -694,15 +721,16 @@ def main(usr_args):
     episode_results_df = pd.DataFrame(episode_results)
     episode_results_df.to_csv(episode_file_path)
 
-    # Persist the online-trained critic alongside the eval results. A frozen one has nothing to
-    # persist -- it is a byte-for-byte copy of `critic_ckpt`, which the snapshotted config
-    # already names -- so the file is skipped rather than written misleadingly.
+    # The online-trained critic is already persisted alongside the eval results: `eval_policy`
+    # checkpoints it after every episode, and reaching here means the last episode completed, so
+    # the file on disk is this run's final state. Re-pickling it would write identical bytes --
+    # only report where it is. A frozen critic has nothing to persist in the first place; it is a
+    # byte-for-byte copy of `critic_ckpt`, which the snapshotted config already names.
     online_critic = getattr(model, "online_critic", None)
     if online_critic is not None and usr_args.get("save_critic", False):
         if _trains_online_critic(model):
-            critic_path = save_dir / "online_value_critic.pkl"
-            online_critic.save(critic_path)
-            print(f"saved online critic to {critic_path}")
+            print(f"saved online critic to {save_dir / CRITIC_CKPT_NAME} "
+                  f"({online_critic.num_updates} updates)")
         else:
             print("train_critic_online is off -- not saving the critic (unchanged from "
                   f"{usr_args.get('critic_ckpt')})")
@@ -762,6 +790,13 @@ def eval_policy(task_name,
     # no TD update runs. Unlike the critic object this is known up front -- it is a
     # construction-time property of the policy, not something built on the first observation.
     train_critic = _trains_online_critic(model)
+    # Checkpoint the critic after every episode rather than once at the end, so a run killed
+    # part-way (SLURM time limit, node failure) still leaves the latest critic on disk and the
+    # next run can pick it up via `critic_ckpt`. Only a *learning* critic is worth writing: a
+    # frozen one is a byte-for-byte copy of the checkpoint it was loaded from, which the
+    # snapshotted config already names.
+    save_critic = train_critic and bool(args.get("save_critic", False))
+    critic_ckpt_announced = False
     train_freq = int(args.get("train_freq", 1))
     ma_window = max(1, int(args.get("wandb_ma_window", 20)))
     success_window = deque(maxlen=ma_window)
@@ -941,6 +976,16 @@ def eval_policy(task_name,
                 print(f"\033[96m[critic]\033[0m buffer={buf} "
                       f"guidance={guidance:.4g}/{model.guidance_scale_target:.4g} "
                       f"(warming up, no update yet)")
+
+            # Overwrite the run's single checkpoint with the critic as of this episode. Only
+            # announced the first time -- it happens every episode, and the line above already
+            # reports the update count that identifies which state was written.
+            if save_critic:
+                critic_path = save_online_critic(online_critic, save_dir)
+                if not critic_ckpt_announced:
+                    print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
+                          f"{critic_path} (set `critic_ckpt` to it to resume this run)")
+                    critic_ckpt_announced = True
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))

@@ -15,9 +15,13 @@
 # The critic's own hyperparameters come from the `critic_config_path` file in that yml.
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
-# Only needed when guidance_scale != 0: QMFM repo (ReplayBuffer is imported from here).
-# Not staged on Rorqual -- clone it and export QMFM_ROOT before running a guided eval.
-export QMFM_ROOT="${QMFM_ROOT:-$HOME/QMFM}"
+# Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
+# `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
+export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
+# Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
+# wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
+# `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 policy_name=pi05
 task_name=${1}
