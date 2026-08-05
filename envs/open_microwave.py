@@ -103,3 +103,8 @@ class open_microwave(Base_Task):
         limits = self.microwave.get_qlimits()
         qpos = self.microwave.get_qpos()
         return qpos[0] >= limits[0][1] * target
+
+    def step_reward(self):
+        limits = self.microwave.get_qlimits()[0]
+        qpos = self.microwave.get_qpos()
+        return (qpos[0] - limits[0]) / (limits[1] - limits[0])

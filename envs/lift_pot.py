@@ -56,3 +56,18 @@ class lift_pot(Base_Task):
         pot_dir = get_face_prod(pot_pose.q, [0, 0, 1], [0, 0, 1])
         return (pot_pose.p[2] > 0.82 and np.sqrt(np.sum((left_end - left_grasp)**2)) < 0.03
                 and np.sqrt(np.sum((right_end - right_grasp)**2)) < 0.03 and pot_dir > 0.8)
+
+    def step_reward(self):
+        pot_pose = self.pot.get_pose()
+        left_end = np.array(self.robot.get_left_tcp_pose()[:3])
+        right_end = np.array(self.robot.get_right_tcp_pose()[:3])
+        left_grasp = np.array(self.pot.get_contact_point(0)[:3])
+        right_grasp = np.array(self.pot.get_contact_point(1)[:3])
+        pot_dir = get_face_prod(pot_pose.q, [0, 0, 1], [0, 0, 1])
+
+        reward = 0.0
+        reward += np.clip(pot_pose.p[2] - 0.82, -0.1, 0.1)
+        reward += max(- np.sqrt(np.sum((left_end - left_grasp)**2)), -0.1)
+        reward += max(- np.sqrt(np.sum((right_end - right_grasp)**2)), -0.1)
+        reward += np.clip(pot_dir - 0.8, -0.1, 0.1)
+        return reward
