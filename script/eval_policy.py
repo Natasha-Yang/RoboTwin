@@ -883,7 +883,7 @@ def eval_policy(task_name,
                 )
             eval_func(TASK_ENV, model, observation)
             success_now = bool(TASK_ENV.eval_success)
-            reward = 1.0 if (success_now and not prev_success) else getattr(TASK_ENV, "step_reward", lambda _: 0.0)()
+            reward = 1.0 if (success_now and not prev_success) else getattr(TASK_ENV, "step_reward", lambda: 0.0)()
             episode_reward += reward
 
             # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped

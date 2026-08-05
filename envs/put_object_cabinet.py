@@ -81,6 +81,10 @@ class put_object_cabinet(Base_Task):
         self.add_prohibit_area(self.cabinet, padding=0.01)
         self.prohibited_area.append([-0.15, -0.3, 0.15, 0.3])
 
+        object_pose = self.object.get_pose().p
+        target_pose = self.cabinet.get_functional_point(0)
+        self.last_dist = np.sum(abs(object_pose[:2] - target_pose[:2]))
+
     def play_once(self):
         arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
         self.arm_tag = arm_tag
@@ -125,5 +129,8 @@ class put_object_cabinet(Base_Task):
     def step_reward(self):
         object_pose = self.object.get_pose().p
         target_pose = self.cabinet.get_functional_point(0)
-        l1 = np.sum(abs(object_pose[:2] - target_pose[:2]) - np.array([0.05, 0.05]))
-        return np.clip(-l1, -0.1, 0.1)
+        cur_dist = np.sum(abs(object_pose[:2] - target_pose[:2]))
+        reward = np.clip(self.last_dist - cur_dist, -0.1, 0.1)
+        self.last_dist = cur_dist
+        return reward
+    
