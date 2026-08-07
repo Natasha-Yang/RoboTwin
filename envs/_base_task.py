@@ -98,6 +98,12 @@ class Base_Task(gym.Env):
 
         self.now_obs = {}
         self.take_action_cnt = 0
+        # Per-primitive-step end-effector contact wrench (see `_log_step_wrench`). Off by
+        # default: it queries every contact in the scene once per `take_action`. The drivers
+        # set it from the task config's `data_type.wrench`, which cannot reach it the way the
+        # other data types do -- contacts are a scene query, not part of `get_obs`.
+        self.record_step_wrench = kwags.get("record_step_wrench", False)
+        self.step_wrench = []
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
         self.save_freq = kwags.get("save_freq")
@@ -526,7 +532,7 @@ class Base_Task(gym.Env):
             pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
         # pointcloud
         if self.data_type.get("pointcloud", False):
-            pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
+            pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("combine", False))
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
@@ -1511,6 +1517,37 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
+    def _log_step_wrench(self):
+        """Record the end-effector contact wrench left by the step that just finished.
+
+        One `{arm: (6,)}` sample per executed `take_action`, i.e. per primitive control step,
+        in the world frame (`envs/utils/wrench.py`). Enabled by `record_step_wrench`; a
+        `take_action` that returns without stepping the scene logs nothing.
+        """
+        if not self.record_step_wrench:
+            return
+        self.step_wrench.append(tcp_wrench_vector(self))
+
+    def pop_step_wrench(self):
+        """Return the wrench samples logged since the last call, and clear the log.
+
+        Drained once per policy inference, *before* the chunk runs — by
+        `script/collect_dataset.py` and by `policy/pi05/deploy_policy.py::critic_obs_modalities`
+        alike — so what comes back is the trace of the chunk *before* this one: the wrench at
+        every primitive step executed since the last observation (at most `pi0_step` of them,
+        fewer when that chunk ended early). That is the only wrench that exists before the
+        current chunk has run, which is what lets it be an observation rather than an outcome.
+
+        With recording on, an empty log yields one sample taken now rather than nothing at all:
+        no steps have run since the last pop at the start of an episode, and a consumer that
+        asked for the wrench should get the current contact state instead of a missing
+        modality. Recording off yields `[]`.
+        """
+        if self.record_step_wrench and not self.step_wrench:
+            return [tcp_wrench_vector(self)]
+        samples, self.step_wrench = self.step_wrench, []
+        return samples
+
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
@@ -1692,10 +1729,12 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
+                self._log_step_wrench()
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
+        self._log_step_wrench()
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()

@@ -2,7 +2,7 @@
 
 task_name=${1}
 task_config=${2}
-gpu_id=${3}
+gpu_id=${3:-0}
 
 ./script/.update_path.sh > /dev/null 2>&1
 
