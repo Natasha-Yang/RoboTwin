@@ -132,22 +132,22 @@ class put_bottles_dustbin(Base_Task):
         return self.info
 
     def stage_reward(self):
-        taget_pose = [-0.45, 0]
+        target_pose = [-0.45, 0]
         eps = np.array([0.221, 0.325])
         reward = 0
         reward_step = 1 / 3
         for i in range(self.bottle_num):
             bottle_pose = self.bottles[i].get_pose().p
-            if (np.all(np.abs(bottle_pose[:2] - taget_pose) < eps) and bottle_pose[2] > 0.2 and bottle_pose[2] < 0.7):
+            if (np.all(np.abs(bottle_pose[:2] - target_pose) < eps) and bottle_pose[2] > 0.2 and bottle_pose[2] < 0.7):
                 reward += reward_step
         return reward
 
     def check_success(self):
-        taget_pose = [-0.45, 0]
+        target_pose = [-0.45, 0]
         eps = np.array([0.221, 0.325])
         for i in range(self.bottle_num):
             bottle_pose = self.bottles[i].get_pose().p
-            if (np.all(np.abs(bottle_pose[:2] - taget_pose) < eps) and bottle_pose[2] > 0.2 and bottle_pose[2] < 0.7):
+            if (np.all(np.abs(bottle_pose[:2] - target_pose) < eps) and bottle_pose[2] > 0.2 and bottle_pose[2] < 0.7):
                 continue
             return False
         return True
