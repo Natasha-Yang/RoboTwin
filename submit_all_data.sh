@@ -16,15 +16,19 @@
 #
 # Usage:
 #   bash submit_all_data.sh <task_config> [num_batches] [--parallel | --sequential]
+#                           [--tasks t1,t2,...]
 #
 #   num_batches = number of Slurm jobs (i.e. number of GPUs used).
 #                 Default: enough jobs to pack the GPUs (parallel), or one task
 #                 per job (sequential).
+#   --tasks     = collect only the given tasks (comma- or space-separated) instead
+#                 of every task in description/task_instruction/. May be repeated.
 #
 # Examples:
 #   bash submit_all_data.sh demo_randomized                # pack GPUs, default (parallel)
 #   bash submit_all_data.sh demo_randomized 8              # 8 jobs, packed
 #   bash submit_all_data.sh demo_randomized 5 --sequential # 5 jobs, one task at a time
+#   bash submit_all_data.sh demo_randomized --tasks beat_block_hammer,place_cup  # only these two
 
 set -euo pipefail
 shopt -s nullglob
@@ -42,11 +46,23 @@ workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 4
 task_config=""
 num_batches=""
 parallel=1
+declare -a requested_tasks=()
 
-for arg in "$@"; do
+while (( $# )); do
+    arg=$1
     case "$arg" in
         --parallel)               parallel=1 ;;
         --sequential|--seq)       parallel=0 ;;
+        --tasks)
+            shift
+            [[ $# -gt 0 ]] || { echo "--tasks requires a task list" >&2; exit 1; }
+            IFS=', ' read -r -a _t <<< "$1"
+            requested_tasks+=("${_t[@]}")
+            ;;
+        --tasks=*)
+            IFS=', ' read -r -a _t <<< "${arg#--tasks=}"
+            requested_tasks+=("${_t[@]}")
+            ;;
         -*)             echo "Unknown option: $arg" >&2; exit 1 ;;
         *)
             if [[ -z "$task_config" ]]; then
@@ -58,6 +74,7 @@ for arg in "$@"; do
             fi
             ;;
     esac
+    shift
 done
 
 if [[ -z "$task_config" ]]; then
@@ -70,8 +87,23 @@ if [[ ! -f "task_config/${task_config}.yml" ]]; then
     exit 1
 fi
 
-task_files=(description/task_instruction/*.json)
-task_count=${#task_files[@]}
+# Build the list of tasks to collect: either the explicit --tasks list (validated
+# against description/task_instruction/) or every task found there.
+declare -a task_names=()
+if (( ${#requested_tasks[@]} )); then
+    for task_name in "${requested_tasks[@]}"; do
+        if [[ ! -f "description/task_instruction/${task_name}.json" ]]; then
+            echo "Task not found: description/task_instruction/${task_name}.json" >&2
+            exit 1
+        fi
+        task_names+=("$task_name")
+    done
+else
+    for f in description/task_instruction/*.json; do
+        task_names+=("$(basename "$f" .json)")
+    done
+fi
+task_count=${#task_names[@]}
 
 if (( task_count == 0 )); then
     echo "No task descriptions found in description/task_instruction/" >&2
@@ -100,7 +132,7 @@ mkdir -p logs/data_collection
 # one when task_count is not a multiple of num_batches.
 declare -a batch_tasks
 for (( i = 0; i < task_count; i++ )); do
-    task_name=$(basename "${task_files[$i]}" .json)
+    task_name=${task_names[$i]}
     b=$(( i % num_batches ))
     batch_tasks[$b]+=" ${task_name}"
 done

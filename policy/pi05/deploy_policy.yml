@@ -9,5 +9,43 @@ instruction_type: unseen
 # Add Parameters You Need
 train_config_name: null
 model_name: null
-checkpoint_id: 30000
-pi0_step: 50
+checkpoint_id: 15000
+pi0_step: 10
+
+# Number of successful eval episodes to run.
+test_num: 50
+
+# ===== Online QMFM Value-critic gradient guidance =====
+# `guidance_scale` is QMFM's steering_coeff AND the on/off switch for the whole online path:
+#   0.0     -> plain pi0.5 sampling (baseline): no critic is built, no replay collection,
+#              no TD updates, no W&B logging.
+#   nonzero -> an ensemble `Value` critic (multisensory_steering) is trained ONLINE by TD
+#              during the eval rollouts and steers the frozen pi0.5 flow sampler via QMFM
+#              denoised-estimate gradient guidance (see `Pi0.sample_actions`).
+# Guidance starts at 0 and ramps linearly to `guidance_scale` over `guidance_ramp_updates` TD
+# updates *of this run* (0 = jump to the target after the first update). A critic warm-started
+# from `critic_ckpt` ramps in the same way -- its restored update counter does not count.
+# Both are overridable as eval.sh's 7th / 8th positional args.
+#
+# Whether that critic also *learns* here is `train_online` in the `critic_config_path` file
+# below, with `freeze_encoder` next to it for the half-way point (keep the checkpoint's
+# observation encoder, keep training the value head). `train_online: false` freezes the critic
+# at `critic_ckpt` entirely: it still steers, but nothing is stashed into the replay buffer and
+# no TD update runs, so guidance sits at `guidance_scale` from the first chunk (there are no
+# updates to ramp against) and `guidance_ramp_updates` is ignored. Overridable as eval.sh's 9th
+# positional arg, or by setting `train_online` here -- this file wins over the included one.
+#
+# NOTE (Rorqual): the guided path additionally needs the QMFM repo, which `pi_model.py` imports
+# `ReplayBuffer` from via $QMFM_ROOT -- it is NOT staged on this cluster. So the default here is
+# the plain baseline. To enable guidance: clone QMFM, `export QMFM_ROOT=<path>`, stage a critic
+# checkpoint into `critic_ckpt`, and set `guidance_scale` (or pass it as eval.sh's 7th arg).
+guidance_scale: 0.0
+guidance_ramp_updates: 256
+# Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
+critic_ckpt: null
+
+# Everything below only takes effect when guidance_scale != 0.
+# Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
+# (or overridden on the eval.sh command line) wins over it.
+critic_config_path: /lustre09/project/6028519/natashay/multisensory-steering/cfgs/qmfm.yaml
+
