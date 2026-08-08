@@ -13,7 +13,7 @@ checkpoint_id: 15000
 pi0_step: 10
 
 # Number of successful eval episodes to run.
-test_num: 50
+test_num: 100
 
 # ===== Online QMFM Value-critic gradient guidance =====
 # `guidance_scale` is QMFM's steering_coeff AND the on/off switch for the whole online path:
@@ -44,10 +44,10 @@ test_num: 50
 # repos, `export QMFM_ROOT=<path>`, point `critic_config_path` at
 # <multisensory-steering>/cfgs/qmfm.yaml, stage a critic checkpoint into `critic_ckpt`, and set
 # `guidance_scale` (or pass it as eval.sh's 7th arg).
-guidance_scale: 0.0
+guidance_scale: 0.1
 guidance_ramp_updates: 256
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
-critic_ckpt: null
+critic_ckpt:
 
 # Everything below only takes effect when guidance_scale != 0.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
