@@ -5,10 +5,10 @@
 # tasks. Two execution modes:
 #
 #   parallel (default): the batch runs as many tasks concurrently as fit on its
-#             single allocated H100. RoboTwin's render load is tiny (3 D435
+#             single allocated L40S. RoboTwin's render load is tiny (3 D435
 #             cameras, 320x240 RGB, ~2-4 GB VRAM), so the binding limit is CPU,
-#             not the GPU. A Killarney H100 node has 48 CPUs / 8 H100s -> ~6 cores
-#             per GPU, and each worker needs ~3, so the job packs 6/3 = 2 workers
+#             not the GPU. A Killarney L40S node has 64 CPUs / 4 L40S -> 16 cores
+#             per GPU, and each worker needs ~3, so the job packs 16/3 = 5 workers
 #             onto the GPU and requests that GPU's full CPU/RAM fair share
 #             (overriding cluster/robotwin_gpu.sh's defaults).
 #   sequential (--sequential): the batch runs its tasks one after another on the
@@ -33,14 +33,14 @@
 set -euo pipefail
 shopt -s nullglob
 
-# --- how many workers fit on one H100 ---
-# Killarney H100 node = 48 CPUs / 8 GPUs -> 6 cores/GPU fair share; collection is
+# --- how many workers fit on one L40S ---
+# Killarney L40S node = 64 CPUs / 4 GPUs -> 16 cores/GPU fair share; collection is
 # CPU-bound (curobo planning + PhysX), ~3 cores/worker. VRAM/RAM are not the
-# limit (~2-4 GB VRAM, ~6 GB RAM per worker on an 80 GB / ~257 GB-per-GPU node).
-cpus_per_gpu=6
+# limit (~2-4 GB VRAM, ~6 GB RAM per worker on a 48 GB / ~128 GB-per-GPU node).
+cpus_per_gpu=16
 cpus_per_worker=3
 mem_per_worker_gb=12
-workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 4
+workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 5
 
 # --- parse args (positional task_config, optional num_batches, mode flag) ---
 task_config=""
@@ -143,7 +143,7 @@ else
     echo "Submitting ${num_batches} sequential batch job(s) for ${task_count} tasks."
 fi
 
-# On Killarney every H100 node uses the same NVIDIA driver, so SAPIEN's Vulkan
+# On Killarney every L40S node uses the same NVIDIA driver, so SAPIEN's Vulkan
 # renderer is not pinned to specific nodes (unlike Fir, where only a few nodes
 # had a working Vulkan device). Verify rendering once with the smoke test
 # (sbatch cluster/robotwin_gpu.sh) before a large collection run; if some node

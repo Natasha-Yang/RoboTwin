@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 #SBATCH --account=def-florian7_gpu
 #SBATCH --job-name=pi05_finetune
-#SBATCH --gpus-per-node=h100:1
+#SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00

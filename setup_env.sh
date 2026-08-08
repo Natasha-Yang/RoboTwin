@@ -64,8 +64,10 @@ fi
 source "$ROBOTWIN_CONDA/etc/profile.d/conda.sh"
 conda activate "$ROBOTWIN_ENV"
 
-# H100 architecture (compute capability 9.0) for any on-the-fly CUDA JIT.
-export TORCH_CUDA_ARCH_LIST="9.0"
+# L40S architecture (Ada, compute capability 8.9) for any on-the-fly CUDA JIT.
+# Change this per GPU (H100 = 9.0) -- and note that curobo/pytorch3d are compiled
+# ahead of time against it, so switching GPU means rebuilding them (CLAUDE.md §1.2).
+export TORCH_CUDA_ARCH_LIST="8.9"
 
 # --- SAPIEN / Vulkan rendering on Fir GPU nodes ---
 # The NVIDIA Vulkan driver (libGLX_nvidia.so.0, resolved by ldconfig from
@@ -85,7 +87,7 @@ if compgen -G "/usr/lib64/libnvidia-gpucomp.so*" >/dev/null 2>&1; then
     # its bundled ICD (it only recognizes the exact name nvidia_icd.json, but
     # Fir's system ICD is nvidia_icd.x86_64.json) -- and that bundled ICD fails
     # vk::PhysicalDevice::createDevice on this driver. The system ICD + the
-    # gpucomp shim above render correctly on the H100.
+    # gpucomp shim above render correctly on the GPU.
     if [ -z "${VK_ICD_FILENAMES:-}" ]; then
         for _icd in /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json \
                     /usr/share/vulkan/icd.d/nvidia_icd.json \

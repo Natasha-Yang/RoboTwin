@@ -17,7 +17,7 @@
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
 # Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
 # `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
-export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
+export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/projects/aip-florian7/natashay/QMFM}"
 # Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
 # wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
 # `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).

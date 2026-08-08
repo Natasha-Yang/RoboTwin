@@ -49,9 +49,12 @@ must be re-checked are:
    (repo root) and `/project/6028519/natashay/miniforge3` (conda). Grep and update:
    `grep -rn "6028519/natashay" setup_env.sh cluster/ policy/`.
 2. **SLURM account + partition** — `--account=rrg-florian7_gpu` and
-   `--gpus-per-node=h100:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
-3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `9.0` (H100 / sm_90).
-   Set to your GPU's compute capability (A100 = `8.0`, RTX 4090 = `8.9`, …).
+   `--gpus-per-node=l40s:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
+3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `8.9` (L40S / Ada /
+   sm_89). Set to your GPU's compute capability (A100 = `8.0`, H100 = `9.0`, …).
+   This is **not** just a JIT hint: curobo and pytorch3d are compiled ahead of time
+   against it, so changing GPU generation means clean-rebuilding both (§1.2) — a
+   binary built for `sm_90` will not run on an L40S.
 4. **Vulkan / SAPIEN rendering** — the `setup_env.sh` gpucomp-shim + `VK_ICD_FILENAMES`
    block is Fir-specific (see §1.3). On a cluster where SAPIEN renders out of the
    box (e.g. a normal workstation with an NVIDIA driver), it no-ops harmlessly; on
@@ -110,7 +113,7 @@ curobo and pytorch3d compile CUDA kernels. On the login node (no GPU) they will
 ```bash
 module load cuda/12.2              # do NOT pipe `module load` — a pipe subshells it
 export CUDA_HOME=$EBROOTCUDA
-export TORCH_CUDA_ARCH_LIST=9.0    # H100; change per §0.3
+export TORCH_CUDA_ARCH_LIST=8.9    # L40S (Ada / sm_89); change per §0.3
 export FORCE_CUDA=1                # force the CUDA build on the GPU-less login node
 ```
 
@@ -151,8 +154,9 @@ no-op on the login node / non-Fir hosts):
 - **pin the render GPU**: `envs/_base_task.py` constructs the renderer with
   `sapien.Device("cuda:0")` so it doesn't probe every GPU on a busy shared node.
 
-**H100 note:** ray tracing works even though H100 has no RT cores — the driver/OptiX
-runs it. No `_base_task.py` edit needed to fall back to rasterization.
+**Ray-tracing note:** the L40S has RT cores, so `rt` is native there. It also worked
+on H100 despite that chip having none — the driver/OptiX runs it. Either way, no
+`_base_task.py` edit is needed to fall back to rasterization.
 
 **Verify rendering on a GPU node** before collecting anything:
 
@@ -219,7 +223,7 @@ harmless there since it only supplies codec sonames nothing else uses.)
 
 | Script | Purpose |
 |---|---|
-| `cluster/robotwin_gpu.sh` | Generic single-H100 GPU job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
+| `cluster/robotwin_gpu.sh` | Generic single-GPU (L40S) job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
 | `cluster/finetune_pi05.sh` | π0.5 fine-tuning job. Runs in the `policy/pi05` uv venv (JAX), **not** the SAPIEN conda env — no Vulkan needed. |
 | `submit_all_data.sh` | Fan out data collection over many SLURM jobs (batches). |
 | `cluster/convert_molmoact_checkpoint.sh` | Convert a native MolmoAct checkpoint into the HF layout (§5.2). |
@@ -892,13 +896,29 @@ Notes:
 - **Offline compute nodes**: pre-download HF checkpoints/assets and set `HF_HOME` on
   the login node; only *record* rollouts on the compute node, build/push datasets on
   the login node.
-- **pytorch3d lives in *both* envs.** `fps` in `envs/camera/camera.py` (point-cloud
-  downsampling) imports a compiled `_C.so` pinned to a torch ABI, and the two envs run
-  different torch (conda RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0). Collection runs
-  in the first, eval/collection-of-rollouts in the second, so **both** need a pytorch3d
-  built against their own torch. `camera.py` swallows the ABI error in a bare `except:`
-  and prints only `fps error: missing pytorch3d` — the same message you get when it
-  simply isn't installed, so don't read that as "not installed".
+- **pytorch3d is needed only for point clouds — and on Killarney it is installed in
+  *neither* env.** `fps` in `envs/camera/camera.py` (point-cloud downsampling) imports a
+  compiled `_C.so` pinned to a torch ABI, and the two envs run different torch (conda
+  RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you do need it, **both** need
+  their own build — collection runs in the first, eval/rollout-collection in the second.
+  But `fps` is only reached from `camera.py`'s point-cloud path behind
+  `pcd_down_sample_num > 0`, and every task config that ships here sets
+  `data_type.pointcloud: false`, so nothing calls it and its absence is harmless. Two
+  traps if you *do* enable `pointcloud`:
+  - the fallback does **not** degrade gracefully — it prints `fps error: missing
+    pytorch3d` and calls `exit()`, killing the run;
+  - `camera.py` swallows a torch-ABI mismatch in a bare `except:` and prints the same
+    `missing pytorch3d` message, so don't read that as "not installed".
+  (The `fps` call higher up in `get_pcd` is dead code — an unconditional `return`
+  precedes it.)
+- **Switching GPU generation means rebuilding curobo.** Its CUDA extensions are compiled
+  ahead of time for whatever `TORCH_CUDA_ARCH_LIST` said at build time; an `sm_90` build
+  fails on an L40S at kernel launch ("no kernel image is available"). Check what you have
+  with `cuobjdump --list-elf envs/curobo/src/curobo/curobolib/*.so | grep -o 'sm_[0-9]*'`,
+  and clean-rebuild per §1.2. **Build it on a compute node, not the login node** — the
+  login node's per-user memory cap kills `nvcc` mid-file, and the failure prints a bare
+  `FAILED:` line with *no* diagnostic, which reads like a source error but isn't. The
+  build needs no internet (`--no-build-isolation --no-deps`), so a compute node is fine.
 - **The critic path needs two out-of-repo checkouts.** `guidance_scale != 0` needs the
   `multisensory_steering` package (`/lustre09/project/6028519/natashay/multisensory-steering`)
   **and** the QMFM repo it imports `ReplayBuffer` from via `$QMFM_ROOT`
