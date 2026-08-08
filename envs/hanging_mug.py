@@ -86,3 +86,13 @@ class hanging_mug(Base_Task):
         eps = 0.02
         return (np.all(abs((mug_function_pose - rack_middle_pose)[:2]) < eps) and self.is_right_gripper_open()
                 and mug_function_pose[2] > 0.86)
+
+    # def step_reward(self):
+    #     mug_function_pose = self.mug.get_functional_point(0)[:3]
+    #     rack_pose = self.rack.get_pose().p
+    #     rack_function_pose = self.rack.get_functional_point(0)[:3]
+    #     rack_middle_pose = (rack_pose + rack_function_pose) / 2
+    #     dist = np.sum(abs((mug_function_pose - rack_middle_pose)[:2]))
+    #     reward = np.clip(self.last_dist - dist, -0.1, 0.1)
+    #     self.last_dist = dist
+    #     return reward
