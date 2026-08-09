@@ -12,6 +12,7 @@ no critic this is the plain baseline rollout. Configure via
 
 import sys
 import os
+import json
 import re
 import subprocess
 
@@ -20,7 +21,7 @@ sys.path.append(f"./policy")
 sys.path.append("./description/utils")
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
-from envs.utils.wrench import WRENCH_COMPONENTS, tcp_wrench_vector
+from envs.utils.debug_vis import QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
 
 import numpy as np
 from pathlib import Path
@@ -45,7 +46,12 @@ parent_directory = current_file_path.parent
 # the plain baseline never reaches any of this, so wandb stays an optional dependency.
 
 
-def init_wandb(usr_args, save_dir, current_time):
+def init_wandb(usr_args, save_dir, current_time, resume_id=None):
+    """Open the run's W&B session, rejoining `resume_id` when this is a resumed run.
+
+    `resume="allow"` rather than `"must"`: a run whose W&B side was never created (offline, or
+    the id predates a project change) should still start logging, not abort the eval over it.
+    """
     import wandb
 
     if not usr_args.get("wandb_enabled", True):
@@ -70,6 +76,9 @@ def init_wandb(usr_args, save_dir, current_time):
     wandb_mode = usr_args.get("wandb_mode", None)
     if wandb_mode is not None:
         init_kwargs["mode"] = wandb_mode
+    if resume_id:
+        init_kwargs["id"] = resume_id
+        init_kwargs["resume"] = "allow"
 
     run = wandb.init(**init_kwargs)
     wandb.define_metric("critic/update")
@@ -100,12 +109,112 @@ def _trains_online_critic(model):
     return _uses_online_critic(model) and bool(getattr(model, "train_critic_online", True))
 
 
+def as_bool(value, default):
+    """A config flag that may arrive as a CLI override string.
+
+    The yml gives real booleans, but `--overrides use_step_reward false` reaches here as the
+    *string* `"false"` (`parse_args_and_config`'s `eval()` raises NameError on it and the parser
+    keeps the text), and `bool("false")` is True -- exactly backwards for a switch. Anything
+    unrecognised raises rather than defaulting, so a typo cannot silently turn a flag on.
+
+    The pi05 policy has its own copy of this for the knobs it reads itself
+    (`policy/pi05/deploy_policy.py::_as_bool`); it runs on the other side of
+    `eval_function_decorator`, which loads the policy package rather than importing from here.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return bool(value)
+    text = value.strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0", ""):
+        return False
+    raise ValueError(f"expected a boolean, got {value!r}")
+
+
+def control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward=True):
+    """Reward for the control step (action chunk) that just executed.
+
+    Success pays 1.0 on the transition that first reaches it; every other step is worth
+    whatever the task's own `step_reward` says -- a *delta* (progress since the last call, see
+    e.g. `envs/lift_pot.py`), so it must be called exactly once per control step, and only by
+    the driver running the rollout. Tasks that define no shaping fall back to 0.0, which leaves
+    a sparse terminal reward.
+
+    `use_step_reward=False` drops the shaping for every task, leaving that same sparse terminal
+    reward (`use_step_reward` in deploy_policy.yml / eval.sh's 10th arg). The task's
+    `step_reward` is then never called at all, so its internal "since the last call" state never
+    advances -- which is what keeps a disabled run from paying a huge accumulated delta if the
+    flag were flipped mid-rollout.
+
+    Shared with `script/collect_dataset.py` so an offline dataset's `reward` column and the
+    reward the online critic is fed by `commit()` are the same quantity -- nothing downstream
+    can tell them apart if they drift (see `multisensory_steering/cfgs/qmfm.yaml`).
+    """
+    if success_now and not prev_success:
+        return 1.0
+    if not use_step_reward:
+        return 0.0
+    return float(getattr(TASK_ENV, "step_reward", lambda: 0.0)())
+
+
 def _scalar(value):
     return float(np.asarray(value))
 
 
 def _window_mean(values):
     return float(np.mean(values)) if values else 0.0
+
+
+class BestOfNRecorder:
+    """Per-episode record of what best-of-N selection is actually buying.
+
+    The policy (pi05: `PI0.get_action`, only when `best_of_n > 1`) leaves the ensemble-mean Q of
+    every candidate chunk it chose between in `model.last_best_scores`. Two numbers summarize a
+    control step's selection:
+
+    * `q_gain` -- the winner's Q minus the mean over the candidates, i.e. how much value the
+      selection added over executing an arbitrary one of them. This is the whole point of
+      best-of-N: a gain that sits near zero means the critic cannot separate the chunks the
+      sampler draws, so the extra N-fold denoising is buying nothing.
+    * `q_spread` -- max minus min, the range it was choosing over. Puts the gain in context: a
+      small gain over a wide spread is a different failure from both being small.
+
+    Values are in the critic's own output space (normalized return units for a checkpoint
+    trained offline), so they are comparable within a run but not across critics.
+
+    Consumed like `QValueRecorder.record` -- the scores are cleared as they are read, so a
+    control step that sampled nothing cannot re-log the previous step's selection.
+    """
+
+    def __init__(self):
+        self._reset()
+
+    def _reset(self):
+        self.gain = []
+        self.spread = []
+
+    def record(self, model):
+        scores = getattr(model, "last_best_scores", None)
+        if scores is None:
+            return
+        model.last_best_scores = None
+        scores = np.asarray(scores, dtype=np.float64).ravel()
+        self.gain.append(float(scores.max() - scores.mean()))
+        self.spread.append(float(scores.max() - scores.min()))
+
+    def metrics(self):
+        """This episode's averages, then start a fresh episode. Empty when nothing was logged."""
+        if not self.gain:
+            return {}
+        out = {
+            "bestofn/q_gain": _window_mean(self.gain),
+            "bestofn/q_spread": _window_mean(self.spread),
+            "bestofn/chunks": len(self.gain),
+        }
+        self._reset()
+        return out
 
 
 def log_critic_update(wandb_run, online_critic, model, info, chunk_count, episode_idx, action_count):
@@ -146,6 +255,7 @@ def log_episode(
     success_rate_ma,
     reward_ma,
     ma_window,
+    best_of_n_log=None,
 ):
     if wandb_run is None:
         return
@@ -167,6 +277,8 @@ def log_episode(
             "critic/guidance_scale": float(model.scheduled_guidance_scale()),
             "critic/guidance_scale_target": float(model.guidance_scale_target),
         })
+    if best_of_n_log is not None:
+        metrics.update(best_of_n_log.metrics())
     wandb_run.log(metrics)
 
 
@@ -188,236 +300,13 @@ def eval_function_decorator(policy_name, model_name):
         raise e
 
 
-# ===== TCP wrench debug logging =====
-# Also gated on `debug: true` in the task config. Unlike the image/point-cloud dump above,
-# this needs the live env (contacts are a scene query, not part of the observation), so the
-# recorder takes TASK_ENV and is driven from the same visualize_debug_obs call site.
-# The wrench itself is computed in `envs/utils/wrench.py`, shared with the per-step logging
-# `script/collect_dataset.py` records into the rollout dataset.
-
-WRENCH_GIF_FRAME_WIDTH = 320  # rollout frames are downscaled to this before being kept in RAM
-WRENCH_GIF_FPS = 5
-WRENCH_GIF_MAX_FRAMES = 200  # long episodes are subsampled; the traces still cover every sample
-WRENCH_AXIS_LENGTH = 0.08  # metres; length of the world frame arrows drawn on the rollout
-WRENCH_LABEL_OFFSET = 7  # points past the arrow tip, along the arrow, to place its label
-# One colour per axis, shared by the trace lines and the arrows drawn on the rollout, so the
-# x/y/z arrow and its Fx/Tx trace read as the same thing.
-WRENCH_AXIS_COLORS = ("tab:blue", "tab:orange", "tab:green")  # x, y, z
-
-
-class TCPWrenchRecorder:
-    """Per-episode TCP wrench log -> component histograms + a rollout/wrench GIF.
-
-    One sample is taken per policy call (the rate `visualize_debug_obs` is called at, i.e.
-    every `pi0_step` sim frames), paired with the head-camera frame from the same
-    observation. ``flush`` writes three files into the episode's own debug dir, alongside
-    the image/point-cloud dumps `visualize_debug_obs` puts there:
-    ``<debug_save_dir>/episode<N>/`` gets ``wrench_hist_episode<N>.png``,
-    ``wrench_episode<N>.gif`` and ``wrench_episode<N>.npz``.
-    """
-
-    def __init__(self, debug_save_dir):
-        self.debug_save_dir = Path(debug_save_dir)
-        self._reset()
-
-    def episode_dir(self, episode_idx):
-        return self.debug_save_dir / f"episode{episode_idx}"
-
-    def _reset(self):
-        self.steps = []
-        self.wrench = {arm: [] for arm in ("left", "right")}
-        self.frames = []
-        self.world_axes = []
-
-    def record(self, task_env, observation, step_idx):
-        try:
-            wrench = tcp_wrench_vector(task_env)
-        except Exception as e:
-            print(f"[debug] TCP wrench sampling failed: {e}")
-            return
-        self.steps.append(step_idx)
-        for arm, vector in wrench.items():
-            self.wrench[arm].append(vector)
-
-        rgb = observation.get("observation", {}).get("head_camera", {}).get("rgb", None)
-        if rgb is not None:
-            from PIL import Image
-
-            img = Image.fromarray(np.asarray(rgb, dtype=np.uint8))
-            scale = 1.0
-            if img.width > WRENCH_GIF_FRAME_WIDTH:  # keep the kept-in-RAM rollout small
-                scale = WRENCH_GIF_FRAME_WIDTH / img.width
-                img = img.resize((WRENCH_GIF_FRAME_WIDTH, max(1, round(img.height * scale))), Image.BILINEAR)
-            self.frames.append(np.asarray(img, dtype=np.uint8))
-            self.world_axes.append(self._project_world_axes(task_env, observation, scale))
-
-    @staticmethod
-    def _project_world_axes(task_env, observation, scale):
-        """The world axes, anchored at each TCP, as head-camera pixels at the frame's scale.
-
-        The wrench is resolved in world axes, so those are what the rollout should show; they
-        are anchored at each arm's TCP because that is the point the wrench acts on (and it
-        keeps the triad in frame, unlike the world origin). Both triads therefore point the
-        same way and only their origins differ. Returns ``{arm: (origin_uv, tips_uv(3, 2))}``,
-        skipping an arm whose TCP is behind the camera; anything merely outside the image is
-        clipped when it is drawn.
-        """
-        cam = observation.get("observation", {}).get("head_camera", {})
-        if "intrinsic_cv" not in cam or "extrinsic_cv" not in cam:
-            return {}  # camera matrices missing: draw no axes rather than guess
-        K = np.asarray(cam["intrinsic_cv"], dtype=np.float64)
-        ext = np.asarray(cam["extrinsic_cv"], dtype=np.float64)[:3]  # world -> camera (OpenCV)
-
-        out = {}
-        for arm_tag in ("left", "right"):
-            origin = np.asarray(getattr(task_env.robot, f"get_{arm_tag}_tcp_pose")(), dtype=np.float64)[:3]
-            # (4, 3): origin, then the world x/y/z unit axes stepped out from it
-            pts_world = np.vstack([origin, origin + WRENCH_AXIS_LENGTH * np.eye(3)])
-            pts_cam = pts_world @ ext[:, :3].T + ext[:, 3]
-            if np.any(pts_cam[:, 2] <= 1e-6):  # at or behind the image plane: not projectable
-                continue
-            uv = (pts_cam @ K.T)[:, :2] / pts_cam[:, 2:3] * scale
-            out[arm_tag] = (uv[0], uv[1:])
-        return out
-
-    def flush(self, episode_idx):
-        """Render this episode's outputs and start a fresh episode. No-op with no samples."""
-        if not self.steps:
-            self._reset()
-            return
-        out_dir = self.episode_dir(episode_idx)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        steps = np.asarray(self.steps)
-        series = {arm: np.asarray(vals) for arm, vals in self.wrench.items()}
-        try:
-            self._save_histograms(out_dir, episode_idx, series)
-            self._save_gif(out_dir, episode_idx, steps, series)
-            np.savez_compressed(
-                out_dir / f"wrench_episode{episode_idx}.npz",
-                step=steps,
-                components=np.array(WRENCH_COMPONENTS),
-                **{arm: vals for arm, vals in series.items()},
-            )
-            print(f"\033[93m[debug] wrench log written to {out_dir}/wrench_*\033[0m")
-        except Exception as e:
-            print(f"[debug] TCP wrench output failed: {e}")
-        self._reset()
-
-    def _save_histograms(self, out_dir, episode_idx, series):
-        """One histogram per wrench component, both arms overlaid."""
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, axes = plt.subplots(2, 3, figsize=(15, 7))
-        for i, name in enumerate(WRENCH_COMPONENTS):
-            ax = axes[i // 3, i % 3]
-            for arm, color in (("left", "tab:blue"), ("right", "tab:orange")):
-                vals = series[arm][:, i]
-                ax.hist(vals, bins=40, alpha=0.55, color=color,
-                        label=f"{arm}: {vals.mean():+.3g} ± {vals.std():.3g}")
-            ax.set_xlabel(f"{name} [{'N' if i < 3 else 'N·m'}]")
-            ax.set_ylabel("policy calls")
-            # Most of an episode is free space, i.e. an exact zero; log counts keep the
-            # contact tail readable next to that spike.
-            ax.set_yscale("log")
-            ax.legend(fontsize="small")
-        fig.suptitle(f"episode {episode_idx} — TCP wrench distribution, world frame "
-                     f"({len(series['left'])} samples)")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"wrench_hist_episode{episode_idx}.png", dpi=100)
-        plt.close(fig)
-
-    def _draw_world_axes(self, ax, frame_idx):
-        """Overlay the world frame on the rollout as labelled x/y/z arrows, one triad per TCP.
-
-        These are the axes the force and torque traces are resolved in: the Fx trace is the
-        contact force along this arrow, Tx the moment about it (taken about the TCP the triad
-        sits on).
-        """
-        import matplotlib.patheffects as pe
-
-        if frame_idx >= len(self.world_axes):
-            return
-        for arm_tag, (origin, tips) in self.world_axes[frame_idx].items():
-            for tip, label, color in zip(tips, "xyz", WRENCH_AXIS_COLORS):
-                ax.annotate("", xy=tip, xytext=origin, annotation_clip=True,
-                            arrowprops=dict(arrowstyle="-|>", color=color, linewidth=1.6,
-                                            shrinkA=0, shrinkB=0))
-                # Offset the label along its own arrow rather than a fixed direction: a world
-                # axis pointing near the camera projects short, and two such arrows can end up
-                # close together, so a fixed offset lets one arm's label drift onto its
-                # neighbour's arrow and read as swapped. (dy flips: image y grows downward,
-                # offset-point y grows upward.)
-                d = np.asarray(tip, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
-                norm = float(np.linalg.norm(d)) or 1.0
-                ax.annotate(f"{arm_tag[0]}{label}", xy=tip,
-                            xytext=WRENCH_LABEL_OFFSET * d / norm * (1, -1), textcoords="offset points",
-                            ha="center", va="center",
-                            color=color, fontsize="x-small", fontweight="bold", annotation_clip=True,
-                            path_effects=[pe.withStroke(linewidth=1.6, foreground="black")])
-
-    def _save_gif(self, out_dir, episode_idx, steps, series):
-        """Rollout on the left, the wrench traces with a step cursor on the right."""
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from PIL import Image
-
-        if not self.frames:
-            return
-        n = min(len(self.frames), len(steps))
-        # Fixed limits across frames so only the cursor moves.
-        lims = {}
-        for row, sl in (("force", slice(0, 3)), ("torque", slice(3, 6))):
-            vals = np.concatenate([series[arm][:n, sl].ravel() for arm in ("left", "right")])
-            span = max(float(np.abs(vals).max()), 1e-6) * 1.1
-            lims[row] = (-span, span)
-
-        gif_frames = []
-        for k in range(0, n, max(1, -(-n // WRENCH_GIF_MAX_FRAMES))):
-            fig = plt.figure(figsize=(12, 5.5))
-            gs = fig.add_gridspec(2, 3, width_ratios=[1.6, 1, 1])
-            ax_img = fig.add_subplot(gs[:, 0])
-            ax_img.imshow(self.frames[k])
-            ax_img.axis("off")
-            ax_img.set_title(f"rollout — step {steps[k]}")
-            self._draw_world_axes(ax_img, k)
-            for r, (row, sl) in enumerate((("force", slice(0, 3)), ("torque", slice(3, 6)))):
-                for c, arm in enumerate(("left", "right")):
-                    ax = fig.add_subplot(gs[r, c + 1])
-                    for j, comp in enumerate(WRENCH_COMPONENTS[sl]):
-                        ax.plot(steps[:n], series[arm][:n, sl][:, j], linewidth=1.0,
-                                color=WRENCH_AXIS_COLORS[j], label=comp)
-                    ax.axvline(steps[k], color="k", linewidth=1.2)
-                    ax.set_xlim(steps[0], max(steps[n - 1], steps[0] + 1))
-                    ax.set_ylim(*lims[row])
-                    if r == 0:  # units live on the y axis, so the title only names the arm
-                        ax.set_title(f"{arm} arm TCP (world frame)", fontsize="small")
-                    ax.set_xlabel("sim step", fontsize="x-small")
-                    ax.set_ylabel(f"{row} [{'N' if row == 'force' else 'N·m'}]", fontsize="x-small")
-                    ax.tick_params(labelsize="x-small")
-                    ax.legend(fontsize="xx-small", ncol=3, loc="upper right")
-            fig.tight_layout()
-            fig.canvas.draw()
-            gif_frames.append(Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3]))
-            plt.close(fig)
-
-        gif_frames[0].save(
-            out_dir / f"wrench_episode{episode_idx}.gif",
-            save_all=True,
-            append_images=gif_frames[1:],
-            duration=int(1000 / WRENCH_GIF_FPS),
-            loop=0,
-        )
-
-
 def visualize_debug_obs(observation, step_idx=0, save_dir=None, show=True, task_env=None, wrench_recorder=None):
     """Visualize per-camera images (rgb / depth / segmentation) and the point cloud.
 
     When a ``wrench_recorder`` is passed it also samples the end-effector contact wrench
-    from ``task_env`` at this step (see TCPWrenchRecorder); that part needs neither depth
-    nor point clouds, so it works under any task config that sets `debug: true`.
+    from ``task_env`` at this step (see ``envs/utils/debug_vis.py::TCPWrenchRecorder``); that
+    part needs neither depth nor point clouds, so it works under any task config that sets
+    `debug: true`.
 
     Enabled by `debug: true` in the task config. The observation layout follows
     ``_base_task.get_obs`` (see envs/_base_task.py); each entry is present only when
@@ -554,6 +443,107 @@ def snapshot_config(src_path, values, dst_dir):
         f.writelines([header] + lines)
 
 
+# ===== Incremental results, and resuming an interrupted run =====
+# An eval run is hours long and used to write nothing at all until it finished, so a crash --
+# or the renderer wedging, which it does -- discarded every episode it had already paid for.
+# Each episode now commits to the run directory in dependency order:
+#
+#   1. `_episode_results.csv`     the episode's own row, appended
+#   2. `online_value_critic.pkl`  the critic: params, target, and Adam state
+#   3. `resume_state.json`        the loop counters -- written last, and atomically
+#
+# The json is the commit marker: it only names an episode once 1 and 2 are durably on disk, so
+# an interruption anywhere in the sequence rewinds to the last episode that finished all three.
+# The csv can legitimately be one row ahead of it, which `load_resume_state` trims.
+#
+# What is *not* checkpointed is the replay buffer -- gigabytes, mostly SigLIP features (see
+# CLAUDE.md §5a) -- so a resumed critic keeps its weights and optimizer but refills its buffer
+# from empty, and runs no TD update until `start_training` transitions are back in it.
+#
+# The guidance ramp carries across the break too: `critic_ramp_baseline` records the update
+# count the ramp is measured from, and is handed back to the policy on resume. Without it the
+# resumed run reloads its own critic as an ordinary `critic_ckpt`, re-bases the ramp at that
+# checkpoint's counter, and comes back at guidance 0 to climb the whole ramp again.
+
+RESUME_STATE = "resume_state.json"
+EPISODE_CSV = "_episode_results.csv"
+CRITIC_CKPT = "online_value_critic.pkl"
+EPISODE_COLUMNS = ["episode", "seed", "num_steps", "success", "reward", "success_rate_ma", "reward_ma"]
+
+
+def append_episode_row(csv_path, row):
+    """Append one finished episode to the results csv, writing the header for the first."""
+    pd.DataFrame([row], columns=EPISODE_COLUMNS).to_csv(
+        csv_path, mode="a", header=not csv_path.exists(), index=False
+    )
+
+
+def save_critic_atomically(online_critic, path):
+    """Checkpoint the critic via a temp file, so an interrupted save cannot shred the old one.
+
+    `resume_state.json` is written after this returns and points at the result, so a torn
+    pickle here would otherwise be a checkpoint the next run is told to trust.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    online_critic.save(tmp)
+    tmp.replace(path)
+
+
+def numpy_random_state():
+    """The global numpy RNG state, as json.
+
+    Part of the seed bookkeeping and not a formality: the episode's language instruction is
+    drawn with `np.random.choice`, so a resume that skipped this would replay the recorded
+    seeds against different instructions.
+    """
+    kind, keys, pos, has_gauss, cached = np.random.get_state()
+    return {"kind": kind, "keys": keys.tolist(), "pos": int(pos),
+            "has_gauss": int(has_gauss), "cached_gaussian": float(cached)}
+
+
+def set_numpy_random_state(blob):
+    np.random.set_state((blob["kind"], np.array(blob["keys"], dtype=np.uint32),
+                         int(blob["pos"]), int(blob["has_gauss"]), float(blob["cached_gaussian"])))
+
+
+def write_resume_state(save_dir, state):
+    """Record the loop state atomically -- the last write of an episode."""
+    path = Path(save_dir) / RESUME_STATE
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    tmp.replace(path)  # rename is atomic within a filesystem: a torn write never becomes state
+
+
+def load_resume_state(save_dir):
+    """The state left by the last fully-committed episode, or None if there is nothing to resume."""
+    save_dir = Path(save_dir)
+    path = save_dir / RESUME_STATE
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as f:
+        state = json.load(f)
+
+    # The csv is written before the state, so an episode interrupted between the two leaves a
+    # row nothing accounts for. Drop it instead of double-counting it on the next append.
+    csv_path = save_dir / EPISODE_CSV
+    if csv_path.exists():
+        rows = pd.read_csv(csv_path)
+        if len(rows) > state["episodes"]:
+            print(f"[resume] dropping {len(rows) - state['episodes']} uncommitted csv row(s)")
+            rows.iloc[: state["episodes"]].to_csv(csv_path, index=False)
+    return state
+
+
+def find_resumable_run(run_root):
+    """The most recent run directory under `run_root` carrying resume state, if any."""
+    run_root = Path(run_root)
+    if not run_root.is_dir():
+        return None
+    candidates = [d for d in run_root.iterdir() if d.is_dir() and (d / RESUME_STATE).exists()]
+    return max(candidates, key=lambda d: (d / RESUME_STATE).stat().st_mtime, default=None)
+
+
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
@@ -562,6 +552,10 @@ def main(usr_args):
     # checkpoint_num = usr_args['checkpoint_num']
     policy_name = usr_args["policy_name"]
     instruction_type = usr_args["instruction_type"]
+    # Shaped per-step progress reward on/off (see control_step_reward). Resolved here, before
+    # the config snapshot and the W&B init below, so both record the boolean actually used
+    # rather than the `"false"` string a CLI override arrives as.
+    usr_args["use_step_reward"] = as_bool(usr_args.get("use_step_reward"), True)
     save_dir = None
     video_save_dir = None
     video_size = None
@@ -614,9 +608,48 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    # `resume: true` continues the newest interrupted run for this task/policy/config/checkpoint
+    # in place rather than opening a fresh timestamped directory -- the episodes, the critic and
+    # the seed sequence all live in there and only mean anything together. With no such run (or
+    # `resume: false`) this is an ordinary new run.
+    run_root = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}")
+    resume_dir = find_resumable_run(run_root) if usr_args.get("resume", False) else None
+    save_dir = resume_dir if resume_dir is not None else run_root / current_time
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)
+
+    resume_state = load_resume_state(save_dir) if resume_dir is not None else None
+    if resume_state is not None:
+        print(f"\033[93m[resume] continuing {save_dir}\033[0m")
+        print(f"\033[93m[resume] {resume_state['episodes']} episode(s) done, "
+              f"{resume_state['successes']} successful, next seed {resume_state['now_seed']}\033[0m")
+        # Point the policy at this run's own critic and ask for the optimizer back with it.
+        # Without `restore_optimizer` the critic would reload its weights but restart Adam and
+        # the LR schedule from the top of warmup (see OnlineValueCritic._adopt_pending_optimizer).
+        critic_ckpt = save_dir / CRITIC_CKPT
+        if critic_ckpt.exists():
+            # The guidance ramp is measured from the update count the run started at, and a
+            # warm start normally re-bases it at the checkpoint's counter. Here the checkpoint
+            # IS this run's own critic, so re-basing would zero the ramp and make a run that had
+            # already ramped to full guidance crawl back up from 0. Hand the original baseline
+            # back instead. (Only meaningful with the critic actually reloaded, hence in here:
+            # applying it to a critic starting at 0 updates would pin guidance at 0 instead.)
+            baseline = resume_state.get("critic_ramp_baseline")
+            if baseline is None and not usr_args.get("critic_ckpt"):
+                # State files written before 2026-08-08 have no such key. A run that trained
+                # its critic from scratch ramped from 0 updates, so that is exactly its
+                # baseline; one that warm-started from an offline critic cannot be
+                # reconstructed and keeps the old (restart-the-ramp) behavior.
+                baseline = 0
+            if baseline is not None:
+                usr_args["critic_ramp_baseline"] = int(baseline)
+            usr_args["critic_ckpt"] = str(critic_ckpt)
+            usr_args["restore_optimizer"] = True
+            print(f"\033[93m[resume] critic + optimizer from {critic_ckpt}"
+                  + (f", guidance ramp from update {baseline}" if baseline is not None
+                     else ", guidance ramp restarts (pre-2026-08-08 state file)") + "\033[0m")
+            print("\033[93m[resume] the replay buffer is not checkpointed -- it refills from "
+                  "empty before TD updates restart\033[0m")
 
     # Snapshot the deploy config (and the critic config it includes) next to the results, with
     # the CLI overrides written in, so a run's settings stay readable -- and accurate -- after
@@ -662,6 +695,11 @@ def main(usr_args):
     # the policy actually built a critic.
     args["train_freq"] = usr_args.get("train_freq", 1)
     args["wandb_ma_window"] = usr_args.get("wandb_ma_window", 20)
+    # Checkpointed after every episode, not just at the end, so a resume has a recent critic
+    # to restore. Same flag that governs the final save below.
+    args["save_critic"] = usr_args.get("save_critic", False)
+    # Off leaves the sparse terminal reward, which is what the critic is then trained on.
+    args["use_step_reward"] = usr_args["use_step_reward"]
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
@@ -672,7 +710,11 @@ def main(usr_args):
     # The policy decides whether guidance is on (pi05: guidance_scale != 0). The critic object
     # itself may not exist until the first observation (its shape depends on the embodiment),
     # so W&B keys off the policy's declared intent rather than off `model.online_critic`.
-    wandb_run = init_wandb(usr_args, save_dir, current_time) if _uses_online_critic(model) else None
+    # A resumed run rejoins its own W&B run, so the critic curves stay one continuous series
+    # across the interruption instead of restarting at update 0 in a new one.
+    wandb_run = (init_wandb(usr_args, save_dir, current_time,
+                            resume_id=(resume_state or {}).get("wandb_run_id"))
+                 if _uses_online_critic(model) else None)
 
     st_seed, suc_num, episode_results = eval_policy(task_name,
                                    TASK_ENV,
@@ -682,7 +724,8 @@ def main(usr_args):
                                    test_num=test_num,
                                    video_size=video_size,
                                    instruction_type=instruction_type,
-                                   wandb_run=wandb_run)
+                                   wandb_run=wandb_run,
+                                   resume_state=resume_state)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -694,10 +737,9 @@ def main(usr_args):
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
-    episode_file_path = save_dir / "_episode_results.csv"
-    # write num_steps and success to csv file
-    episode_results_df = pd.DataFrame(episode_results)
-    episode_results_df.to_csv(episode_file_path)
+    # `_episode_results.csv` needs nothing here: the rollout appended each episode's row as it
+    # finished, which is what makes an interrupted run salvageable.
+    episode_file_path = save_dir / EPISODE_CSV
 
     # Persist the online-trained critic alongside the eval results. A frozen one has nothing to
     # persist -- it is a byte-for-byte copy of `critic_ckpt`, which the snapshotted config
@@ -705,7 +747,7 @@ def main(usr_args):
     online_critic = getattr(model, "online_critic", None)
     if online_critic is not None and usr_args.get("save_critic", False):
         if _trains_online_critic(model):
-            critic_path = save_dir / "online_value_critic.pkl"
+            critic_path = save_dir / CRITIC_CKPT
             online_critic.save(critic_path)
             print(f"saved online critic to {critic_path}")
         else:
@@ -726,7 +768,8 @@ def eval_policy(task_name,
                 test_num=100,
                 video_size=None,
                 instruction_type=None,
-                wandb_run=None):
+                wandb_run=None,
+                resume_state=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -738,7 +781,7 @@ def eval_policy(task_name,
     succ_seed = 0
     suc_test_seed_list = []
 
-    episode_results = {"num_steps": [], "success": [], "reward": [], "success_rate_ma": [], "reward_ma": []}
+    episode_results = {col: [] for col in EPISODE_COLUMNS}
 
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
@@ -768,24 +811,76 @@ def eval_policy(task_name,
     # construction-time property of the policy, not something built on the first observation.
     train_critic = _trains_online_critic(model)
     train_freq = int(args.get("train_freq", 1))
+    # The reward every consumer below sees -- the critic's `commit()`, the Q recorder and the
+    # per-episode totals in the csv. With the shaping off it is sparse: 1.0 on success, 0.0
+    # everywhere else, regardless of whether the task defines a `step_reward`.
+    use_step_reward = bool(args.get("use_step_reward", True))
     ma_window = max(1, int(args.get("wandb_ma_window", 20)))
     success_window = deque(maxlen=ma_window)
     reward_window = deque(maxlen=ma_window)
     chunk_count = 0
     last_info = None
+    print(f"\033[95mStep reward (shaped progress):\033[0m "
+          + ("ON" if use_step_reward else "OFF (sparse success reward only)"))
 
     # Debug visualization of depth maps / point clouds (see visualize_debug_obs).
     debug = args.get("debug", False)
     debug_show = bool(os.environ.get("DISPLAY"))  # only pop up windows when a display exists
     save_dir = Path(args.get("eval_save_dir", "eval_result"))
     debug_save_dir = save_dir / "debug_vis" if debug else None
-    # Both share `debug_vis/episode<N>/`: the recorder appends the episode dir itself, since it
-    # only learns the episode index at flush time.
-    wrench_recorder = TCPWrenchRecorder(debug_save_dir) if debug else None
+    # All of these share `debug_vis/episode<N>/`: each recorder appends the episode dir itself,
+    # since it only learns the episode index at flush time. The frame log holds the head-camera
+    # frames both GIFs are drawn on, so the rollout is downscaled and kept once.
+    frame_log = RolloutFrameLog() if debug else None
+    wrench_recorder = TCPWrenchRecorder(debug_save_dir, frame_log) if debug else None
+    # The Q recorder needs a critic to read a value off; without guidance there is none, and
+    # the policy's own per-step scoring stays off (it is an extra critic forward per chunk).
+    q_recorder = QValueRecorder(debug_save_dir, frame_log) if debug and _uses_online_critic(model) else None
+    if q_recorder is not None:
+        model.record_q_values = True
+    # Best-of-N selection diagnostics. Unlike the Q recorder this costs nothing (the scores are
+    # a by-product of the selection the sampler already made) and needs no `debug`, so it is on
+    # whenever the policy is actually choosing between candidates.
+    best_of_n = int(getattr(model, "best_of_n", 1) or 1)
+    best_of_n_recorder = BestOfNRecorder() if best_of_n > 1 else None
+    if best_of_n_recorder is not None:
+        print(f"\033[96m[critic]\033[0m best-of-{best_of_n} sampling ON: {best_of_n} candidate "
+              f"chunks per control step, highest ensemble-mean Q executed")
     if debug:
         print(f"\033[93m[debug] depth/point-cloud visualization ON "
               f"(interactive={debug_show}, saving to {debug_save_dir})\033[0m")
         print(f"\033[93m[debug] TCP wrench logging ON (saving to {debug_save_dir}/episode<N>/)\033[0m")
+        print(f"\033[93m[debug] critic Q logging "
+              + (f"ON (saving to {debug_save_dir}/episode<N>/)" if q_recorder is not None
+                 else "OFF (no critic: guidance_scale is 0 and best_of_n is 1)") + "\033[0m")
+
+    # Where each finished episode is committed (see the notes above `append_episode_row`).
+    csv_path = save_dir / EPISODE_CSV
+    critic_path = save_dir / CRITIC_CKPT
+    save_critic = bool(args.get("save_critic", True))
+
+    if resume_state is not None:
+        # Pick the loop back up exactly where it stopped. `now_seed` is the load-bearing one:
+        # the seed sequence is not a function of the episode index, since the expert check
+        # rejects an unpredictable subset, so it cannot be recomputed -- only restored.
+        now_id = resume_state["now_id"]
+        now_seed = resume_state["now_seed"]
+        succ_seed = resume_state["episodes"]
+        suc_test_seed_list = list(resume_state["suc_test_seed_list"])
+        TASK_ENV.suc = resume_state["successes"]
+        TASK_ENV.test_num = resume_state["test_num"]
+        chunk_count = resume_state["chunk_count"]
+        set_numpy_random_state(resume_state["numpy_random_state"])
+
+        # The csv is the record of the episodes themselves; reload it so the moving averages
+        # continue over the interruption rather than restarting from an empty window.
+        past = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame(columns=EPISODE_COLUMNS)
+        for col in EPISODE_COLUMNS:
+            episode_results[col] = past[col].tolist()
+        success_window.extend(float(v) for v in episode_results["success"][-ma_window:])
+        reward_window.extend(float(v) for v in episode_results["reward"][-ma_window:])
+        print(f"\033[93m[resume] {len(past)} episode(s) reloaded, resuming at seed {now_seed} "
+              f"({succ_seed}/{test_num} done)\033[0m")
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -868,6 +963,9 @@ def eval_policy(task_name,
         prev_success = False
         episode_reward = 0.0
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
+            # The step this observation was taken at, held because `take_action_cnt` advances
+            # during the chunk -- the Q recorder logs against the observation's own index.
+            step = TASK_ENV.take_action_cnt
             observation = TASK_ENV.get_obs()
             if debug:
                 visualize_debug_obs(
@@ -883,8 +981,16 @@ def eval_policy(task_name,
                 )
             eval_func(TASK_ENV, model, observation)
             success_now = bool(TASK_ENV.eval_success)
-            reward = 1.0 if (success_now and not prev_success) else getattr(TASK_ENV, "step_reward", lambda: 0.0)()
+            reward = control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward)
             episode_reward += reward
+
+            # The chunk's Q only exists once the policy has sampled it, so unlike the wrench
+            # this is logged after the control step -- but against `step`, the count the
+            # observation it was drawn from was taken at, so it lines up with that frame.
+            if q_recorder is not None:
+                q_recorder.record(model, observation, step, reward)
+            if best_of_n_recorder is not None:
+                best_of_n_recorder.record(model)
 
             # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped
             # for a frozen critic -- it guides, but its parameters and buffer stay untouched.
@@ -911,7 +1017,11 @@ def eval_policy(task_name,
             if success_now:
                 succ = True
                 break
-        episode_results["num_steps"].append(TASK_ENV.take_action_cnt)
+        episode_steps = TASK_ENV.take_action_cnt
+        episode_seed = now_seed
+        episode_results["episode"].append(TASK_ENV.test_num)
+        episode_results["seed"].append(episode_seed)
+        episode_results["num_steps"].append(episode_steps)
         episode_results["success"].append(succ)
         episode_results["reward"].append(episode_reward)
         # task_total_reward += TASK_ENV.episode_score
@@ -919,6 +1029,10 @@ def eval_policy(task_name,
             TASK_ENV._del_eval_video_ffmpeg()
         if wrench_recorder is not None:
             wrench_recorder.flush(TASK_ENV.test_num)
+        if q_recorder is not None:
+            q_recorder.flush(TASK_ENV.test_num)
+        if frame_log is not None:
+            frame_log.flush()  # last: both GIFs above are drawn from it
 
         if succ:
             TASK_ENV.suc += 1
@@ -973,6 +1087,7 @@ def eval_policy(task_name,
             success_rate_ma,
             reward_ma,
             ma_window,
+            best_of_n_log=best_of_n_recorder,
         )
 
         print(
@@ -983,6 +1098,39 @@ def eval_policy(task_name,
         )
         # TASK_ENV._take_picture()
         now_seed += 1
+
+        # Commit the episode. Strict order: the row, then the critic, then the state that
+        # asserts both are on disk (see the notes above `append_episode_row`). Everything
+        # recorded here is state the next run cannot recompute -- above all `now_seed`, which
+        # depends on which seeds the expert check happened to reject.
+        append_episode_row(csv_path, {
+            "episode": TASK_ENV.test_num,
+            "seed": episode_seed,
+            "num_steps": episode_steps,
+            "success": succ,
+            "reward": episode_reward,
+            "success_rate_ma": success_rate_ma,
+            "reward_ma": reward_ma,
+        })
+        if save_critic and online_critic is not None and train_critic:
+            save_critic_atomically(online_critic, critic_path)
+        write_resume_state(save_dir, {
+            "episodes": succ_seed,
+            "successes": TASK_ENV.suc,
+            "test_num": TASK_ENV.test_num,
+            "now_id": now_id,
+            "now_seed": now_seed,
+            "chunk_count": chunk_count,
+            "suc_test_seed_list": suc_test_seed_list,
+            "numpy_random_state": numpy_random_state(),
+            "critic_updates": int(online_critic.num_updates) if online_critic is not None else 0,
+            # The update count this run's guidance ramp is measured from -- 0 for a critic
+            # trained from scratch here, the checkpoint's lifetime count for one warm-started
+            # from `critic_ckpt`. Restored on resume so the ramp continues rather than
+            # restarting against the run's own checkpoint (see the resume block in `main`).
+            "critic_ramp_baseline": int(getattr(model, "critic_ramp_baseline", 0)),
+            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+        })
 
     return now_seed, TASK_ENV.suc, episode_results
 

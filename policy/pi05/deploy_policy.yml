@@ -1,3 +1,4 @@
+# Snapshot of /home/natasha/RoboTwin/policy/pi05/deploy_policy.yml as used by this eval run.
 # Basic experiment configuration (keep unchanged)
 policy_name: null
 task_name: null
@@ -13,18 +14,38 @@ checkpoint_id: 15000
 pi0_step: 10
 
 # Number of successful eval episodes to run.
-test_num: 50
+test_num: 100
 
-# ===== Online QMFM Value-critic gradient guidance =====
-# `guidance_scale` is QMFM's steering_coeff AND the on/off switch for the whole online path:
-#   0.0     -> plain pi0.5 sampling (baseline): no critic is built, no replay collection,
-#              no TD updates, no W&B logging.
+# ===== Crash recovery =====
+# Every finished episode is committed to the run directory as it completes: its row is appended
+# to _episode_results.csv, the online critic (params AND Adam state) is checkpointed, and
+# resume_state.json records the loop counters -- so an interrupted run keeps the episodes it
+# already paid for.
+#
+# `resume: true` then continues the newest interrupted run for this task/policy/config/ckpt in
+# its existing directory instead of opening a new timestamped one: the seed sequence carries on
+# where it stopped (it cannot be recomputed -- which seeds the expert check rejected is not a
+# function of the episode index), the critic reloads with its optimizer and LR schedule intact,
+# the guidance ramp picks up where it stopped rather than restarting at 0, and the W&B run is
+# rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP
+# features), so a resumed critic refills it from empty before TD updates restart.
+# `false` always starts a fresh run and leaves any interrupted one untouched.
+resume: false
+
+# ===== Online QMFM Value critic =====
+# `guidance_scale` is QMFM's steering_coeff. It and `best_of_n` (below) are the two ways the
+# critic can act on sampling, and the online path is on when EITHER is set -- only
+# `guidance_scale: 0` together with `best_of_n: 1` is the plain pi0.5 baseline, with no critic
+# built, no replay collection, no TD updates and no W&B logging.
+#   0.0     -> the sampler is not steered (but see `best_of_n`).
 #   nonzero -> an ensemble `Value` critic (multisensory_steering) is trained ONLINE by TD
 #              during the eval rollouts and steers the frozen pi0.5 flow sampler via QMFM
 #              denoised-estimate gradient guidance (see `Pi0.sample_actions`).
 # Guidance starts at 0 and ramps linearly to `guidance_scale` over `guidance_ramp_updates` TD
 # updates *of this run* (0 = jump to the target after the first update). A critic warm-started
-# from `critic_ckpt` ramps in the same way -- its restored update counter does not count.
+# from `critic_ckpt` ramps in the same way -- its restored update counter does not count. A
+# *resumed* run is the same run, though, so it carries on from the ramp position it stopped at
+# (`critic_ramp_baseline` in resume_state.json) instead of climbing the ramp a second time.
 # Both are overridable as eval.sh's 7th / 8th positional args.
 #
 # Whether that critic also *learns* here is `train_online` in the `critic_config_path` file
@@ -34,13 +55,36 @@ test_num: 50
 # no TD update runs, so guidance sits at `guidance_scale` from the first chunk (there are no
 # updates to ramp against) and `guidance_ramp_updates` is ignored. Overridable as eval.sh's 9th
 # positional arg, or by setting `train_online` here -- this file wins over the included one.
-guidance_scale: 0.1
-guidance_ramp_updates: 256
+#
+# `best_of_n` is the second way the critic can act on sampling, independent of the gradient
+# guidance:
+#   1       -> off; the sampler returns the one chunk it drew.
+#   n > 1   -> n candidate chunks are drawn from independent noise in a single sampler call and
+#              the one with the highest ensemble-mean Q is executed. That is the chunk the
+#              replay buffer stores and the Q log records, so everything downstream is about
+#              the action that actually ran.
+# It needs the same critic, so `best_of_n > 1` builds (and by default TD-trains) one even at
+# `guidance_scale: 0` -- that combination is best-of-N over the *unmodified* pi0.5 sampler,
+# which is cheaper per candidate than steering. With both on, every candidate is steered and
+# the best steered chunk wins; the ramp applies to the guidance half exactly as below.
+# Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
+# denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
+best_of_n: 1
+guidance_scale: 0.2
+guidance_ramp_updates: 500
+# The reward the run scores itself with -- what `commit()` feeds the online critic, what the
+# W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
+#   true  -> 1.0 on the step that first reaches success, plus the task's own shaped progress
+#            term (`step_reward()`, a delta; tasks that define none contribute 0.0).
+#   false -> sparse: 1.0 on success, 0.0 everywhere else, even for a task that defines shaping.
+# Unlike the keys above this also applies to the unguided baseline. eval.sh's 10th positional
+# arg overrides it.
+use_step_reward: false
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
-critic_ckpt: /home/natasha/multisensory-steering/checkpoints/put_object_cabinet_modality_ablation_stratified/siglip_wrench/best.pkl
+critic_ckpt: /home/natasha/multisensory-steering/checkpoints/critic_offline/best.pkl
 
-# Everything below only takes effect when guidance_scale != 0.
+# Everything below only takes effect when a critic is running, i.e. guidance_scale != 0 or
+# best_of_n > 1.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
 # (or overridden on the eval.sh command line) wins over it.
 critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm.yaml
-
