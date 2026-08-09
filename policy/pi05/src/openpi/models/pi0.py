@@ -255,7 +255,8 @@ class Pi0(_model.BaseModel):
         critic_apply=None,
         critic_params=None,
         critic_obs_extra: dict[str, jax.Array] | None = None,
-        guidance_scale: float | at.Float[at.Array, ""] = 0.0,
+        guidance_scale: float | at.Float[at.Array, ""] | None = 0.0,
+        best_of_n: int = 1,
         return_critic_obs: bool = False,
         critic_action_dim: int | None = None,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
@@ -282,6 +283,21 @@ class Pi0(_model.BaseModel):
         itself a ``{modality: patch map}`` dict, one entry per camera view. This path takes
         precedence over ``return_features``.
 
+        ``best_of_n > 1`` draws that many candidate chunks from independent noise and returns
+        the one the critic scores highest (``mean_k Q``, the same aggregation the guidance
+        ascends), one winner per batch element. It is orthogonal to the guidance: with a
+        ``guidance_scale`` each candidate is steered independently and the best of the steered
+        chunks is kept, so the two compose. It needs a critic for the ranking, so it requires
+        ``critic_apply``/``critic_params`` even when nothing is being steered -- pass
+        ``guidance_scale=None`` for that (best-of-N only), which skips the value gradient
+        entirely rather than multiplying it by a constant zero. The aux dict then also carries
+        ``"critic_best_scores"`` ``(b, n)`` and ``"critic_best_index"`` ``(b,)``.
+
+        The N candidates ride along as extra batch elements, replicated *after* the prefix pass,
+        so the SigLIP tower and the prefix forward are still paid exactly once per control step
+        and only the KV cache and the denoising loop scale with N. ``best_of_n`` is static:
+        changing it recompiles.
+
         ``obs`` is a ``{modality: array}`` dict. This model produces the state and one SigLIP
         map per camera view itself -- ``"state"``, ``"siglip.head"``, ``"siglip.left_wrist"``,
         ``"siglip.right_wrist"`` (see ``critic_observation``) -- and anything else the critic
@@ -305,8 +321,38 @@ class Pi0(_model.BaseModel):
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+
+        has_critic = critic_apply is not None and critic_params is not None
+        # Gradient guidance is on unless it is explicitly switched off with `guidance_scale=None`
+        # -- a *traced* 0.0 still steers (that is what the online ramp's first chunks are), so
+        # the two cases cannot be told apart by value. None is how a best-of-N-only run says
+        # "rank with the critic, but do not differentiate through it".
+        steer = has_critic and guidance_scale is not None
+        # Best-of-N candidates, sampled as extra batch elements.
+        n = 1 if best_of_n is None else max(1, int(best_of_n))
+        if n > 1 and not has_critic:
+            raise ValueError(
+                f"best_of_n={n} needs a critic to rank the candidates with, but no "
+                f"critic_apply/critic_params were given."
+            )
+        sample_batch = batch_size * n
+
+        def tile(tree):
+            """Replicate each batch element n times, contiguously: [a a a b b b] for n=3.
+
+            That is the layout `reshape(batch_size, n, ...)` undoes, which is how the candidates
+            are grouped back per batch element for the argmax below.
+            """
+            return tree if n == 1 else jax.tree.map(lambda x: jnp.repeat(x, n, axis=0), tree)
+
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(rng, (sample_batch, self.action_horizon, self.action_dim))
+        elif noise.shape[0] != sample_batch:
+            raise ValueError(
+                f"noise has batch {noise.shape[0]}, expected {sample_batch} "
+                f"(batch {batch_size} x best_of_n {n}). Best-of-N needs independent noise per "
+                f"candidate -- replicating one seed would draw the same chunk n times."
+            )
 
         # first fill KV cache with a forward pass of the prefix. The image tower runs here (once
         # per camera view) and its raw patch features are what the critic sees, so they are taken
@@ -317,10 +363,23 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        # Best-of-N replicates the *conditioning*, not the work that produced it: the tower and
+        # the prefix pass above ran once at batch `batch_size`, and only the cache they filled is
+        # widened so the N candidates can attend to it. `KVCache` is stacked over layers by the
+        # scan in gemma.Module, so its batch axis is 1, not 0 (`l b t k h`).
+        if n > 1:
+            kv_cache = jax.tree.map(lambda x: jnp.repeat(x, n, axis=1), kv_cache)
+            prefix_mask = tile(prefix_mask)
+        # The observation the *suffix* is embedded against. Tiled as a whole rather than field by
+        # field so it stays a well-formed Observation (its batch dims are typechecked); the
+        # images in it are unused from here on and get dropped by DCE. `observation` itself stays
+        # at the original batch, which is the one `critic_observation` and the aux dict want.
+        suffix_obs = tile(observation)
+
         def action_expert_features(x_t, time):
             """Run one denoising forward pass and return the action-expert features (pre-projection)."""
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                suffix_obs, x_t, jnp.broadcast_to(time, sample_batch)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -332,7 +391,7 @@ class Pi0(_model.BaseModel):
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
-                batch_size,
+                sample_batch,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
@@ -402,10 +461,58 @@ class Pi0(_model.BaseModel):
                 "critic_action": critic_action_view(x_0),
             }
 
-        if critic_apply is not None and critic_params is not None:
+        def denoise(step_fn):
+            """Integrate `step_fn` from t=1 (noise) down to t=0, returning the clean chunk."""
+
+            def cond(carry):
+                _, time = carry
+                # robust to floating-point error
+                return time >= -dt / 2
+
+            x_0, _ = jax.lax.while_loop(cond, step_fn, (noise, 1.0))
+            return x_0
+
+        if has_critic:
+            # `critic_obs` is at the caller's batch (it is what the aux dict reports and what the
+            # replay buffer stores); `critic_obs_n` is the same observation replicated once per
+            # best-of-N candidate, which is what the sampler scores against.
+            critic_obs = critic_observation()
+            critic_obs_n = tile(critic_obs)
+
+            def score(x_0):
+                """mean_k Q for every candidate chunk -- `(sample_batch,)`."""
+                chunk = critic_action_view(x_0).reshape(x_0.shape[0], -1)
+                return critic_apply(critic_params, critic_obs_n, chunk).mean(axis=0)
+
+            def pick_best(x_0):
+                """Best-of-N: keep the highest-scoring candidate per batch element.
+
+                Ranked by the same `mean_k Q` the guidance ascends, so with both switched on the
+                selection agrees with what the steering was trying to do rather than pulling
+                against it. Scored once, after denoising -- the guided path's own gradients are
+                taken at the intermediate x_t, not at the chunk it lands on.
+                """
+                scores = score(x_0).reshape(batch_size, n)
+                idx = jnp.argmax(scores, axis=-1)
+                candidates = x_0.reshape(batch_size, n, *x_0.shape[1:])
+                best = jnp.take_along_axis(candidates, idx[:, None, None, None], axis=1)[:, 0]
+                return best, {"critic_best_scores": scores, "critic_best_index": idx}
+
+            def finish(x_0):
+                """Pick the winner (best-of-N only) and build the aux dict the caller gets."""
+                if n == 1:
+                    return x_0, critic_aux(critic_obs, x_0)
+                best, picked = pick_best(x_0)
+                return best, {**critic_aux(critic_obs, best), **picked}
+
+        def step(carry):
+            x_t, time = carry
+            v_t = self.action_out_proj(action_expert_features(x_t, time))
+            return x_t + dt * v_t, time + dt
+
+        if steer:
             # QMFM-exact denoised-estimate gradient guidance
             # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
-            critic_obs = critic_observation()
 
             def guided_step(carry):
                 x_t, time = carry
@@ -422,7 +529,7 @@ class Pi0(_model.BaseModel):
                     # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
                     # Only the embodiment dims are scored, so the padded tail gets zero gradient.
                     chunk = critic_action_view(x1_estimate(a))
-                    qs = critic_apply(critic_params, critic_obs, chunk.reshape(a.shape[0], -1))
+                    qs = critic_apply(critic_params, critic_obs_n, chunk.reshape(a.shape[0], -1))
                     return qs.mean(axis=0).sum()
 
                 grad = jax.grad(value_fn)(x_t).astype(v_t.dtype)
@@ -440,27 +547,17 @@ class Pi0(_model.BaseModel):
                 # (uphill on the critic). `guidance_scale` is QMFM's steering_coeff (>0 ascends Q).
                 return x_t + dt * (v_t - guidance_scale * grad), time + dt
 
-            def guided_cond(carry):
-                _, time = carry
-                # robust to floating-point error
-                return time >= -dt / 2
+            return finish(denoise(guided_step))
 
-            x_0, _ = jax.lax.while_loop(guided_cond, guided_step, (noise, 1.0))
-            return x_0, critic_aux(critic_obs, x_0)
+        if has_critic:
+            # Best-of-N with no steering: plain pi0.5 denoising for every candidate, and the
+            # critic is only read to rank the chunks it produced. Cheaper per candidate than the
+            # guided path, which pays two extra forward passes per denoising step for the value
+            # gradient.
+            return finish(denoise(step))
 
         if not return_features:
-
-            def step(carry):
-                x_t, time = carry
-                v_t = self.action_out_proj(action_expert_features(x_t, time))
-                return x_t + dt * v_t, time + dt
-
-            def cond(carry):
-                x_t, time = carry
-                # robust to floating-point error
-                return time >= -dt / 2
-
-            x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            x_0 = denoise(step)
             if not return_critic_obs:
                 return x_0
             # Unguided sampling, but emit the critic's view of this step so rollout collection

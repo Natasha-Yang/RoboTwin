@@ -474,11 +474,17 @@ Or directly on an `salloc`'d GPU node:
 ```bash
 cd policy/pi05
 bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
-             [guidance_scale] [guidance_ramp_updates] [train_online]
+             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n]
 # baseline (no critic guidance)
-bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 0
-# critic-guided (see §6.2 — needs QMFM + a critic checkpoint staged first)
-bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 0 0.3 256
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
+# online critic-guided
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256
+# ... with the shaped step reward off (sparse success reward only)
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256 "" false
+# best-of-8 selection with no gradient guidance
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0 "" "" "" 8
+# both: every candidate steered, the best steered chunk executed
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256 "" "" 8
 ```
 
 - `eval.sh` activates `policy/pi05/.venv` and calls `script/eval_policy.py` with
@@ -489,6 +495,84 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora_clean_50x25 run0 
   steps are executed per call, default 10) come from `deploy_policy.yml`.
 - Camera → model mapping (in `deploy_policy.py::encode_obs` / `pi_model.py`):
   `head_camera → cam_high`, `left_camera → cam_left_wrist`, `right_camera → cam_right_wrist`.
+- Results land in `eval_result/<task_name>/<policy_name>/<task_config>/<ckpt_setting>/<timestamp>/`.
+  Alongside `_result.txt` / `_episode_results.csv`, each run snapshots `deploy_policy.yml` and the
+  `critic_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
+  The copies keep their comments but carry the values **actually used** — `eval.sh`'s positional
+  args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
+  as the `null`/default in the source yml.
+- `use_step_reward` (`deploy_policy.yml`, or `eval.sh`'s 10th arg) picks **which reward the run
+  scores itself with** — what `online_critic.commit()` is fed, what the W&B reward curves and the
+  `reward` column of `_episode_results.csv` measure. `true` (default) is 1.0 on the control step
+  that first reaches success plus the task's own shaped progress term (`step_reward()`, a delta —
+  `envs/lift_pot.py`, `envs/open_microwave.py`, `envs/put_object_cabinet.py`); `false` is sparse:
+  1.0 on success and 0.0 everywhere else, even for a task that defines shaping (`step_reward()`
+  is then never called at all, so its own delta state never advances). Unlike the guidance knobs
+  this applies to the plain baseline too. `script/eval_policy.py::control_step_reward` is the one
+  place it acts, so a guided run's TD targets and the printout agree by construction; the
+  equivalent for a collected dataset's `reward` column is §6a, which is always shaped.
+
+#### Crash recovery
+
+An eval run is hours long and can end early two ways: it can crash, and it can wedge.
+
+> **The wedge, for reference.** The renderer hangs: `SapienRenderCameraInternal::waitForRender`
+> → `libnvidia-eglcore` → `poll()`, a render fence that never signals, with the GPU completely
+> idle and every thread asleep. It surfaces as a run that neither progresses nor dies. Diagnose
+> with `sudo py-spy dump --pid <pid> --native` (needs root: `ptrace_scope=1`). `_base_task.py`
+> uses the `rt` shader with the **`optix`** denoiser (`script/test_render.py` uses `oidn` for
+> the same block), which is the first thing to vary if it recurs. Nothing detects this
+> automatically — a hung run has to be noticed and killed by hand.
+
+Either way the episodes already finished are safe. Every one is committed to the run dir in
+strict order — its row
+appended to `_episode_results.csv`, the critic checkpointed, then `resume_state.json` written
+atomically. The json is the commit marker, so an interruption rewinds to the last episode that
+completed all three; a csv row one ahead of it is trimmed on resume.
+
+`resume: true` (`deploy_policy.yml`) then continues the newest interrupted run for this
+task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one:
+
+| Restored | From | Why it cannot be recomputed |
+|---|---|---|
+| `now_seed`, `now_id`, `suc_test_seed_list` | `resume_state.json` | which seeds the expert check rejected is not a function of the episode index |
+| global numpy RNG state | `resume_state.json` | the episode's instruction is drawn with `np.random.choice` |
+| `test_num`, `suc`, `chunk_count` | `resume_state.json` | counters the guidance ramp and MA windows key off |
+| episode rows + MA windows | `_episode_results.csv` | reloaded so the averages continue across the break |
+| critic params, target, **Adam state, LR schedule position** | `online_value_critic.pkl` | see below |
+| guidance ramp position | `critic_ramp_baseline` in `resume_state.json` | see below |
+| W&B run | `wandb_run_id` → `resume="allow"` | keeps the critic curves one continuous series |
+
+The optimizer half needed a change in `multisensory_steering`: `OnlineValueCritic.save` now
+records `opt_state` and `lr_step`, and restores them when `restore_optimizer` is set — which
+`eval_policy.py` sets only on a resume. A plain warm start from `critic_ckpt` still gets a fresh
+optimizer, which is the right default for pointing an offline critic at a new task but was
+silently wrong for resuming: the run came back at the *bottom of warmup* (lr 0) and climbed the
+schedule again. The state is checked against the optimizer actually built (`clip_grad` and
+`freeze_encoder` change its tree) and dropped with a message rather than crashing if it no
+longer fits; checkpoints written before this load exactly as they did.
+
+The **guidance ramp** had the same shape of bug one level up. A resume points `critic_ckpt` at
+the run's own `online_value_critic.pkl`, and `PI0._init_critic` re-bases the ramp at whatever
+update count a checkpoint restores (§5a — deliberate for an offline critic, so a warm start eases
+in like a fresh one). Applied to a run's own checkpoint that means the ramp restarts: a run that
+had reached full `guidance_scale` comes back at **0** and climbs the whole
+`guidance_ramp_updates` again. So `resume_state.json` now carries `critic_ramp_baseline` — the
+count *that* run's ramp was measured from (0 when its critic was trained from scratch here) — and
+`eval_policy.py` hands it back through `deploy_policy.py` as `PI0(critic_ramp_baseline=...)`,
+which uses it instead of re-deriving one. The startup banner prints where the ramp resumes. It is
+not a user-facing config key: nothing but the resume path sets it, and it is applied only when
+the critic checkpoint is actually reloaded (against a critic starting at 0 updates it would pin
+guidance at 0 instead). State files written before 2026-08-08 have no such key: a run whose
+critic trained from scratch is reconstructed exactly (its baseline was 0), one that warm-started
+from an offline `critic_ckpt` cannot be, and keeps the old restart-the-ramp behavior with a
+printed note.
+
+**Not** restored: the replay buffer (gigabytes of SigLIP features, §5a), so a resumed critic
+keeps its weights and optimizer but refills the buffer from empty and runs no TD update until
+`start_training` transitions are back in it.
+
+`_episode_results.csv` gained explicit `episode` and `seed` columns and lost its unnamed index.
 
 Setting `debug: true` in the **task config** turns on extra per-episode diagnostics
 (`script/eval_policy.py::visualize_debug_obs`), all written into `debug_vis/episode<N>/`
@@ -499,9 +583,18 @@ under that same result dir:
 | TCP wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), left and right arm overlaid |
 | Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); the wrench traces with a step cursor on the right |
 | Raw series | `wrench_episode<N>.npz` | `step`, `left`, `right` — `(num_samples, 6)` each |
+| Critic Q trace | `q_episode<N>.png` | guided runs only (see below) |
+| Rollout + Q GIF | `q_episode<N>.gif` | head camera on the left, the Q and reward traces with a step cursor on the right |
+| Raw series | `q_episode<N>.npz` | `step`, `q` `(num_samples, num_qs)`, `reward`, `guidance_scale`, `return_to_go`, plus the scalars `return_mean` / `return_std` / `gamma_h` |
 | Depth / segmentation tiles, point clouds | `obs_step<S>.png` / `pcd_step<S>.ply` | only for the modalities the task config's `data_type` enables |
 
-The wrench is computed by `envs/utils/wrench.py` (shared with the rollout-dataset collector, §7a).
+Both GIFs animate the same rollout, so `envs/utils/debug_vis.py::RolloutFrameLog` downscales
+and holds the head-camera frames once for all of them, keyed by sim step. That module holds
+both recorders (`TCPWrenchRecorder`, `QValueRecorder`) and the plotting/GIF plumbing they
+share; `eval_policy.py` keeps `visualize_debug_obs` and the code that constructs, feeds and
+flushes them.
+
+The wrench is computed by `envs/utils/wrench.py` (shared with the rollout-dataset collector, §6a).
 It is the **net contact wrench on the end-effector links** (wrist link + gripper
 fingers + any `fix_gripper_name` links), summed from `scene.get_contacts()` impulses divided
 by the sim timestep, with torque taken about the TCP origin. Both vectors are resolved in the
@@ -531,21 +624,74 @@ rollout dataset, for when you want the distribution over a whole run rather than
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
+The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
+`guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
+writes none. Each row
+is one control step: `pi_model.py::PI0.get_action` scores the chunk it is about to execute with
+the critic that produced it — the same normalized `(50, 14)` chunk the guidance climbed and/or
+best-of-N selected, against the same observation, via `OnlineValueCritic.q_values` — and
+`debug_vis.py::QValueRecorder` pairs
+it with the reward that chunk earned and the guidance scale in force at the time. Unlike the
+wrench it is recorded *after* the control step (the value does not exist until the chunk has
+been drawn), against the step index of the observation it was drawn from, so it lines up with
+the same frame. The extra critic forward per chunk is why `PI0.record_q_values` is off unless
+the driver turns it on.
 
-There is **one** eval script and **one** config. `guidance_scale` in `deploy_policy.yml`
-(overridable as `eval.sh`'s 7th positional arg) decides whether a critic steers the frozen
-pi0.5 flow sampler in `Pi0.sample_actions`:
+Both plots draw the **realized discounted return-to-go** (at the critic's own `discount **
+horizon`) against Q, in return units — Q is un-normalized by the checkpoint's
+`return_mean`/`return_std` first, which is the identity for a critic trained online from
+scratch. Q tracking that curve is a calibrated critic; a flat Q means it is not distinguishing
+the states it is steering through, a persistent gap means it over- or under-values them, and an
+ensemble range that stays wide means the members disagree about states the guidance follows
+anyway. The `.npz` keeps `q` **raw** (as the guidance sees it) plus the constants to convert.
 
-| `guidance_scale` | Behavior |
-|---|---|
-| `0.0` (default on this branch) | plain pi0.5 baseline — no critic is built, no replay collection, no TD updates, no W&B |
-| nonzero | an ensemble QMFM `Value` critic steers the sampler; by default it is also trained **online** by TD during the rollouts, and guidance ramps `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+### 5a. Critic-conditioned sampling (`guidance_scale` and `best_of_n`)
+
+There is **one** eval script and **one** config. Two independent keys in `deploy_policy.yml`
+decide whether a critic acts on `Pi0.sample_actions`, and **either one** on its own builds the
+critic (and, by default, TD-trains it online):
+
+| Key | Off | On |
+|---|---|---|
+| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+| `best_of_n` (11th arg) | `1` | `n` candidate chunks are drawn per control step and the highest-Q one is executed |
+
+Both off is the plain pi0.5 baseline — no critic is built, no replay collection, no TD updates,
+no W&B.
+
+#### Best-of-N selection
+
+`best_of_n: n` draws `n` chunks from independent noise in a **single** `sample_actions` call and
+executes the one with the highest ensemble-mean Q — the same aggregation the guidance ascends, so
+with both switched on the selection agrees with what the steering was trying to do instead of
+pulling against it. The winner is the chunk that goes into the replay buffer, the `_episode_results.csv`
+reward and the debug Q log: everything downstream is about the action that actually ran, and the
+losing candidates are discarded inside the sampler.
+
+The two knobs compose but are not the same thing. Guidance moves a *single* sample toward higher Q
+and can walk it off the policy's own distribution if the critic is wrong there; best-of-N only ever
+returns something the frozen pi0.5 sampler drew on its own, so a bad critic costs it nothing beyond
+the wasted compute — with an untrained critic it degrades to picking a candidate at random, which is
+exactly the baseline. That is why guidance needs `guidance_ramp_updates` and best-of-N needs no ramp.
+
+Cost is `n` denoising loops, not `n` policy calls: the candidates ride along as extra batch elements,
+replicated **after** the SigLIP tower and the prefix pass, so those still run once per control step
+and only the loop and the prefix KV cache scale with `n` (the cache is ~15 MB/candidate at this
+prefix length). `guidance_scale: 0` with `best_of_n > 1` is meaningfully cheaper per candidate than
+the guided path, which pays two extra forward passes per denoising step for the value gradient —
+`pi_model.py` passes `guidance_scale=None` in that case so the gradient branch is compiled out
+rather than multiplied by a constant zero. `best_of_n` is a static jit arg: changing it recompiles.
+
+Per-episode W&B (`script/eval_policy.py::BestOfNRecorder`) reports `bestofn/q_gain` — the winner's Q
+minus the mean over its candidates, i.e. what the selection bought over executing an arbitrary one of
+them — and `bestofn/q_spread`, the range it chose over. A `q_gain` near zero means the critic cannot
+separate the chunks the sampler draws and the extra `n`-fold denoising is buying nothing.
 
 
 How much of the critic online TD is then allowed to move is decided by two keys in the
 **critic config** (`critic_config_path`, i.e. `cfgs/qmfm.yaml` — not `deploy_policy.yml`, though
 that file and the CLI can override them like any other critic key). Both only mean anything once
-guidance is on:
+a critic is running:
 
 | Key | Default | Behavior |
 |---|---|---|
@@ -559,8 +705,8 @@ dataset paid for — the part a few thousand online transitions are least able t
 letting TD refit the MLP on top of it.
 
 `train_online: false` requires a `critic_ckpt`: a frozen critic never leaves its initialization,
-so with none it would guide on the gradients of a random network, and `pi_model.py` raises at
-startup rather than running it. The replay buffer is allocated lazily on the first stash, so a
+so with none it would steer on the gradients of a random network (or rank best-of-N candidates by
+one), and `pi_model.py` raises at startup rather than running it. The replay buffer is allocated lazily on the first stash, so a
 frozen run never pays its memory either, and `save_critic` is skipped — the critic is
 byte-identical to the checkpoint the snapshotted config names. `eval.sh`'s 9th positional arg
 overrides `train_online` for a one-off run.
@@ -571,7 +717,7 @@ losing all of its TD training to a SLURM time limit is the expensive failure. Th
 per run, overwritten each time, so nothing accumulates; to resume, point the next run's
 `critic_ckpt` at it (the checkpoint carries `num_updates`, so the guidance ramp picks up where
 it left off — `PI0.scheduled_guidance_scale` still counts only *this* run's updates, §6.2).
-`script/eval_policy.py::save_online_critic` pickles into a sibling `.tmp` and `os.replace`s it
+`script/eval_policy.py::save_critic_atomically` pickles into a sibling `.tmp` and renames it
 into position, so a kill mid-write leaves the previous complete checkpoint rather than a
 truncated one — writing in place at this rate would otherwise make the interrupt this is meant
 to survive destroy the checkpoint too. There is **no** separate end-of-run save: a run that
@@ -593,8 +739,8 @@ using that counter directly would read as "ramp already finished" and apply full
 the first chunk; `PI0.scheduled_guidance_scale` subtracts the value at load time instead. W&B's
 `critic/update` still reports the lifetime count.
 
-`guidance_scale` defaults to whatever `deploy_policy.yml` says; the positional arg only
-overrides it (pass `0` to force the baseline). The critic's own hyperparameters are **not** in
+`guidance_scale` and `best_of_n` default to whatever `deploy_policy.yml` says; the positional args
+only override them (pass `0` and `1` to force the baseline). The critic's own hyperparameters are **not** in
 `deploy_policy.yml` — it carries `critic_config_path`, and `parse_args_and_config` merges that
 file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
 critic implementation and its config both come from the `multisensory_steering` package
@@ -774,6 +920,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
 | `observation.wrench.{left,right}` | world-frame TCP contact wrench, one row per executed step | `(pi0_step, 6)` |
+| `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
 different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
@@ -828,6 +975,20 @@ action, and offline training pairs it with the row's state/action as-is.
 > `observation.wrench.*` is the trace of the row's **own** chunk. To train on one, shift the
 > column a row later within each episode — `multisensory_steering`'s `dataset.modalities`
 > takes `{column: ..., shift: 1}` for exactly this.
+
+`reward` is the **same quantity the online critic is fed** during a guided eval: 1.0 on the
+control step that first reaches success, and otherwise the task's own `step_reward()` — the
+shaped, *delta*-valued progress term (`envs/lift_pot.py`, `envs/open_microwave.py`,
+`envs/put_object_cabinet.py`); tasks that define none leave the column sparse (0 everywhere but
+the successful step). Both drivers call `eval_policy.py::control_step_reward` at the same point
+in their loop so the two cannot drift — `eval_policy.py` passes the result to
+`online_critic.commit()`, `collect_dataset.py` stores it. Unlike the wrench, it belongs to the
+row's **own** chunk (it is the outcome of this row's action, not an observation preceding it),
+which is exactly what an offline `(s, a, r, s')` needs. It cannot be recomputed after the fact:
+`step_reward()` is a difference against its own previous call, so it only exists while the
+episode runs. Train on it with `reward_col: reward` in `multisensory_steering`'s
+`cfgs/train_offline.yaml` (the alternative, `terminal_reward`, derives the sparse signal from
+`success` and ignores the shaping). Datasets collected before 2026-08-07 have no such column.
 
 `envs/utils/wrench.py::stack_step_wrench` does the stacking, shared with the critic's online
 view of the same modality. A trace can be short — an episode's first row has no previous chunk
