@@ -5,17 +5,30 @@
 # and runs them one after another.
 #
 # Evals are NOT packed concurrently onto a GPU the way collection is
-# (submit_all_data.sh). eval.sh sets XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 (~32 GB
-# of an 80 GB H100 for JAX) on top of ~7 GB for SAPIEN's OptiX renderer, so two
-# concurrent evals would sit at ~78 GB and OOM the renderer. Tasks inside a job
-# therefore run sequentially; use more jobs, not more workers, to go faster.
+# (submit_all_data.sh). eval.sh sets XLA_PYTHON_CLIENT_MEM_FRACTION=0.4, which on
+# Killarney's 46 GB L40S reserves ~18 GB for JAX, on top of ~7 GB for SAPIEN's
+# OptiX renderer -> ~25 GB for one eval. Two concurrent would want ~50 GB and OOM
+# the 46 GB card. Tasks inside a job therefore run sequentially; use more jobs,
+# not more workers, to go faster. (The same held on Rorqual's 80 GB H100, where
+# 0.4 meant ~32 GB and two evals came to ~78 GB.)
+#
+# Killarney time bands: Slurm routes a GPU job to a gpubase_l40s_b* partition by
+# --time. <=3h lands in b1 (168 nodes), <=12h in b2 (126), <=1d in b3 (84), <=3d
+# in b4 (42), <=7d in b5 (17); the default here is 12h. A shorter --time gets a
+# bigger node pool but NOT necessarily a sooner start -- each band queues
+# separately, and b1 is often the more contended one (measured 2026-08-07: a 12h
+# job was scheduled ~8h earlier than an otherwise identical 3h job). Check before
+# assuming, with:
+#   sbatch --test-only --time=<HH:MM:SS> --cpus-per-task=8 --mem=48G \
+#          cluster/robotwin_gpu.sh bash -c true
 #
 # Usage:
 #   bash eval_tasks.sh <task_config> <train_config_name> <model_name> [seed]
 #                      [--tasks t1,t2,...] [--per-job N]
 #                      [--guidance-scale S] [--guidance-ramp-updates N]
 #                      [--train-online true|false]
-#                      [--time HH:MM:SS] [--cpus N] [--mem 48G] [--dry-run]
+#                      [--time HH:MM:SS] [--cpus N] [--mem 48G]
+#                      [--exclude n1,n2,...] [--dry-run]
 #
 #   --tasks     = evaluate only the given tasks (comma- or space-separated),
 #                 instead of every task in description/task_instruction/.
@@ -25,6 +38,15 @@
 #               = eval.sh's optional 7th/8th/9th args; omit them to take
 #                 policy/pi05/deploy_policy.yml's values. Pass
 #                 --guidance-scale 0 to force the plain pi0.5 baseline.
+#   --exclude   = Slurm --exclude node list (default $EVAL_EXCLUDE). For nodes
+#                 whose GPU is broken in a way Slurm does not notice: a card with
+#                 pending ECC row remaps stays "healthy" in sinfo but fails
+#                 vkCreateDevice AND plain CUDA, so every eval routed to it dies
+#                 in eval_policy.py's render pre-flight within a minute. Diagnose
+#                 a suspect node with:
+#                   nvidia-smi -q -d ECC,ROW_REMAPPER | grep -A2 "Remapped Rows"
+#                 ("Pending: Yes" / nonzero uncorrectable = report it to support
+#                 and blacklist it here meanwhile).
 #   --dry-run   = print the sbatch commands instead of submitting them.
 #
 # Examples:
@@ -33,6 +55,8 @@
 #        --tasks beat_block_hammer,lift_pot
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
 #        --tasks beat_block_hammer --guidance-scale 0.3 --guidance-ramp-updates 256
+#   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
+#        --tasks stack_blocks_three --exclude kn117
 
 set -euo pipefail
 shopt -s nullglob
@@ -47,6 +71,7 @@ time_limit=${EVAL_TIME:-12:00:00}   # test_num: 100 successful episodes is long;
                                     # robotwin_gpu.sh's 3h default is not enough
 cpus=${EVAL_CPUS:-8}
 mem=${EVAL_MEM:-48G}
+exclude=${EVAL_EXCLUDE:-}   # nodes with known-bad GPUs; see --exclude above
 dry_run=0
 
 # --- parse args ---
@@ -84,6 +109,10 @@ while (( $# )); do
         --cpus=*)                 cpus=${arg#--cpus=} ;;
         --mem)                    need_value --mem $#; shift; mem=$1 ;;
         --mem=*)                  mem=${arg#--mem=} ;;
+        # Repeatable, so several bad nodes accumulate instead of overwriting.
+        --exclude)                need_value --exclude $#; shift
+                                  exclude="${exclude:+$exclude,}$1" ;;
+        --exclude=*)              exclude="${exclude:+$exclude,}${arg#--exclude=}" ;;
         --dry-run|-n)             dry_run=1 ;;
         # Print the header comment block (skipping the shebang) as the help text.
         -h|--help)                awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; seen=1; next}
@@ -106,7 +135,8 @@ if [[ -z "$model_name" ]]; then
     echo "Usage: bash eval_tasks.sh <task_config> <train_config_name> <model_name> [seed]" \
          "[--tasks t1,t2,...] [--per-job N] [--guidance-scale S]" \
          "[--guidance-ramp-updates N] [--train-online true|false]" \
-         "[--time HH:MM:SS] [--cpus N] [--mem 48G] [--dry-run]" >&2
+         "[--time HH:MM:SS] [--cpus N] [--mem 48G]" \
+         "[--exclude n1,n2,...] [--dry-run]" >&2
     exit 1
 fi
 
@@ -158,6 +188,7 @@ echo "Submitting ${num_jobs} eval job(s) for ${task_count} task(s):" \
 [[ -n "$guidance_scale"         ]] && echo "  guidance_scale=${guidance_scale}"
 [[ -n "$guidance_ramp_updates"  ]] && echo "  guidance_ramp_updates=${guidance_ramp_updates}"
 [[ -n "$train_online"           ]] && echo "  train_online=${train_online}"
+[[ -n "$exclude"                ]] && echo "  exclude=${exclude}"
 
 # The body each job runs: activate nothing here (cluster/robotwin_gpu.sh has
 # already sourced setup_env.sh); just cd into policy/pi05 and call eval.sh per
@@ -194,6 +225,10 @@ for (( i = 0; i < task_count; i += per_job )); do
         --cpus-per-task="$cpus"
         --mem="$mem"
         --time="$time_limit"
+    )
+    # Omitted entirely when empty -- `--exclude=` with no value is a Slurm error.
+    [[ -n "$exclude" ]] && sbatch_cmd+=(--exclude="$exclude")
+    sbatch_cmd+=(
         cluster/robotwin_gpu.sh
         bash -c "$job_body" eval-job
         "$task_config" "$train_config_name" "$model_name" "$seed"
