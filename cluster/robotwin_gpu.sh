@@ -12,7 +12,7 @@
 #   * Compute nodes have no internet; do all pip/git installs on a login node.
 #   * Submit from the repo root, or set ROBOTWIN_ROOT to override its location.
 # ---------------------------------------------------------------------------
-#SBATCH --account=def-florian7_gpu
+#SBATCH --account=rrg-florian7_gpu
 #SBATCH --job-name=robotwin
 #SBATCH --gpus-per-node=h100:1
 # fc10512 currently exposes the H100 to CUDA but cannot create a Vulkan
@@ -20,7 +20,7 @@
 #SBATCH --exclude=fc10512
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=3:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail
