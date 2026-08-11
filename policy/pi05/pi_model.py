@@ -6,8 +6,10 @@
 import json
 import sys
 import jax
+import jax.numpy as jnp
 import numpy as np
 from openpi.models import model as _model
+from openpi.models.pi0 import SIGLIP_MODALITIES
 from openpi.policies import aloha_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import download
@@ -22,24 +24,312 @@ from openpi.policies import policy_config as _policy_config
 from openpi.shared import download
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+from multisensory_steering import load_critic
+
 import os
 
 class PI0:
 
-    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step):
+    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
+                 critic_ckpt=None, guidance_scale=0.0, best_of_n=1,
+                 guidance_ramp_updates=0, critic_ramp_baseline=None,
+                 online_critic=False, train_critic_online=True,
+                 critic_config=None, critic_seed=0,
+                 collect_critic_obs=False, collect_siglip=True):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
+        self.guidance_scale_target = float(guidance_scale)
+        self.guidance_ramp_updates = max(0, int(guidance_ramp_updates))
+        self.current_guidance_scale = 0.0
+        # Best-of-N: draw this many candidate chunks per control step and execute the one the
+        # critic scores highest (`Pi0.sample_actions`). Independent of the gradient guidance --
+        # either, both or neither -- but it needs the same critic to rank with, so >1 also turns
+        # the critic path on (see deploy_policy.get_model). The candidates are extra batch
+        # elements in one sampler call, so the SigLIP tower and the prefix pass are still paid
+        # once; the denoising loop and the KV cache are what scale with N.
+        self.best_of_n = max(1, int(best_of_n or 1))
+        # The index the last control step's selection landed on and the ensemble-mean Q of every
+        # candidate it chose between, for the eval driver to log. None until a chunk is drawn,
+        # and always None at best_of_n 1 (there is nothing to select).
+        self.last_best_index = None
+        self.last_best_scores = None
+        # Rollout-dataset collection: record the critic's model-space view of each control
+        # step (see get_action / last_critic_obs). Independent of guidance.
+        self.collect_critic_obs = bool(collect_critic_obs)
+        # Also keep the SigLIP patch features the critic conditions on, one column per camera
+        # view. They are by far the largest thing per row (256x1152 fp16 = 576 KB *per view*),
+        # so `collect_siglip` also takes a list of views to record a subset -- see
+        # _siglip_views. Empty tuple = record none, and the state/action columns still go in.
+        self.collect_siglip = self._siglip_views(collect_siglip) if self.collect_critic_obs else ()
+        self.last_critic_obs = None
+        # Debug diagnostics: score each sampled chunk with the critic that steered it and keep
+        # the result in `last_q_values` (one entry per ensemble member) for the eval driver to
+        # plot. Off by default -- it is an extra critic forward per control step -- and turned
+        # on by `script/eval_policy.py` when the task config sets `debug: true` and a critic is
+        # actually running. Never affects sampling: it reads the chunk after it was drawn.
+        self.record_q_values = False
+        self.last_q_values = None
 
         config = _config.get_config(self.train_config_name)
+        self.model_config = config.model
+        checkpoint_dir = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}"
+
+        # Online QMFM Value-critic gradient guidance for the flow-matching sampler (see
+        # multisensory_steering and Pi0.sample_actions). Enabled by the caller iff the target
+        # guidance_scale is nonzero. The critic (an ensemble Q) is trained ONLINE during eval
+        # rollouts; its d(value)/d(action), differentiated through pi0.5's velocity, steers
+        # each denoising step toward higher Q (QMFM denoised-estimate steering).
+        #
+        # The critic scores the action chunk in *embodiment* dims -- the width of
+        # observation["joint_action"]["vector"] -- which nothing here knows until the sim hands
+        # over the first observation. So the critic is built on the first
+        # update_observation_window (see _init_critic), not here. `uses_online_critic` states
+        # up front whether one is coming, because the eval driver has to decide about W&B
+        # before any rollout starts.
+        #
+        # `train_critic_online` decides whether that critic keeps learning here. False freezes
+        # it at the checkpoint's parameters: it is still built and still steers the sampler, but
+        # nothing is stashed into the replay buffer and the eval driver runs no TD update -- an
+        # offline-trained critic evaluated as-is, with no eval-time distribution shift in the
+        # values. It only makes sense against a `critic_ckpt` (see below).
+        self.uses_online_critic = bool(online_critic)
+        self.train_critic_online = bool(train_critic_online)
+        self.online_critic = None
+        self.critic_action_dim = None
+        # Sensor modalities from the sim observation (depth / point cloud / contact wrench --
+        # see envs/utils/obs_modalities.py), handed in by deploy_policy.eval. The model itself
+        # only produces `state` and a `siglip.<view>` map per camera; everything else the critic
+        # conditions on arrives this way. Populated only when a critic is actually running.
+        self.critic_obs_extra = {}
+        self._critic_extra_shapes = {}
+        self._critic_updates_at_start = 0
+        # Where the ramp counts from, when the caller knows better than "wherever the
+        # checkpoint left off". Only `script/eval_policy.py` resuming an interrupted run does:
+        # it reloads that run's *own* critic as `critic_ckpt`, so re-basing at the restored
+        # counter would restart the ramp at 0 and re-ramp a critic the run had already ramped
+        # in. It passes the interrupted run's own baseline back instead. None = derive it from
+        # the checkpoint, which is right for every other warm start.
+        self._critic_ramp_baseline = (None if critic_ramp_baseline is None
+                                      else int(critic_ramp_baseline))
+        self._critic_ckpt = critic_ckpt
+        self._critic_config = dict(critic_config or {})
+        self._critic_config["seed"] = critic_seed
+        # primitive sim steps executed per chunk (gamma^H in TD)
+        self._critic_config["horizon"] = int(pi0_step)
+        if not online_critic and critic_ckpt:
+            # Not an error: the baseline is selected by guidance_scale, and leaving a
+            # critic_ckpt configured while running it is a normal A/B thing to do.
+            print(f"[pi_model] guidance_scale is 0 -- ignoring critic_ckpt {critic_ckpt} "
+                  f"and running the plain pi0.5 baseline")
+        if online_critic and not self.train_critic_online and not critic_ckpt:
+            # A frozen critic never leaves its initialization, so this would steer the sampler
+            # by the gradients of a randomly initialized network for the whole run.
+            raise ValueError(
+                "train_critic_online is false and critic_ckpt is null: the critic would stay at "
+                "its random initialization and guide the sampler with meaningless gradients. "
+                "Point critic_ckpt at an offline-trained critic, or set train_critic_online "
+                "true to train one during the rollouts."
+            )
+
         self.policy = _policy_config.create_trained_policy(
             config,
-            f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            checkpoint_dir,
             )
         print("loading model success!")
         self.img_size = (224, 224)
         self.observation_window = None
         self.pi0_step = pi0_step
+
+    @staticmethod
+    def _siglip_views(collect_siglip):
+        """`collect_siglip` -> the SigLIP modalities to record, in the policy's camera order.
+
+        `true` takes every view the policy sees (head plus both wrists for aloha agilex),
+        `false` none. A list records a subset -- each 256x1152 fp16 map is ~576 KB/row, so the
+        three of them are what dominates a rollout dataset's size -- named either the short way
+        (`head`, `left_wrist`) or as the modality itself (`siglip.head`).
+        """
+        views = tuple(SIGLIP_MODALITIES.values())
+        if collect_siglip is None or isinstance(collect_siglip, bool):
+            return views if collect_siglip else ()
+        if isinstance(collect_siglip, str):
+            collect_siglip = [collect_siglip]
+        wanted = {v if str(v).startswith("siglip.") else f"siglip.{v}" for v in collect_siglip}
+        if unknown := sorted(wanted - set(views)):
+            raise ValueError(
+                f"collect_siglip names camera view(s) the policy does not have: {unknown}. "
+                f"Available: {[v.split('.', 1)[1] for v in views]} (or true / false)."
+            )
+        return tuple(view for view in views if view in wanted)
+
+    def _init_critic(self, state):
+        """Set up the critic path now that the embodiment's action width is known.
+
+        ``state`` is ``observation["joint_action"]["vector"]`` -- the sim's own joint vector
+        (both arms plus grippers), so its width is exactly the number of dims the embodiment
+        acts in. The model itself works in a padded ``action_dim`` (32); AlohaInputs zero-pads
+        14 -> 32 (state as well as actions) and those trailing dims normalize to constant zero,
+        so feeding them to the critic would only widen it with dead weights. Both the state and
+        the action chunk it sees are therefore narrowed back to this width. Called once, from
+        update_observation_window.
+        """
+        self.critic_action_dim = int(np.shape(state)[-1])
+        horizon = int(self.model_config.action_horizon)
+        chunk = f"{horizon}x{self.critic_action_dim}"
+
+        if not self.uses_online_critic:
+            if self.collect_critic_obs:
+                self.policy._sample_kwargs.update({
+                    "return_critic_obs": True,
+                    "critic_action_dim": self.critic_action_dim,
+                })
+                siglip = (f"with SigLIP patch features: {', '.join(self.collect_siglip)}"
+                          if self.collect_siglip else "no SigLIP")
+                print(f"[pi_model] recording model-space critic observations for dataset "
+                      f"collection (action chunk={chunk}, {siglip})")
+            return
+
+        cc = dict(self._critic_config)
+        cc["action_dim_flat"] = horizon * self.critic_action_dim
+        # State is the model-space state narrowed back to the embodiment's own dims, exactly as
+        # the sampler emits it (Pi0.sample_actions::critic_observation) and as the collected
+        # `observation.state.model` column stores it -- not the padded action_dim.
+        cc["state_dim"] = self.critic_action_dim
+        cc["siglip_channels"] = 1152
+        cc["siglip_grid"] = 16
+        # Everything the critic *may* condition on this run: the modalities the sampler produces
+        # itself -- the state and one SigLIP patch map per camera the policy is given, the wrist
+        # views as well as the head -- plus whichever sensors the task config's `data_type`
+        # turned on (they are in `critic_obs_extra` because the first observation has already
+        # been handed in). Which of them it actually uses is decided downstream, by the critic's
+        # own `encoder_modalities` config -- this side just declares what is on offer, and the
+        # critic raises if it was configured for something the sim is not producing.
+        siglip_shape = (cc["siglip_grid"], cc["siglip_grid"], cc["siglip_channels"])
+        cc["obs_shapes"] = {
+            **{view: siglip_shape for view in SIGLIP_MODALITIES.values()},
+            "state": (self.critic_action_dim,),
+            **{key: tuple(np.shape(value)) for key, value in self.critic_obs_extra.items()},
+        }
+        self.online_critic = load_critic(cc, self._critic_ckpt)
+        # The subset that has to be shipped into the sampler on every call (the other two are
+        # built in there). Their shapes are fixed here and enforced per step: a point cloud
+        # collected with `pcd_down_sample_num: 0` has a different N every step, which would
+        # otherwise surface as an XLA recompile per control step.
+        self._critic_extra_shapes = {
+            key: cc["obs_shapes"][key]
+            for key in self.online_critic.obs_keys
+            if key in self.critic_obs_extra
+        }
+        # A warm-started critic restores its lifetime update counter from the checkpoint (an
+        # offline-trained one is in the hundreds/thousands), so the ramp has to be measured
+        # against where *this* run started -- otherwise it reads as already finished and
+        # guidance jumps to the target on the very first chunk. The exception is a *resumed*
+        # run, whose checkpoint is its own earlier self: it hands its original baseline back
+        # (`critic_ramp_baseline`) so the ramp picks up where the interruption left it.
+        self._critic_updates_at_start = (int(self.online_critic.num_updates)
+                                         if self._critic_ramp_baseline is None
+                                         else self._critic_ramp_baseline)
+
+        # A checkpoint's architecture keys override the caller's, so a critic whose shapes do not
+        # match (wrong embodiment, wrong action horizon) loads "successfully" and then fails with
+        # an opaque dot_general shape error inside sample_actions. Catch it here instead. Note
+        # this cannot tell a *raw-space* critic apart from a model-space one: the raw
+        # observation.state / action columns have the same widths as their .model counterparts,
+        # differing only in normalization. Getting that right is on whoever trains the critic.
+        for key in ("action_dim_flat", "state_dim"):
+            got, want = int(self.online_critic.config[key]), int(cc[key])
+            if got != want:
+                raise ValueError(
+                    f"critic checkpoint {self._critic_ckpt!r} was trained with {key}={got}, but "
+                    f"pi0.5 guidance feeds {key}={want} (state is the "
+                    f"{self.critic_action_dim}-dim model state; the action chunk is "
+                    f"{chunk} normalized). Collect a rollout dataset with collect_critic_obs "
+                    f"and train on the observation.state.model / action.model columns."
+                )
+
+        self.policy._sample_kwargs.update({
+            "critic_apply": self.online_critic.critic_apply,
+            # A `None` guidance scale switches the value gradient off entirely, which is what a
+            # best-of-N-only run wants: with a traced 0.0 the sampler cannot tell "ramping in
+            # from zero" from "never steering", and would keep paying two extra forward passes
+            # per denoising step to multiply a gradient by zero. Nonzero targets keep the traced
+            # scalar so the ramp costs no recompile.
+            "guidance_scale": (jnp.asarray(0.0, dtype=jnp.float32)
+                               if self.guidance_scale_target != 0.0 else None),
+            "best_of_n": self.best_of_n,
+            "critic_action_dim": self.critic_action_dim,
+        })
+        warm = (f"warm-started from {self._critic_ckpt} at "
+                f"{int(self.online_critic.num_updates)} updates" if self._critic_ckpt
+                else "from scratch")
+        if not self.train_critic_online:
+            ramp = "no ramp (frozen critic), "
+        elif self._critic_ramp_baseline is None:
+            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
+                    f"TD update), ")
+        else:
+            # Resumed run: the ramp is already partway along, so say where it comes back at
+            # rather than implying it starts here.
+            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (resumed at update "
+                    f"{int(self.online_critic.num_updates) - self._critic_updates_at_start} of "
+                    f"the ramp -> guidance {self.scheduled_guidance_scale():.4g}), ")
+        mode = "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
+        unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
+        if self.guidance_scale_target == 0.0:
+            # Best-of-N only: the sampler is the plain pi0.5 one and the critic never enters a
+            # gradient, it only ranks. Say so, rather than printing a guidance target of 0.
+            ramp = ""
+            steering = "no gradient guidance (guidance_scale 0), "
+        else:
+            steering = f"guidance_scale_target={self.guidance_scale_target}, "
+        select = (f"best-of-{self.best_of_n} (highest ensemble-mean Q per control step), "
+                  if self.best_of_n > 1 else "")
+        print(f"[pi_model] QMFM Value critic enabled, critic {mode} ({warm}, "
+              f"{steering}{select}{ramp}"
+              f"num_qs={cc['num_qs']}, action chunk={chunk} "
+              f"-> action_dim_flat={cc['action_dim_flat']})")
+        print(f"[pi_model] critic observation: "
+              + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
+              + (f" (available but unused: {', '.join(unused)})" if unused else ""))
+
+    @property
+    def critic_ramp_baseline(self):
+        """The lifetime update count the guidance ramp is measured from.
+
+        Written into `resume_state.json` by the eval driver and handed back on resume, so the
+        ramp survives an interruption. 0 until the critic is built (see `_init_critic`).
+        """
+        return self._critic_updates_at_start
+
+    def scheduled_guidance_scale(self):
+        """Guidance ramps 0 -> target over the first `guidance_ramp_updates` TD updates.
+
+        Counted from the start of this run, so a critic warm-started from `critic_ckpt` ramps
+        in exactly like one trained from scratch: its values are trained on a different
+        (offline) state distribution, so easing the sampler into them is worth doing even
+        though the network is not random.
+
+        A frozen critic (`train_critic_online: false`) has no TD updates to count -- the ramp
+        would pin guidance at 0 for the entire run -- so it guides at the target from the first
+        chunk. Its values never move either, so there is nothing to ease into.
+
+        "This run" spans an interruption: a resumed run is the same run, and is handed the
+        original's baseline (`critic_ramp_baseline`), so the ramp continues from where it
+        stopped instead of dropping back to 0 for another `guidance_ramp_updates`.
+        """
+        if self.online_critic is None:
+            return 0.0
+        if not self.train_critic_online:
+            return self.guidance_scale_target
+        updates = self.online_critic.num_updates - self._critic_updates_at_start
+        if updates <= 0:
+            return 0.0
+        if self.guidance_ramp_updates <= 0:
+            return self.guidance_scale_target
+        progress = min(1.0, updates / float(self.guidance_ramp_updates))
+        return self.guidance_scale_target * progress
 
     # set img_size
     def set_img_size(self, img_size):
@@ -51,7 +341,20 @@ class PI0:
         print(f"successfully set instruction:{instruction}")
 
     # Update the observation window buffer
-    def update_observation_window(self, img_arr, state):
+    def update_observation_window(self, img_arr, state, critic_obs=None):
+        """Set the observation the next `get_action` runs on.
+
+        `critic_obs` is the sim's sensor modalities for this control step (depth / point cloud /
+        contact wrench, from `envs/utils/obs_modalities.py`). It is only passed on the call that
+        precedes a `get_action`; the refreshes inside the policy's action loop leave the last
+        one in place rather than paying to rebuild it for a step that never scores anything.
+        """
+        if critic_obs is not None:
+            self.critic_obs_extra = critic_obs
+        if self.critic_action_dim is None:
+            # First observation of the run: the embodiment's action width is now known, and so
+            # is the set of sensor modalities the task config produces.
+            self._init_critic(state)
         img_front, img_right, img_left, puppet_arm = (
             img_arr[0],
             img_arr[1],
@@ -72,9 +375,106 @@ class PI0:
             "prompt": self.instruction,
         }
 
+    def _critic_extra_obs(self):
+        """This step's sensor modalities, in the fixed shapes `_init_critic` pinned down.
+
+        Returned unbatched (the sampler's kwargs bypass `Policy.infer`'s batching, so the caller
+        adds the leading axis), in the dtype they arrive in -- camera frames stay uint8 rather
+        than becoming four times the bytes to cross into XLA -- and NaN and all: an early-ended
+        chunk pads its wrench trace with NaN, and mapping that to something finite is the
+        encoders' job.
+        """
+        obs = {}
+        for key, shape in self._critic_extra_shapes.items():
+            value = self.critic_obs_extra.get(key)
+            if value is None:
+                raise KeyError(
+                    f"critic modality {key!r} was present on the first observation but is "
+                    f"missing now; the observation only carries "
+                    f"{sorted(self.critic_obs_extra)}."
+                )
+            value = np.asarray(value)
+            if value.shape != shape:
+                raise ValueError(
+                    f"critic modality {key!r} changed shape from {shape} to {value.shape}. "
+                    f"A point cloud does this when `pcd_down_sample_num: 0` leaves it "
+                    f"un-downsampled -- the critic needs a fixed-size observation."
+                )
+            obs[key] = value
+        return obs
+
     def get_action(self):
         assert self.observation_window is not None, "update observation_window first!"
-        return self.policy.infer(self.observation_window)["actions"]
+        if self.online_critic is not None:
+            # Inject the current (traced) critic params so online updates take effect without an
+            # XLA recompile. The scheduled guidance scale is also traced, so changing it per
+            # call ramps guidance without compiling a sampler for each scalar value.
+            self.current_guidance_scale = self.scheduled_guidance_scale()
+            self.policy._sample_kwargs["critic_params"] = self.online_critic.params
+            if self.guidance_scale_target != 0.0:
+                # Left at None for a best-of-N-only run -- see _init_critic. Writing a traced
+                # zero here would silently switch the (unused) guidance path back on.
+                self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
+                    self.current_guidance_scale, dtype=jnp.float32
+                )
+            extra = self._critic_extra_obs()
+            self.policy._sample_kwargs["critic_obs_extra"] = {
+                key: jnp.asarray(value)[None, ...] for key, value in extra.items()
+            }
+            # Stash this control step's (obs, action) for the replay buffer. Every SigLIP view
+            # the sampler produced is offered; `stash` keeps only the critic's own
+            # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
+            # skips this entirely -- nothing would ever train on the transitions, and the buffer
+            # is allocated lazily, so it never costs the run any memory.
+            out = self.policy.infer(self.observation_window)
+            critic_obs = {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra}
+            if self.best_of_n > 1:
+                # Which of the N candidates was executed, and what the critic scored all of them
+                # at. `critic_action` below is already the winner, so everything downstream --
+                # the replay transition, the Q log -- is about the chunk that actually ran.
+                self.last_best_index = int(out["critic_best_index"])
+                self.last_best_scores = np.asarray(out["critic_best_scores"], dtype=np.float32)
+            if self.train_critic_online:
+                self.online_critic.stash(critic_obs, out["critic_action"])
+            if self.record_q_values:
+                # The value the guidance was climbing, at the chunk it actually arrived at:
+                # `critic_action` is the normalized chunk the sampler scored (embodiment dims),
+                # and `critic_obs` the observation it scored it against.
+                self.last_q_values = self.online_critic.q_values(critic_obs, out["critic_action"])
+            self._stash_critic_obs(out)
+            return out["actions"]
+        out = self.policy.infer(self.observation_window)
+        self._stash_critic_obs(out)
+        return out["actions"]
+
+    def _stash_critic_obs(self, out):
+        """Keep the last control step's model-space critic view for dataset collection.
+
+        ``critic_obs_state`` (critic_action_dim,) is the normalized model state and
+        ``critic_action`` (action_horizon, critic_action_dim) the normalized chunk, both in
+        embodiment dims -- the tensors the critic is scored on. ``out["actions"]`` is the same
+        chunk after the output transform has unnormalized it.
+
+        ``critic_obs_siglip`` holds the SigLIP patch maps the critic's CNN encoders read, one
+        per camera view, as produced by ``Pi0.sample_actions``' own image tower -- so recording
+        them here makes the separate ``multisensory_steering.create_dataset siglip`` pass
+        unnecessary for every view, not just the head. Each is stored under its modality name
+        (``siglip.head``, ``siglip.left_wrist``, ...) as the flat ``(256, 1152)`` patch sequence
+        that pass wrote (the encoders reshape to the 16x16 grid themselves) and in fp16,
+        matching the online replay buffer's ``stash``.
+        """
+        if not self.collect_critic_obs or "critic_action" not in out:
+            return
+        self.last_critic_obs = {
+            "state": np.asarray(out["critic_obs_state"], dtype=np.float32),
+            "action": np.asarray(out["critic_action"], dtype=np.float32),
+        }
+        maps = out.get("critic_obs_siglip") or {}
+        self.last_critic_obs["siglip"] = {
+            view: np.asarray(maps[view], dtype=np.float16).reshape(-1, np.shape(maps[view])[-1])
+            for view in self.collect_siglip
+            if view in maps
+        }
 
     def reset_obsrvationwindows(self):
         self.instruction = None

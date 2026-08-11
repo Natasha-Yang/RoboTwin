@@ -41,3 +41,5 @@ logs/
 # nested here (see .claude/README.md). Never let them enter this public fork.
 /.claude/conversations/
 /.claude/memory/
+
+rollout_datasets/*
