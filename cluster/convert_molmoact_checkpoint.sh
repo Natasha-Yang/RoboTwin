@@ -7,13 +7,13 @@ set -euo pipefail
 checkpoint_dir="${1:?usage: $0 CHECKPOINT_DIR OUTPUT_DIR}"
 output_dir="${2:?usage: $0 CHECKPOINT_DIR OUTPUT_DIR}"
 
-repo_root="/home/natashay/project/def-florian7/RoboTwin"
-molmo_root="/home/natashay/project/def-florian7/molmoact2"
-python="/project/6028519/natashay/miniforge3/envs/MolmoActConvert/bin/python"
+repo_root="/project/6101811/natashay/RoboTwin"
+molmo_root="/project/6101811/natashay/molmoact2"
+python="/project/6101811/natashay/miniforge3/envs/MolmoActConvert/bin/python"
 
 export PYTHONPATH="${repo_root}/cluster/converter_stubs"
 export MPLCONFIGDIR="${SLURM_TMPDIR:-/tmp}/matplotlib-molmo"
-export HF_HOME="/project/6028519/natashay/.cache/huggingface"
+export HF_HOME="/project/6101811/natashay/.cache/huggingface"
 export PYTHONUNBUFFERED=1
 
 mkdir -p "${MPLCONFIGDIR}"

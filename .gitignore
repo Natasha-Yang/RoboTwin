@@ -30,6 +30,8 @@ envs/curobo/*
 /*.txt
 
 policy/*/training_data/*
+
+rollout_datasets/*
 # RoboTwin cluster render smoke-test artifacts
 cluster/render_check*.png
 

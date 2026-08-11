@@ -5,10 +5,10 @@
 # tasks. Two execution modes:
 #
 #   parallel (default): the batch runs as many tasks concurrently as fit on its
-#             single allocated H100. RoboTwin's render load is tiny (3 D435
+#             single allocated L40S. RoboTwin's render load is tiny (3 D435
 #             cameras, 320x240 RGB, ~2-4 GB VRAM), so the binding limit is CPU,
-#             not the GPU. A Fir H100 node has 48 CPUs / 4 H100s -> ~12 cores per
-#             GPU, and each worker needs ~3, so the job packs 12/3 = 4 workers
+#             not the GPU. A Killarney L40S node has 64 CPUs / 4 L40S -> 16 cores
+#             per GPU, and each worker needs ~3, so the job packs 16/3 = 5 workers
 #             onto the GPU and requests that GPU's full CPU/RAM fair share
 #             (overriding cluster/robotwin_gpu.sh's defaults).
 #   sequential (--sequential): the batch runs its tasks one after another on the
@@ -16,37 +16,53 @@
 #
 # Usage:
 #   bash submit_all_data.sh <task_config> [num_batches] [--parallel | --sequential]
+#                           [--tasks t1,t2,...]
 #
 #   num_batches = number of Slurm jobs (i.e. number of GPUs used).
 #                 Default: enough jobs to pack the GPUs (parallel), or one task
 #                 per job (sequential).
+#   --tasks     = collect only the given tasks (comma- or space-separated) instead
+#                 of every task in description/task_instruction/. May be repeated.
 #
 # Examples:
 #   bash submit_all_data.sh demo_randomized                # pack GPUs, default (parallel)
 #   bash submit_all_data.sh demo_randomized 8              # 8 jobs, packed
 #   bash submit_all_data.sh demo_randomized 5 --sequential # 5 jobs, one task at a time
+#   bash submit_all_data.sh demo_randomized --tasks beat_block_hammer,place_cup  # only these two
 
 set -euo pipefail
 shopt -s nullglob
 
-# --- how many workers fit on one H100 ---
-# Fir H100 node = 48 CPUs / 4 GPUs -> 12 cores/GPU fair share; collection is
+# --- how many workers fit on one L40S ---
+# Killarney L40S node = 64 CPUs / 4 GPUs -> 16 cores/GPU fair share; collection is
 # CPU-bound (curobo planning + PhysX), ~3 cores/worker. VRAM/RAM are not the
-# limit (~2-4 GB VRAM, ~6 GB RAM per worker on an 80 GB / ~288 GB-per-GPU node).
-cpus_per_gpu=12
+# limit (~2-4 GB VRAM, ~6 GB RAM per worker on a 48 GB / ~128 GB-per-GPU node).
+cpus_per_gpu=16
 cpus_per_worker=3
 mem_per_worker_gb=12
-workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 4
+workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 5
 
 # --- parse args (positional task_config, optional num_batches, mode flag) ---
 task_config=""
 num_batches=""
 parallel=1
+declare -a requested_tasks=()
 
-for arg in "$@"; do
+while (( $# )); do
+    arg=$1
     case "$arg" in
         --parallel)               parallel=1 ;;
         --sequential|--seq)       parallel=0 ;;
+        --tasks)
+            shift
+            [[ $# -gt 0 ]] || { echo "--tasks requires a task list" >&2; exit 1; }
+            IFS=', ' read -r -a _t <<< "$1"
+            requested_tasks+=("${_t[@]}")
+            ;;
+        --tasks=*)
+            IFS=', ' read -r -a _t <<< "${arg#--tasks=}"
+            requested_tasks+=("${_t[@]}")
+            ;;
         -*)             echo "Unknown option: $arg" >&2; exit 1 ;;
         *)
             if [[ -z "$task_config" ]]; then
@@ -58,6 +74,7 @@ for arg in "$@"; do
             fi
             ;;
     esac
+    shift
 done
 
 if [[ -z "$task_config" ]]; then
@@ -70,8 +87,23 @@ if [[ ! -f "task_config/${task_config}.yml" ]]; then
     exit 1
 fi
 
-task_files=(description/task_instruction/*.json)
-task_count=${#task_files[@]}
+# Build the list of tasks to collect: either the explicit --tasks list (validated
+# against description/task_instruction/) or every task found there.
+declare -a task_names=()
+if (( ${#requested_tasks[@]} )); then
+    for task_name in "${requested_tasks[@]}"; do
+        if [[ ! -f "description/task_instruction/${task_name}.json" ]]; then
+            echo "Task not found: description/task_instruction/${task_name}.json" >&2
+            exit 1
+        fi
+        task_names+=("$task_name")
+    done
+else
+    for f in description/task_instruction/*.json; do
+        task_names+=("$(basename "$f" .json)")
+    done
+fi
+task_count=${#task_names[@]}
 
 if (( task_count == 0 )); then
     echo "No task descriptions found in description/task_instruction/" >&2
@@ -100,7 +132,7 @@ mkdir -p logs/data_collection
 # one when task_count is not a multiple of num_batches.
 declare -a batch_tasks
 for (( i = 0; i < task_count; i++ )); do
-    task_name=$(basename "${task_files[$i]}" .json)
+    task_name=${task_names[$i]}
     b=$(( i % num_batches ))
     batch_tasks[$b]+=" ${task_name}"
 done
@@ -111,10 +143,11 @@ else
     echo "Submitting ${num_batches} sequential batch job(s) for ${task_count} tasks."
 fi
 
-# Only these Fir nodes have successfully initialized SAPIEN's Vulkan renderer
-# in this environment. Other H100 nodes can run CUDA while exposing no usable
-# Vulkan device, which makes collection fail before the task starts.
-render_nodes=fc10508,fc10519,fc10604,fc10612
+# On Killarney every L40S node uses the same NVIDIA driver, so SAPIEN's Vulkan
+# renderer is not pinned to specific nodes (unlike Fir, where only a few nodes
+# had a working Vulkan device). Verify rendering once with the smoke test
+# (sbatch cluster/robotwin_gpu.sh) before a large collection run; if some node
+# turns out to lack a usable Vulkan device, re-add an --exclude/--nodelist here.
 
 for (( b = 0; b < num_batches; b++ )); do
     tasks=${batch_tasks[$b]# }   # strip the leading space
@@ -137,7 +170,6 @@ for (( b = 0; b < num_batches; b++ )); do
         sbatch \
             --job-name="collect-batch-${b}" \
             --output="logs/data_collection/%x-%j.out" \
-            --nodelist="$render_nodes" \
             --cpus-per-task="$cpus" \
             --mem="${mem_gb}G" \
             cluster/robotwin_gpu.sh \
@@ -174,7 +206,6 @@ for (( b = 0; b < num_batches; b++ )); do
         sbatch \
             --job-name="collect-batch-${b}" \
             --output="logs/data_collection/%x-%j.out" \
-            --nodelist="$render_nodes" \
             cluster/robotwin_gpu.sh \
             bash -c '
                 set -uo pipefail

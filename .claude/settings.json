@@ -1,7 +1,7 @@
 {
   "model": "opus",
   "permissions": {
-    "defaultMode": "acceptEdits"
+    "defaultMode": "auto"
   },
   "statusLine": {
     "type": "command",

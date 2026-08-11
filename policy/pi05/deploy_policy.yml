@@ -35,17 +35,22 @@ test_num: 100
 # updates to ramp against) and `guidance_ramp_updates` is ignored. Overridable as eval.sh's 9th
 # positional arg, or by setting `train_online` here -- this file wins over the included one.
 #
-# NOTE (Rorqual): the guided path additionally needs the QMFM repo, which multisensory_steering
-# imports `ReplayBuffer` from via $QMFM_ROOT. It is staged at
-# /home/natashay/links/projects/def-florian7/natashay/QMFM, which `eval.sh` exports as the
-# default, so a guided run works here as-is. Warm-start it by pointing `critic_ckpt` at a critic
-# checkpoint; `guidance_scale` below (or eval.sh's 7th arg) is the on/off switch.
+# NOTE (Killarney): the guided path needs TWO out-of-repo checkouts -- `multisensory_steering`
+# (which owns `critic_config_path` below) and the QMFM repo `pi_model.py` imports `ReplayBuffer`
+# from via $QMFM_ROOT. NEITHER is staged on this cluster, so the default here is the plain
+# baseline and `critic_config_path` is null. Note it would be read *unconditionally* even at
+# guidance_scale 0.0 (script/eval_policy.py::parse_args_and_config), so a stale path breaks
+# baseline eval too -- hence null rather than a dangling path. To enable guidance: clone both
+# repos, `export QMFM_ROOT=<path>`, point `critic_config_path` at
+# <multisensory-steering>/cfgs/qmfm.yaml, stage a critic checkpoint into `critic_ckpt`, and set
+# `guidance_scale` (or pass it as eval.sh's 7th arg).
 guidance_scale: 0.1
-guidance_ramp_updates: 500
+guidance_ramp_updates: 256
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
 critic_ckpt:
 
 # Everything below only takes effect when guidance_scale != 0.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
 # (or overridden on the eval.sh command line) wins over it.
-critic_config_path: /home/natashay/links/projects/def-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
+critic_config_path: /home/natashay/projects/aip-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
+
