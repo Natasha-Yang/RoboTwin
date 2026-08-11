@@ -62,13 +62,15 @@ must be re-checked are:
 6. **Cluster Python leakage** — the `unset PYTHONPATH / PIP_CONFIG_FILE` in
    `setup_env.sh` guards against Alliance's CVMFS profile (a dummy `opencv` wheel).
    Harmless elsewhere, keep it.
-7. **pi05 policy / critic paths** — `policy/pi05/eval.sh` and
-   `policy/pi05/collect_dataset.sh` prepend a workstation CUDA path
-   (`/home/natasha/miniconda3/envs/cuda128/bin`, for curobo on an RTX 5090) and
-   default `QMFM_ROOT=/home/natasha/QMFM`; `policy/pi05/deploy_policy.yml`'s
-   `critic_config_path` points at a `multisensory-steering` checkout (on Fir,
-   `/home/natashay/links/projects/def-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml`).
-   Update these to your machine (see §6.2, §6.7, §7).
+7. **pi05 critic paths** — two out-of-repo checkouts, both under
+   `/home/natashay/project/def-florian7/` on Fir. `policy/pi05/eval.sh` defaults
+   `QMFM_ROOT=/home/natashay/project/def-florian7/QMFM` (`multisensory_steering`
+   imports `ReplayBuffer` from `$QMFM_ROOT/utils/datasets.py` by explicit path), and
+   `policy/pi05/deploy_policy.yml`'s `critic_config_path` points into the
+   `multisensory-steering` checkout
+   (`/home/natashay/links/projects/def-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml`
+   — the `links/projects` symlink form of the same directory). Update both on a new
+   machine (see §6.2, §6.7, §7).
 
 ---
 
@@ -496,10 +498,11 @@ the trailing ones override the critic knobs (§6.7) for a one-off run.
   targets and the printout agree by construction; the equivalent for a collected
   dataset's `reward` column is §7.1, which is always shaped.
 
-> `policy/pi05/eval.sh` prepends a workstation CUDA path
-> (`/home/natasha/miniconda3/envs/cuda128/bin`, for curobo on an RTX 5090) and
-> defaults `QMFM_ROOT=/home/natasha/QMFM` — remove/adjust both on a new cluster
-> (§0.7).
+> `policy/pi05/eval.sh` defaults `QMFM_ROOT=/home/natashay/project/def-florian7/QMFM`
+> and forces `WANDB_MODE=offline` (compute nodes have no internet, and the guided path
+> opens a W&B run per eval, so an online `wandb.init()` times out after 90 s and can
+> take the job down — sync afterwards from a login node with `cluster/wandb_sync.sh`).
+> Adjust `QMFM_ROOT` on a new cluster (§0.7).
 
 ### 6.3 MolmoAct directly
 

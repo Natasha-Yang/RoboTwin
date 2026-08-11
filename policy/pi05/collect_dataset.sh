@@ -1,7 +1,6 @@
 #!/bin/bash
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
-export PATH="/home/natasha/miniconda3/envs/cuda128/bin:$PATH" # CUDA 12.8 for curobo on RTX 5090
 
 policy_name=pi05
 task_name=${1}

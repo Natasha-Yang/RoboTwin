@@ -4,7 +4,9 @@ If the policy exposes a ``model.online_critic`` (pi05 builds one only when
 ``guidance_scale != 0``), the rollout additionally collects a chunk-level transition after
 every control step and runs TD updates on that critic, which steers the frozen pi0.5 flow
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
-progress is logged to W&B. Setting ``train_critic_online: false`` keeps the guidance but leaves
+progress is logged to W&B. Under ``save_critic`` it is written to the result directory after
+every episode, so an interrupted run leaves a checkpoint the next one can resume from via
+``critic_ckpt``. Setting ``train_critic_online: false`` keeps the guidance but leaves
 the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
 no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
@@ -741,15 +743,16 @@ def main(usr_args):
     # finished, which is what makes an interrupted run salvageable.
     episode_file_path = save_dir / EPISODE_CSV
 
-    # Persist the online-trained critic alongside the eval results. A frozen one has nothing to
-    # persist -- it is a byte-for-byte copy of `critic_ckpt`, which the snapshotted config
-    # already names -- so the file is skipped rather than written misleadingly.
+    # The online-trained critic is already persisted alongside the eval results: `eval_policy`
+    # checkpoints it after every episode, and reaching here means the last episode completed, so
+    # the file on disk is this run's final state. Re-pickling it would write identical bytes --
+    # only report where it is. A frozen critic has nothing to persist in the first place; it is a
+    # byte-for-byte copy of `critic_ckpt`, which the snapshotted config already names.
     online_critic = getattr(model, "online_critic", None)
     if online_critic is not None and usr_args.get("save_critic", False):
         if _trains_online_critic(model):
-            critic_path = save_dir / CRITIC_CKPT
-            online_critic.save(critic_path)
-            print(f"saved online critic to {critic_path}")
+            print(f"saved online critic to {save_dir / CRITIC_CKPT} "
+                  f"({online_critic.num_updates} updates)")
         else:
             print("train_critic_online is off -- not saving the critic (unchanged from "
                   f"{usr_args.get('critic_ckpt')})")

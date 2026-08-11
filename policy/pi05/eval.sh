@@ -24,8 +24,13 @@
 # The critic's own hyperparameters come from the `critic_config_path` file in that yml.
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
-export PATH="/home/natasha/miniconda3/envs/cuda128/bin:$PATH" # CUDA 12.8 for curobo on RTX 5090
-export QMFM_ROOT="${QMFM_ROOT:-/home/natasha/QMFM}" # QMFM repo (ReplayBuffer is imported from here)
+# Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
+# `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
+export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/project/def-florian7/QMFM}"
+# Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
+# wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
+# `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 policy_name=pi05
 task_name=${1}
