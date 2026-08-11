@@ -32,8 +32,8 @@ import os
 class PI0:
 
     def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
-                 critic_ckpt=None, guidance_scale=0.0,
-                 guidance_ramp_updates=0,
+                 critic_ckpt=None, guidance_scale=0.0, best_of_n=1,
+                 guidance_ramp_updates=0, critic_ramp_baseline=None,
                  online_critic=False, train_critic_online=True,
                  critic_config=None, critic_seed=0,
                  collect_critic_obs=False, collect_siglip=True):
@@ -43,6 +43,18 @@ class PI0:
         self.guidance_scale_target = float(guidance_scale)
         self.guidance_ramp_updates = max(0, int(guidance_ramp_updates))
         self.current_guidance_scale = 0.0
+        # Best-of-N: draw this many candidate chunks per control step and execute the one the
+        # critic scores highest (`Pi0.sample_actions`). Independent of the gradient guidance --
+        # either, both or neither -- but it needs the same critic to rank with, so >1 also turns
+        # the critic path on (see deploy_policy.get_model). The candidates are extra batch
+        # elements in one sampler call, so the SigLIP tower and the prefix pass are still paid
+        # once; the denoising loop and the KV cache are what scale with N.
+        self.best_of_n = max(1, int(best_of_n or 1))
+        # The index the last control step's selection landed on and the ensemble-mean Q of every
+        # candidate it chose between, for the eval driver to log. None until a chunk is drawn,
+        # and always None at best_of_n 1 (there is nothing to select).
+        self.last_best_index = None
+        self.last_best_scores = None
         # Rollout-dataset collection: record the critic's model-space view of each control
         # step (see get_action / last_critic_obs). Independent of guidance.
         self.collect_critic_obs = bool(collect_critic_obs)
@@ -52,6 +64,13 @@ class PI0:
         # _siglip_views. Empty tuple = record none, and the state/action columns still go in.
         self.collect_siglip = self._siglip_views(collect_siglip) if self.collect_critic_obs else ()
         self.last_critic_obs = None
+        # Debug diagnostics: score each sampled chunk with the critic that steered it and keep
+        # the result in `last_q_values` (one entry per ensemble member) for the eval driver to
+        # plot. Off by default -- it is an extra critic forward per control step -- and turned
+        # on by `script/eval_policy.py` when the task config sets `debug: true` and a critic is
+        # actually running. Never affects sampling: it reads the chunk after it was drawn.
+        self.record_q_values = False
+        self.last_q_values = None
 
         config = _config.get_config(self.train_config_name)
         self.model_config = config.model
@@ -86,6 +105,14 @@ class PI0:
         self.critic_obs_extra = {}
         self._critic_extra_shapes = {}
         self._critic_updates_at_start = 0
+        # Where the ramp counts from, when the caller knows better than "wherever the
+        # checkpoint left off". Only `script/eval_policy.py` resuming an interrupted run does:
+        # it reloads that run's *own* critic as `critic_ckpt`, so re-basing at the restored
+        # counter would restart the ramp at 0 and re-ramp a critic the run had already ramped
+        # in. It passes the interrupted run's own baseline back instead. None = derive it from
+        # the checkpoint, which is right for every other warm start.
+        self._critic_ramp_baseline = (None if critic_ramp_baseline is None
+                                      else int(critic_ramp_baseline))
         self._critic_ckpt = critic_ckpt
         self._critic_config = dict(critic_config or {})
         self._critic_config["seed"] = critic_seed
@@ -198,8 +225,12 @@ class PI0:
         # A warm-started critic restores its lifetime update counter from the checkpoint (an
         # offline-trained one is in the hundreds/thousands), so the ramp has to be measured
         # against where *this* run started -- otherwise it reads as already finished and
-        # guidance jumps to the target on the very first chunk.
-        self._critic_updates_at_start = int(self.online_critic.num_updates)
+        # guidance jumps to the target on the very first chunk. The exception is a *resumed*
+        # run, whose checkpoint is its own earlier self: it hands its original baseline back
+        # (`critic_ramp_baseline`) so the ramp picks up where the interruption left it.
+        self._critic_updates_at_start = (int(self.online_critic.num_updates)
+                                         if self._critic_ramp_baseline is None
+                                         else self._critic_ramp_baseline)
 
         # A checkpoint's architecture keys override the caller's, so a critic whose shapes do not
         # match (wrong embodiment, wrong action horizon) loads "successfully" and then fails with
@@ -220,23 +251,57 @@ class PI0:
 
         self.policy._sample_kwargs.update({
             "critic_apply": self.online_critic.critic_apply,
-            "guidance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+            # A `None` guidance scale switches the value gradient off entirely, which is what a
+            # best-of-N-only run wants: with a traced 0.0 the sampler cannot tell "ramping in
+            # from zero" from "never steering", and would keep paying two extra forward passes
+            # per denoising step to multiply a gradient by zero. Nonzero targets keep the traced
+            # scalar so the ramp costs no recompile.
+            "guidance_scale": (jnp.asarray(0.0, dtype=jnp.float32)
+                               if self.guidance_scale_target != 0.0 else None),
+            "best_of_n": self.best_of_n,
             "critic_action_dim": self.critic_action_dim,
         })
         warm = (f"warm-started from {self._critic_ckpt} at "
-                f"{self._critic_updates_at_start} updates" if self._critic_ckpt else "from scratch")
-        ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
-                f"TD update), " if self.train_critic_online else "no ramp (frozen critic), ")
+                f"{int(self.online_critic.num_updates)} updates" if self._critic_ckpt
+                else "from scratch")
+        if not self.train_critic_online:
+            ramp = "no ramp (frozen critic), "
+        elif self._critic_ramp_baseline is None:
+            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
+                    f"TD update), ")
+        else:
+            # Resumed run: the ramp is already partway along, so say where it comes back at
+            # rather than implying it starts here.
+            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (resumed at update "
+                    f"{int(self.online_critic.num_updates) - self._critic_updates_at_start} of "
+                    f"the ramp -> guidance {self.scheduled_guidance_scale():.4g}), ")
         mode = "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
         unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
-        print(f"[pi_model] QMFM Value critic guidance enabled, critic {mode} ({warm}, "
-              f"guidance_scale_target={self.guidance_scale_target}, "
-              f"{ramp}"
+        if self.guidance_scale_target == 0.0:
+            # Best-of-N only: the sampler is the plain pi0.5 one and the critic never enters a
+            # gradient, it only ranks. Say so, rather than printing a guidance target of 0.
+            ramp = ""
+            steering = "no gradient guidance (guidance_scale 0), "
+        else:
+            steering = f"guidance_scale_target={self.guidance_scale_target}, "
+        select = (f"best-of-{self.best_of_n} (highest ensemble-mean Q per control step), "
+                  if self.best_of_n > 1 else "")
+        print(f"[pi_model] QMFM Value critic enabled, critic {mode} ({warm}, "
+              f"{steering}{select}{ramp}"
               f"num_qs={cc['num_qs']}, action chunk={chunk} "
               f"-> action_dim_flat={cc['action_dim_flat']})")
         print(f"[pi_model] critic observation: "
               + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
               + (f" (available but unused: {', '.join(unused)})" if unused else ""))
+
+    @property
+    def critic_ramp_baseline(self):
+        """The lifetime update count the guidance ramp is measured from.
+
+        Written into `resume_state.json` by the eval driver and handed back on resume, so the
+        ramp survives an interruption. 0 until the critic is built (see `_init_critic`).
+        """
+        return self._critic_updates_at_start
 
     def scheduled_guidance_scale(self):
         """Guidance ramps 0 -> target over the first `guidance_ramp_updates` TD updates.
@@ -249,6 +314,10 @@ class PI0:
         A frozen critic (`train_critic_online: false`) has no TD updates to count -- the ramp
         would pin guidance at 0 for the entire run -- so it guides at the target from the first
         chunk. Its values never move either, so there is nothing to ease into.
+
+        "This run" spans an interruption: a resumed run is the same run, and is handed the
+        original's baseline (`critic_ramp_baseline`), so the ramp continues from where it
+        stopped instead of dropping back to 0 for another `guidance_ramp_updates`.
         """
         if self.online_critic is None:
             return 0.0
@@ -342,9 +411,12 @@ class PI0:
             # call ramps guidance without compiling a sampler for each scalar value.
             self.current_guidance_scale = self.scheduled_guidance_scale()
             self.policy._sample_kwargs["critic_params"] = self.online_critic.params
-            self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
-                self.current_guidance_scale, dtype=jnp.float32
-            )
+            if self.guidance_scale_target != 0.0:
+                # Left at None for a best-of-N-only run -- see _init_critic. Writing a traced
+                # zero here would silently switch the (unused) guidance path back on.
+                self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
+                    self.current_guidance_scale, dtype=jnp.float32
+                )
             extra = self._critic_extra_obs()
             self.policy._sample_kwargs["critic_obs_extra"] = {
                 key: jnp.asarray(value)[None, ...] for key, value in extra.items()
@@ -355,11 +427,20 @@ class PI0:
             # skips this entirely -- nothing would ever train on the transitions, and the buffer
             # is allocated lazily, so it never costs the run any memory.
             out = self.policy.infer(self.observation_window)
+            critic_obs = {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra}
+            if self.best_of_n > 1:
+                # Which of the N candidates was executed, and what the critic scored all of them
+                # at. `critic_action` below is already the winner, so everything downstream --
+                # the replay transition, the Q log -- is about the chunk that actually ran.
+                self.last_best_index = int(out["critic_best_index"])
+                self.last_best_scores = np.asarray(out["critic_best_scores"], dtype=np.float32)
             if self.train_critic_online:
-                self.online_critic.stash(
-                    {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra},
-                    out["critic_action"],
-                )
+                self.online_critic.stash(critic_obs, out["critic_action"])
+            if self.record_q_values:
+                # The value the guidance was climbing, at the chunk it actually arrived at:
+                # `critic_action` is the normalized chunk the sampler scored (embodiment dims),
+                # and `critic_obs` the observation it scored it against.
+                self.last_q_values = self.online_critic.q_values(critic_obs, out["critic_action"])
             self._stash_critic_obs(out)
             return out["actions"]
         out = self.policy.infer(self.observation_window)

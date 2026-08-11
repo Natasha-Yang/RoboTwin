@@ -69,13 +69,20 @@ def get_model(usr_args):
     train_config_name, model_name, checkpoint_id, pi0_step = (usr_args["train_config_name"], usr_args["model_name"],
                                                               usr_args["checkpoint_id"], usr_args["pi0_step"])
     critic_ckpt = usr_args.get("critic_ckpt", None)
-    # `guidance_scale` is the single switch for the online critic path: 0 (the default) is
-    # plain pi0.5 sampling, anything else builds and TD-trains the online Value critic.
+    # `guidance_scale` and `best_of_n` are the two ways the critic can act on sampling, and
+    # either one on its own turns the critic path on: 0 / 1 is plain pi0.5 sampling, anything
+    # else builds and (by default) TD-trains the online Value critic.
     # Robust parse: `--overrides guidance_scale 0.3` eval()s to a float, but a malformed
     # value stays a string, which must not silently read as "guidance on".
     guidance_scale = float(usr_args.get("guidance_scale", 0.0) or 0.0)
     guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
-    online_critic = guidance_scale != 0.0
+    # Candidate chunks sampled per control step; the highest-Q one is executed. 1 = off.
+    best_of_n = int(usr_args.get("best_of_n", 1) or 1)
+    # Set only by eval_policy when it resumes an interrupted run: the update count that run's
+    # ramp was measured from, so the resumed critic comes back at the guidance it had reached
+    # instead of re-ramping from 0 against its own checkpoint. Not a user-facing config key.
+    critic_ramp_baseline = usr_args.get("critic_ramp_baseline")
+    online_critic = guidance_scale != 0.0 or best_of_n > 1
     # Whether that critic keeps learning during the rollouts. False freezes it at whatever
     # `critic_ckpt` holds: it still steers the sampler, but nothing is stashed into the replay
     # buffer and no TD update runs. Only meaningful when a critic exists at all.
@@ -105,6 +112,10 @@ def get_model(usr_args):
             "offline_mix", "train_online",
             # Train the value head only, keeping the checkpoint's observation encoder.
             "freeze_encoder",
+            # Set by eval_policy when it resumes a run: take Adam's moments and the LR
+            # schedule position from `critic_ckpt` too, rather than restarting the schedule
+            # at the bottom of warmup. Off for an ordinary warm start.
+            "restore_optimizer",
             # Which observation modalities the critic conditions on, and with what encoders.
             "encoder_modalities",
         )
@@ -113,7 +124,9 @@ def get_model(usr_args):
     critic_seed = usr_args.get("critic_seed", usr_args.get("seed", 0) or 0)
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
+               best_of_n=best_of_n,
                guidance_ramp_updates=guidance_ramp_updates,
+               critic_ramp_baseline=critic_ramp_baseline,
                online_critic=online_critic, train_critic_online=train_critic_online,
                critic_config=critic_config, critic_seed=critic_seed,
                collect_critic_obs=usr_args.get("collect_critic_obs", False),
