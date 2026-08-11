@@ -1,0 +1,487 @@
+"""Per-episode debug recorders for a policy rollout (task config `debug: true`).
+
+Each one collects a per-control-step trace and, at the end of an episode, renders it beside
+the rollout: `TCPWrenchRecorder` the end-effector contact wrench, `QValueRecorder` the critic's
+Q for the chunk the policy sampled, plotted against the return the episode actually realized.
+Both animate the same video, so the head-camera frames live once in `RolloutFrameLog`, and the
+matplotlib/GIF plumbing is shared below.
+
+`script/eval_policy.py` owns the driver half: it constructs these, feeds them one sample per
+control step (the wrench before the chunk runs, from `visualize_debug_obs`; the Q after, since
+the value does not exist until the chunk is drawn) and flushes them per episode into
+``<eval run>/debug_vis/episode<N>/``.
+
+matplotlib and PIL are imported inside the functions that need them, so a run with `debug`
+off never pays for them.
+"""
+
+from pathlib import Path
+
+import numpy as np
+
+from envs.utils.wrench import WRENCH_COMPONENTS, tcp_wrench_vector
+
+DEBUG_GIF_FRAME_WIDTH = 320  # rollout frames are downscaled to this before being kept in RAM
+DEBUG_GIF_FPS = 5
+DEBUG_GIF_MAX_FRAMES = 200  # long episodes are subsampled; the traces still cover every sample
+
+
+def agg_pyplot():
+    """matplotlib's pyplot on the Agg backend -- the debug outputs are always written to file."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def gif_frame_indices(count):
+    """Positions to animate: every sample, thinned to at most DEBUG_GIF_MAX_FRAMES."""
+    return range(0, count, max(1, -(-count // DEBUG_GIF_MAX_FRAMES)))
+
+
+def figure_to_image(fig):
+    from PIL import Image
+
+    fig.canvas.draw()
+    return Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3])
+
+
+def write_gif(path, images):
+    if not images:
+        return
+    images[0].save(path, save_all=True, append_images=images[1:],
+                   duration=int(1000 / DEBUG_GIF_FPS), loop=0)
+
+
+def padded_limits(*series, pad=0.08):
+    """Common y limits for a set of traces, with a little headroom (never a degenerate span)."""
+    vals = np.concatenate([np.asarray(s, dtype=np.float64).ravel() for s in series])
+    lo, hi = float(vals.min()), float(vals.max())
+    margin = max(hi - lo, 1e-6) * pad
+    return lo - margin, hi + margin
+
+
+class RolloutFrameLog:
+    """The head-camera frames the debug GIFs are drawn on, kept once for all of them.
+
+    Frames are keyed by sim step (`take_action_cnt`) rather than by position, so a recorder
+    that misses a sample -- the wrench one skips a step whose contact query raised -- still
+    lines its trace up with the right frame. ``record`` is idempotent per step, so every
+    recorder can call it and whichever runs first pays for the downscale.
+    """
+
+    def __init__(self):
+        self._reset()
+
+    def _reset(self):
+        self.frames = {}
+        self.scale = 1.0  # factor the most recent frame was downscaled by
+
+    def record(self, observation, step_idx):
+        """Keep this step's head-camera frame; returns the factor it was downscaled by.
+
+        None means the observation carries no head camera, i.e. there is nothing to draw the
+        traces beside -- the recorders then write their data files and skip the GIF.
+        """
+        if step_idx in self.frames:
+            return self.scale
+        rgb = observation.get("observation", {}).get("head_camera", {}).get("rgb", None)
+        if rgb is None:
+            return None
+        from PIL import Image
+
+        img = Image.fromarray(np.asarray(rgb, dtype=np.uint8))
+        scale = 1.0
+        if img.width > DEBUG_GIF_FRAME_WIDTH:  # keep the kept-in-RAM rollout small
+            scale = DEBUG_GIF_FRAME_WIDTH / img.width
+            img = img.resize((DEBUG_GIF_FRAME_WIDTH, max(1, round(img.height * scale))), Image.BILINEAR)
+        self.frames[step_idx] = np.asarray(img, dtype=np.uint8)
+        self.scale = scale
+        return scale
+
+    def frame(self, step_idx):
+        return self.frames.get(step_idx)
+
+    def flush(self):
+        """Drop the episode's frames. Called after every recorder has rendered its GIF."""
+        self._reset()
+
+
+WRENCH_AXIS_LENGTH = 0.08  # metres; length of the world frame arrows drawn on the rollout
+WRENCH_LABEL_OFFSET = 7  # points past the arrow tip, along the arrow, to place its label
+# One colour per axis, shared by the trace lines and the arrows drawn on the rollout, so the
+# x/y/z arrow and its Fx/Tx trace read as the same thing.
+WRENCH_AXIS_COLORS = ("tab:blue", "tab:orange", "tab:green")  # x, y, z
+
+
+class TCPWrenchRecorder:
+    """Per-episode TCP wrench log -> component histograms + a rollout/wrench GIF.
+
+    One sample is taken per policy call (the rate `visualize_debug_obs` is called at, i.e.
+    every `pi0_step` sim frames), paired with the head-camera frame from the same
+    observation. ``flush`` writes three files into the episode's own debug dir, alongside
+    the image/point-cloud dumps `visualize_debug_obs` puts there:
+    ``<debug_save_dir>/episode<N>/`` gets ``wrench_hist_episode<N>.png``,
+    ``wrench_episode<N>.gif`` and ``wrench_episode<N>.npz``.
+    """
+
+    def __init__(self, debug_save_dir, frame_log):
+        self.debug_save_dir = Path(debug_save_dir)
+        self.frame_log = frame_log
+        self._reset()
+
+    def episode_dir(self, episode_idx):
+        return self.debug_save_dir / f"episode{episode_idx}"
+
+    def _reset(self):
+        self.steps = []
+        self.wrench = {arm: [] for arm in ("left", "right")}
+        self.world_axes = {}  # sim step -> the projected triads for that step's frame
+
+    def record(self, task_env, observation, step_idx):
+        try:
+            wrench = tcp_wrench_vector(task_env)
+        except Exception as e:
+            print(f"[debug] TCP wrench sampling failed: {e}")
+            return
+        self.steps.append(step_idx)
+        for arm, vector in wrench.items():
+            self.wrench[arm].append(vector)
+
+        scale = self.frame_log.record(observation, step_idx)
+        if scale is not None:
+            self.world_axes[step_idx] = self._project_world_axes(task_env, observation, scale)
+
+    @staticmethod
+    def _project_world_axes(task_env, observation, scale):
+        """The world axes, anchored at each TCP, as head-camera pixels at the frame's scale.
+
+        The wrench is resolved in world axes, so those are what the rollout should show; they
+        are anchored at each arm's TCP because that is the point the wrench acts on (and it
+        keeps the triad in frame, unlike the world origin). Both triads therefore point the
+        same way and only their origins differ. Returns ``{arm: (origin_uv, tips_uv(3, 2))}``,
+        skipping an arm whose TCP is behind the camera; anything merely outside the image is
+        clipped when it is drawn.
+        """
+        cam = observation.get("observation", {}).get("head_camera", {})
+        if "intrinsic_cv" not in cam or "extrinsic_cv" not in cam:
+            return {}  # camera matrices missing: draw no axes rather than guess
+        K = np.asarray(cam["intrinsic_cv"], dtype=np.float64)
+        ext = np.asarray(cam["extrinsic_cv"], dtype=np.float64)[:3]  # world -> camera (OpenCV)
+
+        out = {}
+        for arm_tag in ("left", "right"):
+            origin = np.asarray(getattr(task_env.robot, f"get_{arm_tag}_tcp_pose")(), dtype=np.float64)[:3]
+            # (4, 3): origin, then the world x/y/z unit axes stepped out from it
+            pts_world = np.vstack([origin, origin + WRENCH_AXIS_LENGTH * np.eye(3)])
+            pts_cam = pts_world @ ext[:, :3].T + ext[:, 3]
+            if np.any(pts_cam[:, 2] <= 1e-6):  # at or behind the image plane: not projectable
+                continue
+            uv = (pts_cam @ K.T)[:, :2] / pts_cam[:, 2:3] * scale
+            out[arm_tag] = (uv[0], uv[1:])
+        return out
+
+    def flush(self, episode_idx):
+        """Render this episode's outputs and start a fresh episode. No-op with no samples."""
+        if not self.steps:
+            self._reset()
+            return
+        out_dir = self.episode_dir(episode_idx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        steps = np.asarray(self.steps)
+        series = {arm: np.asarray(vals) for arm, vals in self.wrench.items()}
+        try:
+            self._save_histograms(out_dir, episode_idx, series)
+            self._save_gif(out_dir, episode_idx, steps, series)
+            np.savez_compressed(
+                out_dir / f"wrench_episode{episode_idx}.npz",
+                step=steps,
+                components=np.array(WRENCH_COMPONENTS),
+                **{arm: vals for arm, vals in series.items()},
+            )
+            print(f"\033[93m[debug] wrench log written to {out_dir}/wrench_*\033[0m")
+        except Exception as e:
+            print(f"[debug] TCP wrench output failed: {e}")
+        self._reset()
+
+    def _save_histograms(self, out_dir, episode_idx, series):
+        """One histogram per wrench component, both arms overlaid."""
+        plt = agg_pyplot()
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+        for i, name in enumerate(WRENCH_COMPONENTS):
+            ax = axes[i // 3, i % 3]
+            for arm, color in (("left", "tab:blue"), ("right", "tab:orange")):
+                vals = series[arm][:, i]
+                ax.hist(vals, bins=40, alpha=0.55, color=color,
+                        label=f"{arm}: {vals.mean():+.3g} ± {vals.std():.3g}")
+            ax.set_xlabel(f"{name} [{'N' if i < 3 else 'N·m'}]")
+            ax.set_ylabel("policy calls")
+            # Most of an episode is free space, i.e. an exact zero; log counts keep the
+            # contact tail readable next to that spike.
+            ax.set_yscale("log")
+            ax.legend(fontsize="small")
+        fig.suptitle(f"episode {episode_idx} — TCP wrench distribution, world frame "
+                     f"({len(series['left'])} samples)")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"wrench_hist_episode{episode_idx}.png", dpi=100)
+        plt.close(fig)
+
+    def _draw_world_axes(self, ax, step_idx):
+        """Overlay the world frame on the rollout as labelled x/y/z arrows, one triad per TCP.
+
+        These are the axes the force and torque traces are resolved in: the Fx trace is the
+        contact force along this arrow, Tx the moment about it (taken about the TCP the triad
+        sits on).
+        """
+        import matplotlib.patheffects as pe
+
+        for arm_tag, (origin, tips) in self.world_axes.get(step_idx, {}).items():
+            for tip, label, color in zip(tips, "xyz", WRENCH_AXIS_COLORS):
+                ax.annotate("", xy=tip, xytext=origin, annotation_clip=True,
+                            arrowprops=dict(arrowstyle="-|>", color=color, linewidth=1.6,
+                                            shrinkA=0, shrinkB=0))
+                # Offset the label along its own arrow rather than a fixed direction: a world
+                # axis pointing near the camera projects short, and two such arrows can end up
+                # close together, so a fixed offset lets one arm's label drift onto its
+                # neighbour's arrow and read as swapped. (dy flips: image y grows downward,
+                # offset-point y grows upward.)
+                d = np.asarray(tip, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+                norm = float(np.linalg.norm(d)) or 1.0
+                ax.annotate(f"{arm_tag[0]}{label}", xy=tip,
+                            xytext=WRENCH_LABEL_OFFSET * d / norm * (1, -1), textcoords="offset points",
+                            ha="center", va="center",
+                            color=color, fontsize="x-small", fontweight="bold", annotation_clip=True,
+                            path_effects=[pe.withStroke(linewidth=1.6, foreground="black")])
+
+    def _save_gif(self, out_dir, episode_idx, steps, series):
+        """Rollout on the left, the wrench traces with a step cursor on the right."""
+        plt = agg_pyplot()
+
+        n = len(steps)
+        # Fixed limits across frames so only the cursor moves.
+        lims = {}
+        for row, sl in (("force", slice(0, 3)), ("torque", slice(3, 6))):
+            vals = np.concatenate([series[arm][:, sl].ravel() for arm in ("left", "right")])
+            span = max(float(np.abs(vals).max()), 1e-6) * 1.1
+            lims[row] = (-span, span)
+
+        gif_frames = []
+        for k in gif_frame_indices(n):
+            frame = self.frame_log.frame(steps[k])
+            if frame is None:  # no head camera on that step: nothing to animate against
+                continue
+            fig = plt.figure(figsize=(12, 5.5))
+            gs = fig.add_gridspec(2, 3, width_ratios=[1.6, 1, 1])
+            ax_img = fig.add_subplot(gs[:, 0])
+            ax_img.imshow(frame)
+            ax_img.axis("off")
+            ax_img.set_title(f"rollout — step {steps[k]}")
+            self._draw_world_axes(ax_img, steps[k])
+            for r, (row, sl) in enumerate((("force", slice(0, 3)), ("torque", slice(3, 6)))):
+                for c, arm in enumerate(("left", "right")):
+                    ax = fig.add_subplot(gs[r, c + 1])
+                    for j, comp in enumerate(WRENCH_COMPONENTS[sl]):
+                        ax.plot(steps, series[arm][:, sl][:, j], linewidth=1.0,
+                                color=WRENCH_AXIS_COLORS[j], label=comp)
+                    ax.axvline(steps[k], color="k", linewidth=1.2)
+                    ax.set_xlim(steps[0], max(steps[n - 1], steps[0] + 1))
+                    ax.set_ylim(*lims[row])
+                    if r == 0:  # units live on the y axis, so the title only names the arm
+                        ax.set_title(f"{arm} arm TCP (world frame)", fontsize="small")
+                    ax.set_xlabel("sim step", fontsize="x-small")
+                    ax.set_ylabel(f"{row} [{'N' if row == 'force' else 'N·m'}]", fontsize="x-small")
+                    ax.tick_params(labelsize="x-small")
+                    ax.legend(fontsize="xx-small", ncol=3, loc="upper right")
+            fig.tight_layout()
+            gif_frames.append(figure_to_image(fig))
+            plt.close(fig)
+
+        write_gif(out_dir / f"wrench_episode{episode_idx}.gif", gif_frames)
+
+
+class QValueRecorder:
+    """Per-episode critic Q log -> a trace plot, a rollout/Q GIF and the raw series.
+
+    Only meaningful when a critic is scoring the sampler's chunks (`guidance_scale != 0` or
+    `best_of_n > 1`); the driver builds one only then. Each control step contributes the
+    ensemble's Q for the chunk the policy just sampled -- the value the guidance was climbing
+    and/or best-of-N selected on, evaluated at the action it settled on -- plus the reward that
+    chunk earned and the guidance scale in force while it was drawn. ``flush`` writes
+    ``q_episode<N>.png``, ``q_episode<N>.gif`` and ``q_episode<N>.npz`` into the same
+    ``<debug_save_dir>/episode<N>/`` the wrench outputs and the image dumps go to.
+
+    Unlike the wrench, this is sampled *after* the control step: the value does not exist until
+    the policy has drawn the chunk it scores. The frame it is paired with is still the one the
+    chunk was drawn from -- the shared RolloutFrameLog is keyed by sim step, and this step's
+    frame was already captured by `visualize_debug_obs` before the action ran.
+
+    What the plots are for: Q predicts the discounted return still to come, so the realized
+    return-to-go is drawn against it. Q tracking that curve is a calibrated critic; a flat Q
+    means it is not distinguishing the states it is steering through, a persistent gap means it
+    is over- or under-valuing them, and an ensemble spread that stays wide means the members do
+    not agree on states the guidance is nevertheless following.
+    """
+
+    def __init__(self, debug_save_dir, frame_log):
+        self.debug_save_dir = Path(debug_save_dir)
+        self.frame_log = frame_log
+        # Q may be in the normalized return space an offline checkpoint was trained in; the
+        # plots undo that so Q and the realized return share units. Identity when the critic
+        # was trained online from scratch. `gamma_h` is the per-control-step discount
+        # (discount ** horizon), i.e. what the return-to-go must be summed with.
+        self.return_mean, self.return_std, self.gamma_h = 0.0, 1.0, 1.0
+        self._reset()
+
+    def episode_dir(self, episode_idx):
+        return self.debug_save_dir / f"episode{episode_idx}"
+
+    def _reset(self):
+        self.steps = []
+        self.q = []
+        self.rewards = []
+        self.guidance = []
+
+    def record(self, model, observation, step_idx, reward):
+        """Log the Q of the chunk that just executed. No-op until a critic has scored one.
+
+        ``model.last_q_values`` is written by the policy's own sampling path (pi05:
+        `PI0.get_action`, gated on `record_q_values`), so this stays a plain read -- it never
+        runs the critic itself, and a policy that does not expose one simply records nothing.
+        It is consumed here so a control step that somehow sampled no chunk cannot re-log the
+        previous step's value.
+        """
+        q = getattr(model, "last_q_values", None)
+        if q is None:
+            return
+        model.last_q_values = None
+        self.frame_log.record(observation, step_idx)
+        self.steps.append(step_idx)
+        self.q.append(np.asarray(q, dtype=np.float32).ravel())
+        self.rewards.append(float(reward))
+        self.guidance.append(float(model.scheduled_guidance_scale()))
+        critic = getattr(model, "online_critic", None)
+        if critic is not None:
+            self.return_mean = float(getattr(critic, "return_mean", 0.0))
+            self.return_std = float(getattr(critic, "return_std", 1.0))
+            self.gamma_h = float(getattr(critic, "gamma_h", 1.0))
+
+    def flush(self, episode_idx):
+        """Render this episode's outputs and start a fresh episode. No-op with no samples."""
+        if not self.steps:
+            self._reset()
+            return
+        out_dir = self.episode_dir(episode_idx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        steps = np.asarray(self.steps)
+        q = np.stack(self.q)  # (samples, num_qs), in the critic's own output space
+        rewards = np.asarray(self.rewards, dtype=np.float32)
+        guidance = np.asarray(self.guidance, dtype=np.float32)
+        # Both in return units, so they can share an axis.
+        q_return = q * self.return_std + self.return_mean
+        returns = self._return_to_go(rewards)
+        try:
+            self._save_plot(out_dir, episode_idx, steps, q_return, returns, rewards, guidance)
+            self._save_gif(out_dir, episode_idx, steps, q_return, returns, rewards)
+            np.savez_compressed(
+                out_dir / f"q_episode{episode_idx}.npz",
+                step=steps,
+                q=q,  # raw ensemble output, as the guidance sees it
+                reward=rewards,
+                guidance_scale=guidance,
+                return_to_go=returns,
+                return_mean=self.return_mean,
+                return_std=self.return_std,
+                gamma_h=self.gamma_h,
+            )
+            print(f"\033[93m[debug] critic Q log written to {out_dir}/q_*\033[0m")
+        except Exception as e:
+            print(f"[debug] critic Q output failed: {e}")
+        self._reset()
+
+    def _return_to_go(self, rewards):
+        """Realized discounted return from each control step on, at the critic's own discount.
+
+        The episode's own outcome, so a truncated episode's tail is genuinely short -- it is
+        what happened, not an estimate, which is the point of plotting it against Q.
+        """
+        out = np.zeros_like(rewards)
+        acc = 0.0
+        for i in range(len(rewards) - 1, -1, -1):
+            acc = rewards[i] + self.gamma_h * acc
+            out[i] = acc
+        return out
+
+    def _plot_traces(self, ax_q, ax_r, steps, q_return, returns, rewards, cursor=None):
+        """The two stacked panels both outputs share: Q vs realized return, then reward."""
+        q_mean = q_return.mean(axis=1)
+        ax_q.fill_between(steps, q_return.min(axis=1), q_return.max(axis=1),
+                          color="tab:blue", alpha=0.2, linewidth=0,
+                          label=f"ensemble range (n={q_return.shape[1]})")
+        ax_q.plot(steps, q_mean, color="tab:blue", linewidth=1.6, label="Q (ensemble mean)")
+        ax_q.plot(steps, returns, color="tab:red", linewidth=1.2, linestyle="--",
+                  label=f"realized return-to-go (γ={self.gamma_h:.4g})")
+        ax_q.set_ylabel("value [return units]", fontsize="x-small")
+        ax_q.legend(fontsize="xx-small", loc="upper left")
+
+        ax_r.plot(steps, rewards, color="tab:green", linewidth=1.0, drawstyle="steps-post",
+                  label="step reward")
+        ax_r.plot(steps, np.cumsum(rewards), color="tab:gray", linewidth=1.0,
+                  label="cumulative reward")
+        ax_r.set_ylabel("reward", fontsize="x-small")
+        ax_r.set_xlabel("sim step", fontsize="x-small")
+        ax_r.legend(fontsize="xx-small", loc="upper left")
+
+        for ax in (ax_q, ax_r):
+            ax.set_xlim(steps[0], max(steps[-1], steps[0] + 1))
+            ax.tick_params(labelsize="x-small")
+            if cursor is not None:
+                ax.axvline(cursor, color="k", linewidth=1.2)
+
+    def _save_plot(self, out_dir, episode_idx, steps, q_return, returns, rewards, guidance):
+        """The whole episode in one static figure (the GIF's right-hand column, no cursor)."""
+        plt = agg_pyplot()
+
+        fig, (ax_q, ax_r) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+        self._plot_traces(ax_q, ax_r, steps, q_return, returns, rewards)
+        norm = ("" if (self.return_mean, self.return_std) == (0.0, 1.0)
+                else f", un-normalized by ×{self.return_std:.4g}{self.return_mean:+.4g}")
+        fig.suptitle(f"episode {episode_idx} — critic Q along the rollout "
+                     f"({len(steps)} chunks, guidance {guidance.min():.3g}→{guidance.max():.3g}"
+                     f"{norm})")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"q_episode{episode_idx}.png", dpi=100)
+        plt.close(fig)
+
+    def _save_gif(self, out_dir, episode_idx, steps, q_return, returns, rewards):
+        """Rollout on the left, the Q and reward traces with a step cursor on the right."""
+        plt = agg_pyplot()
+
+        q_mean = q_return.mean(axis=1)
+        gif_frames = []
+        for k in gif_frame_indices(len(steps)):
+            frame = self.frame_log.frame(steps[k])
+            if frame is None:  # no head camera on that step: nothing to animate against
+                continue
+            # The rollout axis is aspect-locked, so the figure has to be tall enough to hold it
+            # plus its title -- tight_layout cannot shrink an image below its aspect ratio, and
+            # a short figure simply crops the title off the top.
+            fig = plt.figure(figsize=(11, 5.4))
+            gs = fig.add_gridspec(2, 2, width_ratios=[1.2, 1])
+            ax_img = fig.add_subplot(gs[:, 0])
+            ax_img.imshow(frame)
+            ax_img.axis("off")
+            ax_img.set_title(f"rollout — step {steps[k]}   "
+                             f"Q={q_mean[k]:+.3f}   r={rewards[k]:+.3f}")
+            ax_q = fig.add_subplot(gs[0, 1])
+            ax_r = fig.add_subplot(gs[1, 1], sharex=ax_q)
+            self._plot_traces(ax_q, ax_r, steps, q_return, returns, rewards, cursor=steps[k])
+            # Fixed limits across frames so only the cursor moves.
+            ax_q.set_ylim(*padded_limits(q_return, returns))
+            ax_r.set_ylim(*padded_limits(rewards, np.cumsum(rewards)))
+            fig.tight_layout()
+            gif_frames.append(figure_to_image(fig))
+            plt.close(fig)
+
+        write_gif(out_dir / f"q_episode{episode_idx}.gif", gif_frames)
