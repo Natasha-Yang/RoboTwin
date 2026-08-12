@@ -524,7 +524,10 @@ atomically. The json is the commit marker, so an interruption rewinds to the las
 completed all three; a csv row one ahead of it is trimmed on resume.
 
 `resume: true` (`deploy_policy.yml`) then continues the newest interrupted run for this
-task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one:
+task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one.
+`resume: "<run dir>"` names one specific run instead — needed when a second eval is writing into
+the same directory, since it rewrites its own `resume_state.json` every episode and so stays the
+"newest" one however long ago the run you meant stopped.
 
 | Restored | From | Why it cannot be recomputed |
 |---|---|---|
@@ -566,6 +569,23 @@ keeps its weights and optimizer but refills the buffer from empty and runs no TD
 `start_training` transitions are back in it.
 
 `_episode_results.csv` gained explicit `episode` and `seed` columns and lost its unnamed index.
+
+**A run started before this landed can still be resumed**, because its job log already recorded
+per episode everything `resume_state.json` holds: the `Success rate: <suc>/<test_num> … current
+seed: <n>` line is the episode counter, the success count and the seed, and the seeds that reach
+that print are exactly the ones the expert check accepted. `script/resume_state_from_log.py
+<slurm_log> <run_dir>` parses them back into a `resume_state.json` (and reconstructs
+`_episode_results.csv`), after which `resume` continues the run normally. Run it once the job has
+actually exited, and only for a run with **no critic** — a critic's weights are not in any log, so
+the reconstructed `chunk_count`/`critic_updates`/`critic_ramp_baseline` are zeros, true only when
+`guidance_scale` was 0 and `best_of_n` 1. Two of the columns are inexact and neither is load-bearing:
+`num_steps` is the last step the episode printed, and `reward` is recovered by inverting the printed
+moving average (`r_n = S_n - S_{n-1} + r_{n-window}`), which accumulates the print's 3-decimal
+rounding. The numpy RNG state is the one field genuinely not in the log, and it does not matter:
+`_init_task_env_` reseeds numpy from the episode's own seed at every `setup_demo`, so nothing
+downstream depends on the state the loop carried in. (The instruction is drawn by
+`generate_episode_descriptions` from the `random` module, which nothing seeds and
+`resume_state.json` does not carry — so instructions already differ across any resume.)
 
 Setting `debug: true` in the **task config** turns on extra per-episode diagnostics
 (`script/eval_policy.py::visualize_debug_obs`), all written into `debug_vis/episode<N>/`

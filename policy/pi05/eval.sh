@@ -48,6 +48,10 @@ overrides=()
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
+# Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
+# positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
+# without editing the yml (and so without steering a concurrent eval into that run's directory).
+[ "$#" -gt 11 ] && overrides+=("${@:12}")
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
