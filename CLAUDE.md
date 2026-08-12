@@ -474,7 +474,8 @@ Or directly on an `salloc`'d GPU node:
 ```bash
 cd policy/pi05
 bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
-             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n]
+             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n] \
+             [seed_list] [run_tag]
 # baseline (no critic guidance)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
 # online critic-guided
@@ -511,6 +512,41 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   this applies to the plain baseline too. `script/eval_policy.py::control_step_reward` is the one
   place it acts, so a guided run's TD targets and the printout agree by construction; the
   equivalent for a collected dataset's `reward` column is §6a, which is always shaped.
+
+#### Splitting one eval across parallel jobs
+
+A 100-episode eval is a 12-hour job, and it cannot be divided as it stands: the run *searches*
+for its seeds (from `100000 * (1 + seed)` upward, keeping the ones the expert solves), so which
+seeds it will use is not known until it has run them. `seed_list` (`deploy_policy.yml`, or
+`eval.sh`'s 12th arg) replaces that search with an explicit list — a file of one seed per line,
+or an inline comma-separated list — and `test_num` becomes its length. Seeds still go through
+the expert check (it produces the `episode_info` the instruction is drawn from), so a run can
+finish with slightly fewer episodes than seeds; `_result.txt` divides by the episodes that
+actually ran. `run_tag` (13th arg) adds a level above the run's timestamp in `eval_result/`,
+which is what stops concurrent shards from adopting each other's `resume_state.json` or
+overwriting each other's `online_value_critic.pkl`.
+
+`eval_tasks.sh` does this by default: `--shards N` (default **4**) cuts a per-task reference
+seed list — `eval_result/<task>/seed_<seed>_list.txt`, overridable with `--seed-list PATTERN`
+(`{task}` / `{seed}` are substituted) — into N contiguous chunks, writes them under
+`eval_result/<task>/seed_shards/<submit_time>/`, and submits one 3h job per chunk with
+`run_tag=shard<k>ofN`. `--shards 1` restores the old single 12h job with no seed list at all.
+Each shard opens its own W&B run, so the task's overall score is the concatenation of the four
+`_episode_results.csv` files. Note also that four 3h jobs are four queue waits in Killarney's
+`b1` band, which has measured *slower* to start than `b2` — see the time-band note at the top of
+`eval_tasks.sh`.
+
+**A critic that trains online cannot be sharded, and `eval_tasks.sh` refuses to submit one.**
+Sharding is N independent processes and the critic is per-process state: each shard would start
+from the same `critic_ckpt`, TD-train on its own quarter of the episodes, and write its own
+`online_value_critic.pkl` — N short TD runs rather than the one long one, with the guidance each
+shard applies diverging from the others partway through, so the shards would not be evaluating
+the same policy. A **frozen** critic shards fine (every shard steers with the identical
+checkpoint), so `--train-online false` — which needs a `critic_ckpt` — is the way to shard a
+guided eval; otherwise use `--shards 1`. The check resolves `train_online` exactly as
+`parse_args_and_config` does (CLI > `deploy_policy.yml` > `critic_config_path`), fires only when
+a critic actually runs (`guidance_scale != 0` or `best_of_n > 1`, since `train_online` is inert
+otherwise), and defaults to refusing when it cannot read those configs.
 
 #### Crash recovery
 

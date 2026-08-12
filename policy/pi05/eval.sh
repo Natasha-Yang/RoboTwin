@@ -21,6 +21,9 @@
 # success. Unlike the args above it applies to the baseline too (it is what the csv's per-episode
 # `reward` column and the W&B reward curves measure).
 # It defaults to whatever policy/pi05/deploy_policy.yml says; the 7th arg overrides it.
+# `seed_list` (12th arg) and `run_tag` (13th) are the sharding pair: the first pins the run to an
+# explicit list of seeds instead of the open-ended search upward from `seed`, the second gives it
+# its own result directory. `eval_tasks.sh --shards N` sets both.
 # The critic's own hyperparameters come from the `critic_config_path` file in that yml.
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
@@ -40,7 +43,7 @@ model_name=${4}
 seed=${5}
 gpu_id=${6}
 
-# Optional 7th..11th args override deploy_policy.yml. Omit them to take the yml's values;
+# Optional 7th..13th args override deploy_policy.yml. Omit them to take the yml's values;
 # pass `0` as guidance_scale and `1` as best_of_n to force the plain pi0.5 baseline.
 overrides=()
 [ -n "${7}" ] && overrides+=(--guidance_scale "${7}")          # target QMFM steering_coeff
@@ -48,6 +51,14 @@ overrides=()
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
+# Evaluate exactly the seeds in this file (one per line) instead of searching upward from
+# `seed` for `test_num` expert-solvable ones -- this is what makes an eval splittable across
+# jobs (eval_tasks.sh --shards N). Relative paths are resolved from the repo root, which is
+# where the python below runs.
+[ -n "${12}" ] && overrides+=(--seed_list "${12}")
+# An extra directory level above the run's timestamp, so parallel shards of one eval do not
+# share a result dir (nor each other's resume state / critic checkpoint).
+[ -n "${13}" ] && overrides+=(--run_tag "${13}")
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"

@@ -16,6 +16,23 @@ pi0_step: 10
 # Number of successful eval episodes to run.
 test_num: 100
 
+# ===== Splitting one eval across jobs =====
+# Normally the run searches for its own seeds: it starts at 100000*(1+seed) and walks upward,
+# keeping the ones the expert can solve, until it has `test_num` of them -- so it cannot be
+# divided up front, because which seeds those turn out to be is not known in advance.
+# `seed_list` replaces that search with an explicit list (a path to a file of one seed per line,
+# or an inline comma-separated list): the run evaluates exactly those, in order, and `test_num`
+# becomes however many there are. Seeds still go through the expert check -- it is what produces
+# the episode_info the language instruction is drawn from -- so a run can end with slightly fewer
+# episodes than seeds if one of them fails it there.
+# `run_tag` adds a directory level above the run's timestamp in eval_result/, which is what keeps
+# concurrent shards of one eval from adopting each other's resume state or overwriting each
+# other's critic checkpoint.
+# `eval_tasks.sh --shards N` sets both: it cuts a reference seed list into N chunks and submits a
+# job per chunk (eval.sh's 12th and 13th positional args).
+seed_list: null
+run_tag: null
+
 # ===== Crash recovery =====
 # Every finished episode is committed to the run directory as it completes: its row is appended
 # to _episode_results.csv, the online critic (params AND Adam state) is checkpointed, and

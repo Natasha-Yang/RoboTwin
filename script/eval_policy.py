@@ -135,6 +135,39 @@ def as_bool(value, default):
     raise ValueError(f"expected a boolean, got {value!r}")
 
 
+def load_seed_list(spec):
+    """The explicit seeds this run should evaluate, or None for the usual open-ended search.
+
+    Without it the loop starts at `st_seed` and walks upward until `test_num` seeds have passed
+    the expert check -- which is what makes a run indivisible: how far it has to walk is not
+    known in advance, so two runs cannot be given disjoint halves of the work. Handing it a
+    fixed list instead makes an eval shardable (`eval_tasks.sh --shards N` splits one reference
+    list across N jobs), at the cost of only ever visiting seeds someone already collected.
+
+    Accepts a path to a file of one seed per line (blank lines and `#` comments ignored), an
+    inline comma/whitespace-separated string, or an already-parsed list -- a CLI override
+    arrives as a string, the yml may give either.
+    """
+    if spec is None or spec == "" or spec is False:
+        return None
+    if isinstance(spec, (list, tuple)):
+        items = list(spec)
+    else:
+        text = str(spec)
+        path = Path(text)
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+        elif any(c in text for c in "/\\") or text.endswith(".txt"):
+            # A path-shaped spec that does not exist is a typo, not a one-element seed list.
+            raise FileNotFoundError(f"seed_list file not found: {text}")
+        items = [line.split("#", 1)[0] for line in text.replace(",", "\n").split("\n")]
+        items = [tok for line in items for tok in line.split()]
+    seeds = [int(item) for item in items]
+    if not seeds:
+        raise ValueError(f"seed_list is empty: {spec!r}")
+    return seeds
+
+
 def control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward=True):
     """Reward for the control step (action chunk) that just executed.
 
@@ -623,6 +656,14 @@ def main(usr_args):
     # the seed sequence all live in there and only mean anything together. With no such run (or
     # `resume: false`) this is an ordinary new run.
     run_root = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}")
+    # `run_tag` inserts one more level above the timestamp, so several runs of the same
+    # task/policy/config/checkpoint that are *not* the same experiment keep their results --
+    # and their resume state and critic checkpoints -- apart. `eval_tasks.sh --shards N` uses it
+    # to give each shard of a split seed list its own directory; without it, four shards running
+    # concurrently would all be candidates for each other's `find_resumable_run`.
+    run_tag = usr_args.get("run_tag")
+    if run_tag:
+        run_root = run_root / str(run_tag)
     resume_dir = find_resumable_run(run_root) if usr_args.get("resume", False) else None
     save_dir = resume_dir if resume_dir is not None else run_root / current_time
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -716,6 +757,17 @@ def main(usr_args):
     test_num = usr_args.get("test_num", 100)
     topk = 1
 
+    # An explicit seed list replaces both the starting point and the episode budget: the run
+    # evaluates exactly these seeds (in order) and stops when the list runs out, so `test_num`
+    # is however many it holds. Seeds still go through the expert check -- it is what produces
+    # the `episode_info` the language instruction is generated from -- and a seed that fails it
+    # here is skipped, which is why a shard can finish with slightly fewer episodes than seeds.
+    seed_list = load_seed_list(usr_args.get("seed_list"))
+    if seed_list is not None:
+        test_num = len(seed_list)
+        print(f"\033[95mSeed list:\033[0m {len(seed_list)} seed(s) from "
+              f"{usr_args['seed_list']} ({seed_list[0]}..{seed_list[-1]})")
+
     model = get_model(usr_args)
     # The policy decides whether guidance is on (pi05: guidance_scale != 0). The critic object
     # itself may not exist until the first observation (its shape depends on the embodiment),
@@ -735,17 +787,23 @@ def main(usr_args):
                                    video_size=video_size,
                                    instruction_type=instruction_type,
                                    wandb_run=wandb_run,
-                                   resume_state=resume_state)
+                                   resume_state=resume_state,
+                                   seed_list=seed_list)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
 
     file_path = save_dir / "_result.txt"
+    # Divide by the episodes that actually ran, not the budget: identical for an ordinary run
+    # (which stops exactly when it has `test_num` of them), but a seed-list run can come up
+    # short when one of its seeds fails the expert check, and scoring those as failures would
+    # understate the success rate.
+    episodes_run = max(len(episode_results["episode"]), 1)
     with file_path.open("w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
         # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        file.write("\n".join(map(str, np.array(suc_nums) / episodes_run)))
 
     # `_episode_results.csv` needs nothing here: the rollout appended each episode's row as it
     # finished, which is what makes an interrupted run salvageable.
@@ -780,7 +838,8 @@ def eval_policy(task_name,
                 video_size=None,
                 instruction_type=None,
                 wandb_run=None,
-                resume_state=None):
+                resume_state=None,
+                seed_list=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -798,7 +857,21 @@ def eval_policy(task_name,
     eval_func = eval_function_decorator(policy_name, "eval")
     reset_func = eval_function_decorator(policy_name, "reset_model")
 
-    now_seed = st_seed
+    # Where in the seed sequence the loop is. With no `seed_list` that sequence is open-ended
+    # (`now_seed` walks upward from `st_seed`) and the cursor is only bookkeeping; with one it
+    # is the index into the list, and the loop ends when it runs off the end.
+    seed_cursor = 0
+    now_seed = st_seed if seed_list is None else seed_list[0]
+
+    def advance_seed():
+        """Move on to the next seed -- after a finished episode or a rejected one alike."""
+        nonlocal seed_cursor, now_seed
+        seed_cursor += 1
+        if seed_list is None:
+            now_seed += 1
+        elif seed_cursor < len(seed_list):
+            now_seed = seed_list[seed_cursor]
+
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
 
@@ -882,6 +955,10 @@ def eval_policy(task_name,
         # rejects an unpredictable subset, so it cannot be recomputed -- only restored.
         now_id = resume_state["now_id"]
         now_seed = resume_state["now_seed"]
+        # A seed-list run is positioned by its cursor rather than by `now_seed` (the list need
+        # not be contiguous). State files written before the seed list existed carry no cursor,
+        # which is correct for them -- they can only be open-ended runs, where it is bookkeeping.
+        seed_cursor = resume_state.get("seed_cursor", 0)
         succ_seed = resume_state["episodes"]
         suc_test_seed_list = list(resume_state["suc_test_seed_list"])
         TASK_ENV.suc = resume_state["successes"]
@@ -898,8 +975,19 @@ def eval_policy(task_name,
         reward_window.extend(float(v) for v in episode_results["reward"][-ma_window:])
         print(f"\033[93m[resume] {len(past)} episode(s) reloaded, resuming at seed {now_seed} "
               f"({succ_seed}/{test_num} done)\033[0m")
+        if seed_list is not None and seed_cursor < len(seed_list) and seed_list[seed_cursor] != now_seed:
+            # The list is an argument, not part of the state, so a resume can be handed a
+            # different one than the run started with -- in which case the cursor points into
+            # the wrong sequence and the run would silently re-evaluate the wrong seeds.
+            raise ValueError(
+                f"seed_list does not match the interrupted run: resuming at cursor {seed_cursor} "
+                f"expects seed {now_seed}, but the list has {seed_list[seed_cursor]}")
 
     while succ_seed < test_num:
+        if seed_list is not None and seed_cursor >= len(seed_list):
+            print(f"\033[93mSeed list exhausted after {succ_seed}/{test_num} episode(s) "
+                  f"-- {len(seed_list) - succ_seed} seed(s) failed the expert check.\033[0m")
+            break
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
@@ -915,7 +1003,7 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                advance_seed()
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
@@ -925,7 +1013,7 @@ def eval_policy(task_name,
                 print(stack_trace)
                 print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                advance_seed()
                 args["render_freq"] = render_freq
                 print("error occurs !")
                 continue
@@ -934,7 +1022,7 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
-            now_seed += 1
+            advance_seed()
             args["render_freq"] = render_freq
             continue
 
@@ -1114,7 +1202,7 @@ def eval_policy(task_name,
             f"current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
-        now_seed += 1
+        advance_seed()
 
         # Commit the episode. Strict order: the row, then the critic, then the state that
         # asserts both are on disk (see the notes above `append_episode_row`). Everything
@@ -1145,6 +1233,8 @@ def eval_policy(task_name,
             "test_num": TASK_ENV.test_num,
             "now_id": now_id,
             "now_seed": now_seed,
+            # Position in an explicit `seed_list` (see `advance_seed`); 0 and unused otherwise.
+            "seed_cursor": seed_cursor,
             "chunk_count": chunk_count,
             "suc_test_seed_list": suc_test_seed_list,
             "numpy_random_state": numpy_random_state(),
