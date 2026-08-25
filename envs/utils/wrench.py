@@ -5,6 +5,8 @@ and by rollout-dataset collection (`script/collect_dataset.py`, one sample per p
 so both record the exact same quantity.
 """
 
+from collections import Counter
+
 import numpy as np
 
 # Component order of the flat (6,) vector `tcp_wrench_vector` returns.
@@ -13,8 +15,13 @@ WRENCH_COMPONENTS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 ARM_TAGS = ("left", "right")
 
 
-def _ee_link_ids(robot, arm_tag):
-    """Entity ids of the links that make up one arm's end-effector assembly.
+def _ee_links(robot, arm_tag):
+    """The links that make up one arm's end-effector assembly, in report order.
+
+    Returns ``[(link_name, entity_id), ...]`` — the gripper finger links (aloha: ``fl_link7``,
+    ``fl_link8``) plus any ``fix_gripper_name`` links. Matching is by ``entity.per_scene_id``
+    rather than by name, because a non-dual-arm embodiment loads the same URDF twice and the
+    two arms then carry identical link names on distinct entities.
     """
     entity = getattr(robot, f"{arm_tag}_entity")
     # get the child links of the ee joint (i.e. wrist link)
@@ -23,60 +30,109 @@ def _ee_link_ids(robot, arm_tag):
     links = []
     links += [joint.child_link for joint, _, _ in getattr(robot, f"{arm_tag}_gripper")]
     links += [entity.find_link_by_name(n) for n in getattr(robot, f"{arm_tag}_fix_gripper_name", [])]
-    # return the per_scene_id (a non-dual-arm embodiment loads the same URDF twice, so the two arms carry identical link names)
-    return {link.entity.per_scene_id for link in links if link is not None}
+    out, seen = [], set()
+    for link in links:
+        if link is None or link.entity.per_scene_id in seen:
+            continue
+        seen.add(link.entity.per_scene_id)
+        out.append((link.get_name(), link.entity.per_scene_id))
+    return out
 
 
-def compute_tcp_wrench(task_env):
-    """Net contact wrench on each arm's end effector, resolved in the **world** frame.
+def ee_link_labels(robot):
+    """Plot/column labels for every end-effector link: ``{arm_tag: [(label, entity_id), ...]}``.
+
+    The label is the URDF link name (``fl_link7``), which for a dual-arm URDF already names the
+    arm. When both arms carry the *same* name — the same single-arm URDF loaded twice — it is
+    prefixed with the arm tag (``left_link7``) so the two stay distinguishable in a legend or an
+    npz key.
+    """
+    per_arm = {arm: _ee_links(robot, arm) for arm in ARM_TAGS}
+    shared = {name for name, count in
+              Counter(name for links in per_arm.values() for name, _ in links).items() if count > 1}
+    return {arm: [(f"{arm}_{name}" if name in shared else name, link_id) for name, link_id in links]
+            for arm, links in per_arm.items()}
+
+
+def compute_link_wrench(task_env):
+    """Net contact wrench on each end-effector **link**, resolved in the **world** frame.
 
     SAPIEN reports per-contact-point *impulses* accumulated over the last physics step and
     applied to ``contact.bodies[0]``; dividing by the scene timestep turns them into the
-    average force over that step. Force is summed over every contact point on the
-    end-effector links and torque is taken about the TCP origin (``sum (p - p_tcp) x f``).
-    Only the moment arm is TCP-relative — the components themselves stay in world axes, so a
-    trace is comparable across steps even as the gripper rotates.
+    average force over that step. Force is summed over every contact point on the link, and
+    torque is taken about that arm's TCP origin (``sum (p - p_tcp) x f``) — the same reference
+    point for all of the arm's links, so the fingers are comparable with each other and with
+    their sum (`compute_tcp_wrench`, which is exactly this summed per arm). Only the moment arm
+    is TCP-relative — the components themselves stay in world axes, so a trace is comparable
+    across steps even as the gripper rotates.
 
-    Returns ``{"left": (force(3,), torque(3,)), "right": ...}`` in N and N*m. An arm touching
-    nothing reads as all zeros — free-space motion produces no wrench here, only contact does.
+    Returns ``{arm_tag: {link_label: (force(3,), torque(3,))}}`` in N and N*m, labelled by
+    `ee_link_labels`. A link touching nothing reads as all zeros — free-space motion produces no
+    wrench here, only contact does.
     """
     contacts = task_env.scene.get_contacts()
     dt = task_env.scene.get_timestep()
     robot = task_env.robot
     out = {}
-    for arm_tag in ARM_TAGS:
-        link_ids = _ee_link_ids(robot, arm_tag)
+    for arm_tag, links in ee_link_labels(robot).items():  # [fl_link7, fl_link8] or [fr_link7, fr_link8]
+        label_of = {link_id: label for label, link_id in links}
         tcp_p = np.asarray(getattr(robot, f"get_{arm_tag}_tcp_pose")(), dtype=np.float64)[:3]
-        force = np.zeros(3)
-        torque = np.zeros(3)
+        per_link = {label: (np.zeros(3), np.zeros(3)) for label, _ in links}
         for contact in contacts:
             ids = [body.entity.per_scene_id for body in contact.bodies]
             # impulses are applied to the first actor
-            if ids[0] in link_ids and ids[1] in link_ids:
+            if ids[0] in label_of and ids[1] in label_of:
                 continue  # self-contact inside the assembly: internal, cancels out
-            if ids[0] in link_ids:
-                sign = 1.0  # impulses applied on the robot
-            elif ids[1] in link_ids: # impulses applied to another object
-                sign = -1.0
+            if ids[0] in label_of:
+                label, sign = label_of[ids[0]], 1.0  # impulses applied on the robot
+            elif ids[1] in label_of: # impulses applied to another object
+                label, sign = label_of[ids[1]], -1.0
             else:
                 continue
+            force, torque = per_link[label]
             for point in contact.points:
                 f = sign * np.asarray(point.impulse, dtype=np.float64) / dt
                 force += f
                 torque += np.cross(np.asarray(point.position, dtype=np.float64) - tcp_p, f)
-        out[arm_tag] = (force, torque)
+        out[arm_tag] = per_link
     return out
+
+
+def compute_tcp_wrench(task_env):
+    """`compute_link_wrench` summed over each arm's links: the whole end effector's wrench.
+
+    Returns ``{"left": (force(3,), torque(3,)), "right": ...}`` in N and N*m, in the world frame
+    with torque about that arm's TCP. Summing is valid because every link of an arm already
+    shares that reference point.
+    """
+    return {arm: (np.sum([f for f, _ in per_link.values()] or [np.zeros(3)], axis=0),
+                  np.sum([t for _, t in per_link.values()] or [np.zeros(3)], axis=0))
+            for arm, per_link in compute_link_wrench(task_env).items()}
 
 
 def tcp_wrench_vector(task_env):
     """`compute_tcp_wrench` flattened to one ``(6,)`` vector per arm, in WRENCH_COMPONENTS order.
 
-    Returns ``{"left": (6,), "right": (6,)}`` — the layout both the debug ``.npz`` logs and the
-    rollout dataset's wrench columns store.
+    Returns ``{"left": (6,), "right": (6,)}`` — the layout the rollout dataset's wrench columns
+    and the critic's `wrench.*` modality store.
     """
     return {
         arm: np.concatenate([force, torque])
         for arm, (force, torque) in compute_tcp_wrench(task_env).items()
+    }
+
+
+def link_wrench_vector(task_env):
+    """`compute_link_wrench` flattened to one ``(6,)`` vector per link, in WRENCH_COMPONENTS order.
+
+    Returns ``{link_label: (6,)}`` over both arms, left arm's links first — the layout the debug
+    wrench plots and their ``.npz`` store, so a gripper's two fingers can be read apart instead
+    of only their sum.
+    """
+    return {
+        label: np.concatenate([force, torque])
+        for per_link in compute_link_wrench(task_env).values()
+        for label, (force, torque) in per_link.items()
     }
 
 

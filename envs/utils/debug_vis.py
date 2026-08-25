@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from envs.utils.wrench import WRENCH_COMPONENTS, tcp_wrench_vector
+from envs.utils.wrench import WRENCH_COMPONENTS, link_wrench_vector
 
 DEBUG_GIF_FRAME_WIDTH = 320  # rollout frames are downscaled to this before being kept in RAM
 DEBUG_GIF_FPS = 5
@@ -113,10 +113,19 @@ WRENCH_LABEL_OFFSET = 7  # points past the arrow tip, along the arrow, to place 
 # One colour per axis, shared by the trace lines and the arrows drawn on the rollout, so the
 # x/y/z arrow and its Fx/Tx trace read as the same thing.
 WRENCH_AXIS_COLORS = ("tab:blue", "tab:orange", "tab:green")  # x, y, z
+# One colour per end-effector link, in the order `link_wrench_vector` reports them (left arm's
+# links first): cool for the left gripper's fingers, warm for the right's.
+WRENCH_LINK_COLORS = ("tab:blue", "tab:cyan", "tab:orange", "tab:red",
+                      "tab:green", "tab:purple", "tab:brown", "tab:olive")
 
 
 class TCPWrenchRecorder:
-    """Per-episode TCP wrench log -> component histograms + a rollout/wrench GIF.
+    """Per-episode end-effector wrench log -> component histograms + a rollout/wrench GIF.
+
+    The wrench is kept **per gripper link** (aloha: ``fl_link7`` / ``fl_link8`` and
+    ``fr_link7`` / ``fr_link8``) rather than summed per arm, so a finger pushing against its
+    opposite -- forces that cancel in the arm total -- is still visible. Torque is about that
+    arm's TCP for all of its links, so the traces stay comparable across the fingers.
 
     One sample is taken per policy call (the rate `visualize_debug_obs` is called at, i.e.
     every `pi0_step` sim frames), paired with the head-camera frame from the same
@@ -136,18 +145,20 @@ class TCPWrenchRecorder:
 
     def _reset(self):
         self.steps = []
-        self.wrench = {arm: [] for arm in ("left", "right")}
+        # link label -> one (6,) sample per policy call. Filled on the first sample, since the
+        # links are the embodiment's and are not known before the env exists.
+        self.wrench = {}
         self.world_axes = {}  # sim step -> the projected triads for that step's frame
 
     def record(self, task_env, observation, step_idx):
         try:
-            wrench = tcp_wrench_vector(task_env)
+            wrench = link_wrench_vector(task_env)
         except Exception as e:
-            print(f"[debug] TCP wrench sampling failed: {e}")
+            print(f"[debug] end-effector wrench sampling failed: {e}")
             return
         self.steps.append(step_idx)
-        for arm, vector in wrench.items():
-            self.wrench[arm].append(vector)
+        for link, vector in wrench.items():
+            self.wrench.setdefault(link, []).append(vector)
 
         scale = self.frame_log.record(observation, step_idx)
         if scale is not None:
@@ -184,13 +195,13 @@ class TCPWrenchRecorder:
 
     def flush(self, episode_idx):
         """Render this episode's outputs and start a fresh episode. No-op with no samples."""
-        if not self.steps:
+        if not self.steps or not self.wrench:
             self._reset()
             return
         out_dir = self.episode_dir(episode_idx)
         out_dir.mkdir(parents=True, exist_ok=True)
         steps = np.asarray(self.steps)
-        series = {arm: np.asarray(vals) for arm, vals in self.wrench.items()}
+        series = {link: np.asarray(vals) for link, vals in self.wrench.items()}
         try:
             self._save_histograms(out_dir, episode_idx, series)
             self._save_gif(out_dir, episode_idx, steps, series)
@@ -198,32 +209,36 @@ class TCPWrenchRecorder:
                 out_dir / f"wrench_episode{episode_idx}.npz",
                 step=steps,
                 components=np.array(WRENCH_COMPONENTS),
-                **{arm: vals for arm, vals in series.items()},
+                links=np.array(list(series)),  # the order the colours/columns follow
+                **series,
             )
             print(f"\033[93m[debug] wrench log written to {out_dir}/wrench_*\033[0m")
         except Exception as e:
-            print(f"[debug] TCP wrench output failed: {e}")
+            print(f"[debug] end-effector wrench output failed: {e}")
         self._reset()
 
     def _save_histograms(self, out_dir, episode_idx, series):
-        """One histogram per wrench component, both arms overlaid."""
+        """One histogram per wrench component, every gripper link overlaid.
+
+        Outlined rather than filled: with a link per finger there are more series than the two
+        the filled bars stayed readable at.
+        """
         plt = agg_pyplot()
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 7))
         for i, name in enumerate(WRENCH_COMPONENTS):
             ax = axes[i // 3, i % 3]
-            for arm, color in (("left", "tab:blue"), ("right", "tab:orange")):
-                vals = series[arm][:, i]
-                ax.hist(vals, bins=40, alpha=0.55, color=color,
-                        label=f"{arm}: {vals.mean():+.3g} ± {vals.std():.3g}")
+            for (link, vals), color in zip(series.items(), WRENCH_LINK_COLORS):
+                ax.hist(vals[:, i], bins=40, histtype="step", linewidth=1.4, color=color,
+                        label=f"{link}: {vals[:, i].mean():+.3g} ± {vals[:, i].std():.3g}")
             ax.set_xlabel(f"{name} [{'N' if i < 3 else 'N·m'}]")
             ax.set_ylabel("policy calls")
             # Most of an episode is free space, i.e. an exact zero; log counts keep the
             # contact tail readable next to that spike.
             ax.set_yscale("log")
-            ax.legend(fontsize="small")
-        fig.suptitle(f"episode {episode_idx} — TCP wrench distribution, world frame "
-                     f"({len(series['left'])} samples)")
+            ax.legend(fontsize="x-small")
+        fig.suptitle(f"episode {episode_idx} — per-link contact wrench distribution, world frame "
+                     f"({len(next(iter(series.values())))} samples)")
         fig.tight_layout()
         fig.savefig(out_dir / f"wrench_hist_episode{episode_idx}.png", dpi=100)
         plt.close(fig)
@@ -256,14 +271,16 @@ class TCPWrenchRecorder:
                             path_effects=[pe.withStroke(linewidth=1.6, foreground="black")])
 
     def _save_gif(self, out_dir, episode_idx, steps, series):
-        """Rollout on the left, the wrench traces with a step cursor on the right."""
+        """Rollout on the left, one trace column per gripper link with a step cursor, right."""
         plt = agg_pyplot()
 
         n = len(steps)
-        # Fixed limits across frames so only the cursor moves.
+        links = list(series)
+        # Fixed limits across frames so only the cursor moves, and shared by every link so the
+        # columns can be read against each other.
         lims = {}
         for row, sl in (("force", slice(0, 3)), ("torque", slice(3, 6))):
-            vals = np.concatenate([series[arm][:, sl].ravel() for arm in ("left", "right")])
+            vals = np.concatenate([vals[:, sl].ravel() for vals in series.values()])
             span = max(float(np.abs(vals).max()), 1e-6) * 1.1
             lims[row] = (-span, span)
 
@@ -272,24 +289,27 @@ class TCPWrenchRecorder:
             frame = self.frame_log.frame(steps[k])
             if frame is None:  # no head camera on that step: nothing to animate against
                 continue
-            fig = plt.figure(figsize=(12, 5.5))
-            gs = fig.add_gridspec(2, 3, width_ratios=[1.6, 1, 1])
+            # The rollout keeps a fixed share of the figure; the width grows with the number of
+            # links so each column stays as wide as it was when there were two.
+            fig = plt.figure(figsize=(4.5 + 2.4 * len(links), 5.5))
+            gs = fig.add_gridspec(2, 1 + len(links), width_ratios=[1.6] + [1] * len(links))
             ax_img = fig.add_subplot(gs[:, 0])
             ax_img.imshow(frame)
             ax_img.axis("off")
             ax_img.set_title(f"rollout — step {steps[k]}")
             self._draw_world_axes(ax_img, steps[k])
             for r, (row, sl) in enumerate((("force", slice(0, 3)), ("torque", slice(3, 6)))):
-                for c, arm in enumerate(("left", "right")):
+                for c, link in enumerate(links):
                     ax = fig.add_subplot(gs[r, c + 1])
                     for j, comp in enumerate(WRENCH_COMPONENTS[sl]):
-                        ax.plot(steps, series[arm][:, sl][:, j], linewidth=1.0,
+                        ax.plot(steps, series[link][:, sl][:, j], linewidth=1.0,
                                 color=WRENCH_AXIS_COLORS[j], label=comp)
                     ax.axvline(steps[k], color="k", linewidth=1.2)
                     ax.set_xlim(steps[0], max(steps[n - 1], steps[0] + 1))
                     ax.set_ylim(*lims[row])
-                    if r == 0:  # units live on the y axis, so the title only names the arm
-                        ax.set_title(f"{arm} arm TCP (world frame)", fontsize="small")
+                    if r == 0:  # units live on the y axis, so the title only names the link
+                        ax.set_title(f"{link} (world frame)", fontsize="small",
+                                     color=WRENCH_LINK_COLORS[c % len(WRENCH_LINK_COLORS)])
                     ax.set_xlabel("sim step", fontsize="x-small")
                     ax.set_ylabel(f"{row} [{'N' if row == 'force' else 'N·m'}]", fontsize="x-small")
                     ax.tick_params(labelsize="x-small")
