@@ -593,9 +593,9 @@ under that same result dir:
 
 | Output | File (under `debug_vis/episode<N>/`) | Notes |
 |---|---|---|
-| TCP wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), left and right arm overlaid |
-| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); the wrench traces with a step cursor on the right |
-| Raw series | `wrench_episode<N>.npz` | `step`, `left`, `right` — `(num_samples, 6)` each |
+| Per-link wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), every gripper link overlaid (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) |
+| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); one trace column per gripper link with a step cursor on the right |
+| Raw series | `wrench_episode<N>.npz` | `step`, `components`, `links`, plus one `(num_samples, 6)` array per link name |
 | Critic Q trace | `q_episode<N>.png` | guided runs only (see below) |
 | Rollout + Q GIF | `q_episode<N>.gif` | head camera on the left, the Q and reward traces with a step cursor on the right |
 | Raw series | `q_episode<N>.npz` | `step`, `q` `(num_samples, num_qs)`, `reward`, `guidance_scale`, `return_to_go`, plus the scalars `return_mean` / `return_std` / `gamma_h` |
@@ -637,6 +637,14 @@ rollout dataset, for when you want the distribution over a whole run rather than
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
+The debug plots keep it **per link** (`link_wrench_vector`, one `(6,)` per gripper finger)
+rather than per arm, so a finger squeezing against its opposite — equal and opposite forces
+that cancel in the arm total — is still visible. `compute_tcp_wrench` is that same
+decomposition summed over each arm's links, which is what the dataset's
+`observation.wrench.{left,right}` columns and the critic's `wrench.*` modality still store
+(§5a, §6a): those shapes are baked into collected datasets and critic checkpoints, so only the
+plots split by link.
+
 The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
 `guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
 writes none. Each row
