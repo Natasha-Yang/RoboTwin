@@ -32,12 +32,45 @@ try:
 
         return sampled_points, indices
 
-except:
-    print("missing pytorch3d")
+except Exception as _pytorch3d_err:
+    # pytorch3d is a compiled extension pinned to a torch ABI, so it is routinely absent
+    # (no wheels are published, and this repo runs two envs on different torch versions --
+    # see CLAUDE.md §8). It is used for exactly one thing: farthest-point sampling in
+    # get_pcd(). The previous fallback called exit(), which killed the whole collection
+    # worker with a one-line message the moment a config set pcd_down_sample_num > 0.
+    # A pure-torch FPS costs nothing to ship and keeps that path working, so the import
+    # is now a real fallback rather than a landmine.
+    print(f"missing pytorch3d ({type(_pytorch3d_err).__name__}); using the built-in "
+          "farthest-point sampler")
 
     def fps(points, num_points=1024, use_cuda=True):
-        print("fps error: missing pytorch3d")
-        exit()
+        """Farthest-point sampling, matching pytorch3d's sample_farthest_points contract.
+
+        Returns `(sampled_points, indices)` where `sampled_points` is an `(K, 3)` numpy
+        array and `indices` is a **torch** tensor of shape `(1, K)` -- get_pcd() does
+        `index.detach().cpu().numpy()[0]` on it, so the leading batch dim must be there.
+        Seeds from index 0, which is what pytorch3d does at its default
+        `random_start_point=False`; that keeps a seeded run reproducible.
+        """
+        pts = torch.from_numpy(np.ascontiguousarray(points)).float()
+        if use_cuda and torch.cuda.is_available():
+            pts = pts.cuda()
+
+        n = pts.shape[0]
+        k = min(int(num_points), n)
+        idx = torch.zeros(k, dtype=torch.long, device=pts.device)
+        # Squared distance from each point to the nearest already-selected point.
+        nearest = torch.full((n, ), float("inf"), device=pts.device)
+        far = torch.zeros((), dtype=torch.long, device=pts.device)
+
+        for i in range(k):
+            idx[i] = far
+            # Keep `far` a device tensor rather than a python int: reading it back each
+            # iteration would force k GPU syncs per call, and get_pcd() runs every step.
+            nearest = torch.minimum(nearest, ((pts - pts[far])**2).sum(-1))
+            far = torch.argmax(nearest)
+
+        return pts[idx].cpu().numpy(), idx.unsqueeze(0)
 
 
 class Camera:

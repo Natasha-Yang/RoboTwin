@@ -963,10 +963,10 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
 
 Everything **beyond** rgb + qpos is decided by the **task config**, not by `collect_dataset.yml`:
 whatever its `data_type` block turns on reaches `envs/_base_task.py::get_obs`, and
-`extra_obs_columns` records all of it (§7b). The configs that ship here (`demo_clean`,
-`demo_clean_25`, `demo_randomized`) enable only rgb + endpose + qpos + wrench, so they yield
-just the columns in §7a's table; a privileged config that also turns on depth / pointcloud /
-segmentation roughly doubles the bytes per row.
+`extra_obs_columns` records all of it (§7b). `demo_clean` and `demo_randomized` enable only
+rgb + endpose + qpos + wrench, so they yield just the columns in §7a's table;
+**`demo_clean_multimodal` additionally turns on depth + pointcloud**, which roughly doubles the
+bytes per row (and is the config that makes `camera.py`'s FPS path live — see §8).
 
 Each episode is flushed to its own shard in `<output_dir>/<task>/<config>/<ckpt>_shards` the
 moment it finishes, and the shards are memory-mapped and concatenated into the final dataset at
@@ -1084,10 +1084,12 @@ modality unavailable, §6.2). What differs between the drivers is only *where* t
 ### 7b. Extra data types (privileged task configs)
 
 `script/collect_dataset.py::extra_obs_columns` records everything else the observation carries,
-so the dataset follows the task config's `data_type` block automatically. **No privileged config
-ships in this fork** — make one with `bash task_config/create_task_config.sh <name>` and turn on
-`depth` / `pointcloud` / `third_view` / `mesh_segmentation` / `actor_segmentation`. With all of
-them on, a row gains, per camera `<cam>` ∈ `head` / `left_wrist` / `right_wrist`:
+so the dataset follows the task config's `data_type` block automatically. The one privileged
+config that ships here is **`demo_clean_multimodal`** (`demo_clean` plus `depth` + `pointcloud`
+at `pcd_down_sample_num: 1024`, and `episode_num: 10`); for the rest, make one with
+`bash task_config/create_task_config.sh <name>` and turn on `depth` / `pointcloud` /
+`third_view` / `mesh_segmentation` / `actor_segmentation`. With all of them on, a row gains, per
+camera `<cam>` ∈ `head` / `left_wrist` / `right_wrist`:
 
 | Column | Type | Shape |
 |---|---|---|
@@ -1144,19 +1146,30 @@ Notes:
 - **Offline compute nodes**: pre-download HF checkpoints/assets and set `HF_HOME` on
   the login node; only *record* rollouts on the compute node, build/push datasets on
   the login node.
-- **pytorch3d is needed only for point clouds — and on Killarney it is installed in
-  *neither* env.** `fps` in `envs/camera/camera.py` (point-cloud downsampling) imports a
-  compiled `_C.so` pinned to a torch ABI, and the two envs run different torch (conda
-  RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you do need it, **both** need
-  their own build — collection runs in the first, eval/rollout-collection in the second.
-  But `fps` is only reached from `camera.py`'s point-cloud path behind
-  `pcd_down_sample_num > 0`, and every task config that ships here sets
-  `data_type.pointcloud: false`, so nothing calls it and its absence is harmless. Two
-  traps if you *do* enable `pointcloud`:
-  - the fallback does **not** degrade gracefully — it prints `fps error: missing
-    pytorch3d` and calls `exit()`, killing the run;
-  - `camera.py` swallows a torch-ABI mismatch in a bare `except:` and prints the same
-    `missing pytorch3d` message, so don't read that as "not installed".
+- **pytorch3d is used for point clouds only, is installed in *neither* env on Killarney,
+  and no longer needs to be.** `fps` in `envs/camera/camera.py` (point-cloud
+  downsampling, reached from `get_pcd` behind `pcd_down_sample_num > 0`) used to import
+  pytorch3d's `sample_farthest_points`; that import is a compiled `_C.so` pinned to a
+  torch ABI, and the two envs run different torch (conda RoboTwin = 2.4.1,
+  `policy/pi05/.venv` = 2.7.0), so satisfying it meant **two** separate source builds —
+  there are no pytorch3d wheels on PyPI at all. `camera.py` now ships a **pure-torch FPS
+  fallback** instead, so the point-cloud path works in both envs with nothing to compile.
+  Notes:
+  - The fallback matches pytorch3d's contract exactly: it returns `(sampled_points,
+    indices)` with `indices` a torch tensor of shape `(1, K)` (`get_pcd` does
+    `index.detach().cpu().numpy()[0]`), and seeds from index 0 the way pytorch3d does at
+    its default `random_start_point=False`, so a seeded run stays reproducible.
+  - It runs on the GPU when one is available and keeps the running argmax on-device, so
+    it costs no per-iteration host sync — `get_pcd` runs every saved frame.
+  - Before this, the fallback printed `fps error: missing pytorch3d` and called `exit()`,
+    silently killing the whole collection worker the moment a config set
+    `pcd_down_sample_num > 0`. `demo_clean_multimodal` is such a config
+    (`pointcloud: true`, `pcd_down_sample_num: 1024`), so this was a live landmine, not a
+    hypothetical one.
+  - If you install pytorch3d anyway it still wins — the `try:` branch is unchanged. But
+    `camera.py` swallows a torch-ABI mismatch in that same `except:`, so a "missing
+    pytorch3d" message can mean "installed, wrong ABI" rather than "absent"; the message
+    now names the exception type to tell those apart.
   (The `fps` call higher up in `get_pcd` is dead code — an unconditional `return`
   precedes it.)
 - **curobo must be built into BOTH envs — eval will not even import without it.**

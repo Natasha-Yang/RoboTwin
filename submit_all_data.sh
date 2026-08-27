@@ -5,12 +5,13 @@
 # tasks. Two execution modes:
 #
 #   parallel (default): the batch runs as many tasks concurrently as fit on its
-#             single allocated L40S. RoboTwin's render load is tiny (3 D435
-#             cameras, 320x240 RGB, ~2-4 GB VRAM), so the binding limit is CPU,
-#             not the GPU. A Killarney L40S node has 64 CPUs / 4 L40S -> 16 cores
-#             per GPU, and each worker needs ~3, so the job packs 16/3 = 5 workers
-#             onto the GPU and requests that GPU's full CPU/RAM fair share
-#             (overriding cluster/robotwin_gpu.sh's defaults).
+#             single allocated L40S. The binding limit is CPU: a Killarney L40S
+#             node has 64 CPUs / 4 L40S -> 16 cores per GPU, and each worker needs
+#             ~3, so the job packs 16/3 = 5 workers onto the GPU and requests that
+#             GPU's full CPU/RAM fair share (overriding cluster/robotwin_gpu.sh's
+#             defaults). VRAM is close behind though -- a measured 6.0 GB/worker
+#             on the heaviest config caps the card at ~6 -- so both bounds are
+#             computed below and the smaller wins.
 #   sequential (--sequential): the batch runs its tasks one after another on the
 #             GPU, using the job's default CPU/RAM request.
 #
@@ -34,13 +35,35 @@ set -euo pipefail
 shopt -s nullglob
 
 # --- how many workers fit on one L40S ---
-# Killarney L40S node = 64 CPUs / 4 GPUs -> 16 cores/GPU fair share; collection is
-# CPU-bound (curobo planning + PhysX), ~3 cores/worker. VRAM/RAM are not the
-# limit (~2-4 GB VRAM, ~6 GB RAM per worker on a 48 GB / ~128 GB-per-GPU node).
-cpus_per_gpu=16
-cpus_per_worker=3
-mem_per_worker_gb=12
-workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 5
+# Killarney L40S node = 64 CPUs / 4 GPUs / 515 GB -> a per-GPU fair share of 16
+# cores and ~128 GB. Collection is CPU-bound (curobo planning + PhysX, ~3
+# cores/worker), so CPU is what binds: 16/3 = 5 workers. Staying inside the fair
+# share matters -- requesting more CPUs than that on a 1-GPU job strands the
+# node's other three GPUs, which cannot be scheduled once the cores are gone.
+#
+# MEASURED on kn023, 5 concurrent demo_clean_multimodal workers (logs/sizing,
+# probe job 5042967) -- rgb + depth + pointcloud + wrench, the heaviest config
+# that ships:
+#   L40S total VRAM   46068 MiB (45.0 GB)
+#   peak per worker    6164 MiB ( 6.02 GB)   <- OptiX ray tracing, NOT ~2-4 GB
+#   peak GPU used     30750 MiB (30.0 GB)    <- 5 workers, 15 GB spare
+#   peak host RSS      24.3 GB               <- ~4.9 GB/worker
+# So VRAM is not the binding limit at 5, but it is much closer than the old
+# "~2-4 GB, not the limit" comment implied: the ceiling is ~6 workers, not ~11.
+# The guard below makes that explicit so raising CPUS_PER_GPU cannot silently
+# over-pack the card -- 8 workers would want ~48 GB on a 45 GB GPU and OOM the
+# renderer (cudaErrorMemoryAllocation / OptiX error).
+cpus_per_gpu=${CPUS_PER_GPU:-16}                 # per-GPU CPU fair share
+cpus_per_worker=${CPUS_PER_WORKER:-3}
+mem_per_worker_gb=${MEM_PER_WORKER_GB:-12}       # measured ~4.9 GB; 12 leaves room
+vram_gb_per_worker=${VRAM_GB_PER_WORKER:-7}      # measured 6.02 GB peak, round up
+gpu_vram_gb=${GPU_VRAM_GB:-45}                   # L40S usable (46068 MiB)
+
+# workers/GPU = min(CPU-bound, VRAM-bound). Defaults -> min(16/3, 41/7) = min(5, 5) = 5.
+workers_by_cpu=$(( cpus_per_gpu / cpus_per_worker ))
+workers_by_vram=$(( (gpu_vram_gb - 4) / vram_gb_per_worker ))   # -4 GB driver/headroom
+workers=$(( workers_by_cpu < workers_by_vram ? workers_by_cpu : workers_by_vram ))
+(( workers < 1 )) && workers=1
 
 # --- parse args (positional task_config, optional num_batches, mode flag) ---
 task_config=""
