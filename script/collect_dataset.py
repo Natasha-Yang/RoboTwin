@@ -59,18 +59,21 @@ import yaml
 
 
 def wrench_columns(step_wrench, num_steps):
-    """Per-arm end-effector contact wrench, one sample per primitive step since the last row.
+    """Per-link end-effector contact wrench, one sample per primitive step since the last row.
 
     `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
-    `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame. It
-    comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use -- the
-    only difference is the rate: `eval_policy.py` samples once per policy call, here every step
-    in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
+    `{link_label: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world
+    frame. It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots
+    use -- the only difference is the rate: `eval_policy.py` samples once per policy call, here
+    every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
     fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online view
     of the same modality (`envs/utils/obs_modalities.py`).
     """
-    return {f"observation.wrench.{arm}": samples
-            for arm, samples in stack_step_wrench(step_wrench, num_steps).items()}
+    # One column per gripper link (aloha: `observation.wrench.fl_link7`, `.fl_link8`,
+    # `.fr_link7`, `.fr_link8`) rather than one per arm, because two fingers squeezing the same
+    # object exert equal and opposite forces that cancel in an arm-level sum.
+    return {f"observation.wrench.{link}": samples
+            for link, samples in stack_step_wrench(step_wrench, num_steps).items()}
 
 
 def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):

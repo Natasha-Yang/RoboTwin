@@ -298,6 +298,44 @@ Logs land in `logs/data_collection/`. **Fir-specific:** it pins collection to
 `render_nodes=fc10508,fc10519,fc10604,fc10612` (the nodes whose Vulkan works) —
 change or drop this on another cluster (see §0.5).
 
+### 3.4 What ends up in the demo HDF5
+
+The per-episode HDF5 mirrors whatever `get_obs` returned, so the task config's `data_type`
+block decides its columns (`envs/utils/pkl2hdf5.py` infers the layout from the first frame —
+nothing is enumerated per data type). One row per saved frame, i.e. every `save_freq` physics
+steps. `rgb: true` / `depth` / `pointcloud` / `endpose` / `qpos` / the segmentations all flow
+through that path automatically.
+
+**SigLIP features are not collected here and cannot be.** They are π0.5's own image-tower
+output, so they exist only where a policy is loaded — that is `script/collect_dataset.py`
+(§7), not `script/collect_data.py`. They are also the single most expensive column in that
+pipeline (~576 KB/row per view).
+
+**The contact wrench is the one exception to the `get_obs` rule**, because contacts are a scene
+query rather than an observation. With `data_type.wrench: true`:
+
+| HDF5 path | Shape | Contents |
+|---|---|---|
+| `wrench/<link>` | `(num_frames, save_freq, 6)` float32 | one group member per end-effector link — aloha gives `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8` |
+
+Per **link**, not summed per arm (§6.2). Each row is the trace of the `save_freq` primitive
+steps that led up to that frame, one `[Fx, Fy, Fz, Tx, Ty, Tz]` sample per step, world frame,
+torque about that arm's TCP. `_base_task._log_step_wrench` samples after every `scene.step()` of
+`take_dense_action` / `together_move_to_pose`, and `_take_picture` drains the log while building
+the frame — so this is exactly the `pi0_step`-rate column §7a records, at the demo cadence.
+Short traces are **NaN**-padded (zero is a meaningful reading): a motion segment's first frame
+has no steps behind it and carries a single sample of the contact state at that instant, its
+last frame carries however many steps ran since the previous one.
+
+Two consequences worth knowing:
+
+- Logging is gated on `save_data`, so it costs nothing during the seed-search phase, whose
+  trajectories are thrown away. It does add a `scene.get_contacts()` scan to **every** physics
+  step of the replay phase, which is not free on a CPU-bound collection run — turn
+  `data_type.wrench` off if you don't want the columns.
+- A config with `save_freq: null` has no frame cadence to stack against, so the wrench is left
+  out rather than stored ragged.
+
 ---
 
 ## 4. Building a LeRobot dataset (for fine-tuning)
@@ -637,13 +675,19 @@ rollout dataset, for when you want the distribution over a whole run rather than
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
-The debug plots keep it **per link** (`link_wrench_vector`, one `(6,)` per gripper finger)
-rather than per arm, so a finger squeezing against its opposite — equal and opposite forces
-that cancel in the arm total — is still visible. `compute_tcp_wrench` is that same
-decomposition summed over each arm's links, which is what the dataset's
-`observation.wrench.{left,right}` columns and the critic's `wrench.*` modality still store
-(§5a, §6a): those shapes are baked into collected datasets and critic checkpoints, so only the
-plots split by link.
+Everything that records the wrench keeps it **per link** (`link_wrench_vector`, one `(6,)`
+per gripper finger) rather than per arm, so a finger squeezing against its opposite — equal and
+opposite forces that cancel in the arm total — is still visible. That is the debug plots, the
+demo HDF5's `wrench/<link>` groups (§3.4), the rollout dataset's `observation.wrench.<link>`
+columns (§7a) and the critic's `wrench.<link>` modality alike. `compute_tcp_wrench` /
+`tcp_wrench_vector` are that same decomposition summed per arm; nothing on the recording path
+calls them any more, they are kept as the arm-level summary for analysis.
+
+> **Breaking change (2026-08-26).** The per-arm `wrench.left` / `wrench.right` modality and the
+> `observation.wrench.{left,right}` dataset columns are gone, replaced by one per link. A critic
+> checkpoint trained on the old names will not load against the new `encoder_modalities`, and a
+> rollout dataset collected before this date has the old two columns — retrain, or sum the link
+> columns back into two if you need the old shape.
 
 The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
 `guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
@@ -809,7 +853,7 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.{left,right}` | per-step contact wrench, logged by the env | `(pi0_step, 6)` |
+| `wrench.<link>` | per-step contact wrench, one modality per gripper link (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`), logged by the env | `(pi0_step, 6)` each |
 
 The names are the §7a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -940,7 +984,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.{left,right}` | world-frame TCP contact wrench, one row per executed step | `(pi0_step, 6)` |
+| `observation.wrench.<link>` | world-frame contact wrench per gripper link, one row per executed step | `(pi0_step, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
@@ -977,10 +1021,12 @@ siglip.right_wrist]` at them and skip that pass entirely. At ~576 KB/row **each*
 dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well as
 `true`/`false`, and dropping the wrists is the cheapest way to shrink a run.
 
-`observation.wrench.left` / `.right` are the **same quantity** §6.1's debug GIF plots — net contact
-wrench on that arm's end-effector links, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
-about the TCP — computed by the shared `envs/utils/wrench.py::tcp_wrench_vector` so the eval and
-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
+`observation.wrench.<link>` — one column per gripper link (aloha: `fl_link7`, `fl_link8`,
+`fr_link7`, `fr_link8`) — is the **same quantity** §6.1's debug GIF plots draw: net contact
+wrench on that link, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque about that arm's TCP
+(the same reference point for all of an arm's links, so they stay comparable with each other and
+with their sum). Computed by the shared `envs/utils/wrench.py::link_wrench_vector`, so the eval,
+demo-collection and rollout-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
 call, while collection samples after **every** primitive step, so a row carries a whole
 `(pi0_step, 6)` trace rather than a single vector.
 
@@ -1023,7 +1069,8 @@ flag itself: contacts are a scene query, not part of `get_obs`. So each driver r
 `data_type.wrench` and passes `record_step_wrench` into the env — `collect_data.py`,
 `collect_dataset.py` and `eval_policy.py` all do, and nothing logs a wrench with the flag off.
 Turning it off drops these columns from the dataset entirely (and makes a `wrench.*` critic
-modality unavailable, §6.2).
+modality unavailable, §6.2). What differs between the drivers is only *where* the log is drained
+— see §3.4 for the expert-demo path.
 
 
 ### 7b. Extra data types (privileged task configs)
