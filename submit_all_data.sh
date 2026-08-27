@@ -5,15 +5,12 @@
 # tasks. Two execution modes:
 #
 #   parallel (default): the batch runs as many tasks concurrently as fit on its
-#             single allocated H100. Each worker ray-traces 3 D435 views via
-#             OptiX and uses ~6.5-7.5 GB VRAM, so on an 80 GB H100 VRAM and CPU
-#             are BOTH real binding limits (~9 workers). We pack workers onto ONE
-#             GPU and request the CPUs/RAM to match (overriding
-#             cluster/robotwin_gpu.sh's defaults). Packing hard means the SAME
-#             worker throughput ties up FAR FEWER GPUs (a GPU running only a few
-#             workers is ~90% idle on VRAM), which cuts queue time. Tune the
-#             per-GPU worker count with the CPUS_PER_GPU / *_PER_WORKER env vars
-#             below.
+#             single allocated L40S. RoboTwin's render load is tiny (3 D435
+#             cameras, 320x240 RGB, ~2-4 GB VRAM), so the binding limit is CPU,
+#             not the GPU. A Killarney L40S node has 64 CPUs / 4 L40S -> 16 cores
+#             per GPU, and each worker needs ~3, so the job packs 16/3 = 5 workers
+#             onto the GPU and requests that GPU's full CPU/RAM fair share
+#             (overriding cluster/robotwin_gpu.sh's defaults).
 #   sequential (--sequential): the batch runs its tasks one after another on the
 #             GPU, using the job's default CPU/RAM request.
 #
@@ -36,34 +33,14 @@
 set -euo pipefail
 shopt -s nullglob
 
-# --- how many workers to pack onto one H100 ---
-# Collection is CPU-heavy (curobo planning + PhysX, ~3 cores/worker) AND VRAM-heavy
-# (OptiX ray tracing, ~6.5-7.5 GB/worker -- see below). So workers/GPU is limited by
-# (a) the CPU budget we request for the single-GPU batch job and (b) H100 VRAM --
-# not GPU compute. On an 80 GB H100, VRAM caps at ~9 workers, so DON'T over-pack:
-# 13 concurrent workers OOM'd the renderer (cudaErrorMemoryAllocation / OptiX error).
-#
-# rorqual H100 node = 64 CPUs / 4 GPUs / 512 GB, so the per-GPU fair share is
-# 16 CPUs / 128 GB. We request MORE CPUs than that on a 1-GPU job to pack more
-# workers: this is allowed but strands the node's other GPUs (they can't be
-# scheduled once the CPUs are gone) and bills at the CPU-equivalent rate -- the
-# cost of packing hard. The upside is you need far fewer GPU-holding jobs for the
-# same total worker throughput. All knobs are env-overridable:
-cpus_per_gpu=${CPUS_PER_GPU:-48}                 # CPU budget for one 1-GPU batch job
-cpus_per_worker=${CPUS_PER_WORKER:-3}
-mem_per_worker_gb=${MEM_PER_WORKER_GB:-8}
-# SAPIEN renders with OptiX ray tracing (envs/_base_task.py), which allocates
-# ~6.5-7.5 GB/process on the H100 -- NOT the ~2-4 GB a rasterized D435 view would.
-# Measured via `nvidia-smi --query-compute-apps=used_memory` on a live batch. Use 8
-# as a safe cap (peak > steady during acceleration-structure rebuilds).
-vram_gb_per_worker=${VRAM_GB_PER_WORKER:-8}
-gpu_vram_gb=${GPU_VRAM_GB:-80}                   # H100 80GB; leave headroom below
-
-# Workers/GPU = min(CPU-bound, VRAM-bound). Defaults -> min(48/3, 72/8) = 9.
-workers_by_cpu=$(( cpus_per_gpu / cpus_per_worker ))
-workers_by_vram=$(( (gpu_vram_gb - 8) / vram_gb_per_worker ))   # -8 GB driver/headroom
-workers=$(( workers_by_cpu < workers_by_vram ? workers_by_cpu : workers_by_vram ))
-(( workers < 1 )) && workers=1
+# --- how many workers fit on one L40S ---
+# Killarney L40S node = 64 CPUs / 4 GPUs -> 16 cores/GPU fair share; collection is
+# CPU-bound (curobo planning + PhysX), ~3 cores/worker. VRAM/RAM are not the
+# limit (~2-4 GB VRAM, ~6 GB RAM per worker on a 48 GB / ~128 GB-per-GPU node).
+cpus_per_gpu=16
+cpus_per_worker=3
+mem_per_worker_gb=12
+workers=$(( cpus_per_gpu / cpus_per_worker ))   # -> 5
 
 # --- parse args (positional task_config, optional num_batches, mode flag) ---
 task_config=""
@@ -166,13 +143,11 @@ else
     echo "Submitting ${num_batches} sequential batch job(s) for ${task_count} tasks."
 fi
 
-# NOTE (rorqual port): on Fir only a handful of nodes could initialize SAPIEN's
-# Vulkan renderer, so jobs were pinned with `--nodelist=fc10508,...`. On rorqual
-# any H100 node renders (verified via cluster/robotwin_gpu.sh smoke-test), so we
-# do NOT pin nodes -- let the scheduler pick. If some rorqual node turns out to
-# expose CUDA but no usable Vulkan device, set `render_nodes` to the good nodes
-# and re-add `--nodelist="$render_nodes"` to the sbatch calls below.
-render_nodes=""
+# On Killarney every L40S node uses the same NVIDIA driver, so SAPIEN's Vulkan
+# renderer is not pinned to specific nodes (unlike Fir, where only a few nodes
+# had a working Vulkan device). Verify rendering once with the smoke test
+# (sbatch cluster/robotwin_gpu.sh) before a large collection run; if some node
+# turns out to lack a usable Vulkan device, re-add an --exclude/--nodelist here.
 
 for (( b = 0; b < num_batches; b++ )); do
     tasks=${batch_tasks[$b]# }   # strip the leading space

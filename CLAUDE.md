@@ -10,10 +10,10 @@ for cluster batch jobs (`cluster/`, `submit_all_data.sh`), a contact-wrench
 observation (`envs/utils/wrench.py`), a named observation-modality layer
 (`envs/utils/obs_modalities.py`), a policy-rollout → HuggingFace dataset pipeline
 (`script/collect_dataset.py`), and a QMFM value-critic guided-inference path inside
-π0.5's flow sampler. It was developed on the **Fir** cluster (Alliance Canada) and is
-currently run on **Rorqual** (**H100**, account `def-florian7_gpu`, repo root
-`/project/6028519/natashay/RoboTwin`). The sections below give the concrete cluster setup
-**and** what to change to port it elsewhere.
+π0.5's flow sampler. It was developed on the **Fir** cluster (Alliance Canada), then run on
+**Rorqual** (H100), and is currently run on **Killarney** (**L40S**, account
+`aip-florian7`, repo root `/project/6101811/natashay/RoboTwin`). The sections below give the
+concrete cluster setup **and** what to change to port it elsewhere.
 
 > The upstream project docs live at https://robotwin-platform.github.io/doc/ —
 > refer there for task/config semantics. This file is about running it on a cluster.
@@ -46,17 +46,19 @@ currently run on **Rorqual** (**H100**, account `def-florian7_gpu`, repo root
 When moving to a **new cluster**, the things that are environment-specific and
 must be re-checked are:
 
-1. **Paths** — the repo currently hardcodes `/project/6028519/natashay/RoboTwin`
-   (repo root) and `/project/6028519/natashay/miniforge3` (conda). Grep and update:
-   `grep -rn "natashay/RoboTwin\|natashay/miniforge3" setup_env.sh cluster/ policy/`
-   (and `grep -rn 6028519` for the allocation id itself).
-2. **SLURM account + partition** — `--account=rrg-florian7_gpu` and
-   `--gpus-per-node=h100:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
-3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `9.0` (H100 / sm_90).
-   Set to your GPU's compute capability (A100 = `8.0`, L40S / Ada = `8.9`, …).
+1. **Paths** — the repo hardcodes `/project/6101811/natashay/RoboTwin` (repo root) and
+   `/project/6101811/natashay/miniforge3` (conda) on Killarney. Grep and update:
+   `grep -rn "natashay/RoboTwin\|natashay/miniforge3" setup_env.sh cluster/ policy/`.
+   Grep `6028519` too — it is the old Rorqual allocation, and stale fallbacks
+   naming it have surfaced more than once when merging cluster branches.
+2. **SLURM account + partition** — `--account=aip-florian7` (the only account this
+   user is associated with here) and
+   `--gpus-per-node=l40s:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
+3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `8.9` (L40S / Ada /
+   sm_89). Set to your GPU's compute capability (A100 = `8.0`, H100 = `9.0`, …).
    This is **not** just a JIT hint: curobo and pytorch3d are compiled ahead of time
    against it, so changing GPU generation means clean-rebuilding both (§1.2) — a
-   binary built for `sm_90` will not run on an L40S, and vice versa.
+   binary built for `sm_90` will not run on an L40S.
 4. **Vulkan / SAPIEN rendering** — the `setup_env.sh` gpucomp-shim + `VK_ICD_FILENAMES`
    block is Fir-specific (see §1.3). On a cluster where SAPIEN renders out of the
    box (e.g. a normal workstation with an NVIDIA driver), it no-ops harmlessly; on
@@ -115,7 +117,7 @@ curobo and pytorch3d compile CUDA kernels. On the login node (no GPU) they will
 ```bash
 module load cuda/12.2              # do NOT pipe `module load` — a pipe subshells it
 export CUDA_HOME=$EBROOTCUDA
-export TORCH_CUDA_ARCH_LIST=9.0    # H100 (sm_90); change per §0.3
+export TORCH_CUDA_ARCH_LIST=8.9    # L40S (Ada / sm_89); change per §0.3
 export FORCE_CUDA=1                # force the CUDA build on the GPU-less login node
 ```
 
@@ -156,8 +158,9 @@ no-op on the login node / non-Fir hosts):
 - **pin the render GPU**: `envs/_base_task.py` constructs the renderer with
   `sapien.Device("cuda:0")` so it doesn't probe every GPU on a busy shared node.
 
-**H100 note:** ray tracing works even though H100 has no RT cores — the driver/OptiX
-runs it. No `_base_task.py` edit needed to fall back to rasterization.
+**Ray-tracing note:** the L40S has RT cores, so `rt` is native there. It also worked
+on H100 despite that chip having none — the driver/OptiX runs it. Either way, no
+`_base_task.py` edit is needed to fall back to rasterization.
 
 **Verify rendering on a GPU node** before collecting anything:
 
@@ -166,6 +169,11 @@ sbatch cluster/robotwin_gpu.sh          # no args -> runs the headless render sm
 # or directly on an salloc'd GPU node:
 python cluster/test_render_headless.py  # runs rt + raster in isolated subprocesses
 ```
+
+**Killarney L40S nodes need none of the above fixes.** Verified on `kn119` (driver 580.159.03):
+`raytracing=True rasterization=True` with `VK_ICD_FILENAMES` **unset** — SAPIEN's own bundled
+ICD works, and the gpucomp shim never triggers (no `/usr/lib64/libnvidia-gpucomp.so*` there).
+The whole Fir block correctly no-ops, as §0.4 predicts; don't mistake it for load-bearing here.
 
 ### 1.4 Download assets
 
@@ -185,12 +193,12 @@ source setup_env.sh
 This unsets the CVMFS `PYTHONPATH`/`PIP_CONFIG_FILE`, `module load ffmpeg/7.1.1`
 (see below), activates the conda env, sets `TORCH_CUDA_ARCH_LIST`, and installs the
 Vulkan shim. **Every** SLURM job script sources it (`cluster/robotwin_gpu.sh`,
-`submit_all_data.sh`).
+`cluster/rollout.sh`).
 
 **ffmpeg (do NOT build from source).** The π0.5 doc's §1.1 tells you to compile
 ffmpeg 7.1 — but that step only exists as a fallback for when `uv sync` fails
 building **PyAV (`av`)** ("if error occured while build av, you should update
-ffmpeg"). On Alliance clusters you don't build anything: `module load ffmpeg/7.1.1` gives
+ffmpeg"). On Killarney you don't build anything: `module load ffmpeg/7.1.1` gives
 ffmpeg 7.1.1 built `--enable-shared` with **libx264/libx265** *and* the dev headers
 + pkg-config `.pc` files. `setup_env.sh` loads it (and puts its pkgconfig dir on
 `PKG_CONFIG_PATH`), so `uv sync` in `policy/pi05` compiles `av` cleanly against 7.1.
@@ -224,7 +232,7 @@ harmless there since it only supplies codec sonames nothing else uses.)
 
 | Script | Purpose |
 |---|---|
-| `cluster/robotwin_gpu.sh` | Generic single-H100 GPU job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
+| `cluster/robotwin_gpu.sh` | Generic single-GPU (L40S) job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
 | `cluster/finetune_pi05.sh` | π0.5 fine-tuning job. Runs in the `policy/pi05` uv venv (JAX), **not** the SAPIEN conda env — no Vulkan needed. |
 | `submit_all_data.sh` | Fan out data collection over many SLURM jobs (batches). |
 | `cluster/convert_molmoact_checkpoint.sh` | Convert a native MolmoAct checkpoint into the HF layout (§5.2). |
@@ -659,13 +667,13 @@ rollout dataset, for when you want the distribution over a whole run rather than
 
 ### 6.2 Critic gradient guidance (`guidance_scale` is the on/off switch)
 
-> **Status on Rorqual: both dependencies are staged and installed.**
+> **Status on Killarney: both dependencies are staged and installed.**
 > `multisensory_steering` is checked out at
-> `/lustre09/project/6028519/natashay/multisensory-steering` **and editable-installed
+> `/home/natashay/projects/aip-florian7/natashay/multisensory-steering` **and editable-installed
 > into `policy/pi05/.venv`** (`pip install -e … --no-deps`) — cloning alone is not enough, since
 > `pi_model.py` imports it at module scope and a *baseline* eval fails without it (§8). The
 > **QMFM repo** it imports `ReplayBuffer` from (by explicit path, `$QMFM_ROOT/utils/datasets.py`)
-> is at `/home/natashay/links/projects/def-florian7/natashay/QMFM`. `eval.sh` exports that as the
+> is at `/home/natashay/projects/aip-florian7/natashay/QMFM`. `eval.sh` exports that as the
 > `QMFM_ROOT` default — override the env var to point elsewhere. It also forces
 > `WANDB_MODE=offline`: compute nodes have no internet, and the guided path opens a W&B run
 > per eval, so an online `wandb.init()` times out (90 s) and can take the job down. Sync the
@@ -809,7 +817,7 @@ only override them (pass `0` and `1` to force the baseline). The critic's own hy
 `deploy_policy.yml` — it carries `critic_config_path`, and `parse_args_and_config` merges that
 file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
 critic implementation and its config both come from the `multisensory_steering` package
-(editable install from `/lustre09/project/6028519/natashay/multisensory-steering`, config at
+(editable install from `/home/natashay/projects/aip-florian7/natashay/multisensory-steering`, config at
 `cfgs/qmfm.yaml`), which imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` — see the status note
 at the top of this section for where both are staged. Only the guided path logs to W&B, collects replay transitions, and honors
 `save_critic` / `critic_ckpt` / the TD hyperparameters; `script/eval_policy.py` keys all of it
@@ -1136,12 +1144,11 @@ Notes:
 - **Offline compute nodes**: pre-download HF checkpoints/assets and set `HF_HOME` on
   the login node; only *record* rollouts on the compute node, build/push datasets on
   the login node.
-- **pytorch3d is needed only for point clouds — and on Rorqual it is installed in the
-  conda env (0.7.8) but *not* in `policy/pi05/.venv`.** `fps` in `envs/camera/camera.py`
-  (point-cloud downsampling) imports a compiled `_C.so` pinned to a torch ABI, and the two
-  envs run different torch (conda RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you
-  do need it, **both** need their own build — collection runs in the first,
-  eval/rollout-collection in the second.
+- **pytorch3d is needed only for point clouds — and on Killarney it is installed in
+  *neither* env.** `fps` in `envs/camera/camera.py` (point-cloud downsampling) imports a
+  compiled `_C.so` pinned to a torch ABI, and the two envs run different torch (conda
+  RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you do need it, **both** need
+  their own build — collection runs in the first, eval/rollout-collection in the second.
   But `fps` is only reached from `camera.py`'s point-cloud path behind
   `pcd_down_sample_num > 0`, and every task config that ships here sets
   `data_type.pointcloud: false`, so nothing calls it and its absence is harmless. Two
@@ -1163,7 +1170,7 @@ Notes:
   ```bash
   cd envs/curobo
   module load cuda/12.6; export CUDA_HOME=$EBROOTCUDA
-  export TORCH_CUDA_ARCH_LIST=9.0 FORCE_CUDA=1
+  export TORCH_CUDA_ARCH_LIST=8.9 FORCE_CUDA=1
   ../../policy/pi05/.venv/bin/python -m pip install -e . \
       --no-build-isolation --no-deps --force-reinstall
   ```
@@ -1174,9 +1181,8 @@ Notes:
   Building against torch `cu128` with the `cuda/12.6` module is fine — same CUDA major, so
   torch's `cpp_extension` warns rather than raising.
 - **Switching GPU generation means rebuilding curobo.** Its CUDA extensions are compiled
-  ahead of time for whatever `TORCH_CUDA_ARCH_LIST` said at build time; an `sm_89` build
-  fails on an H100 at kernel launch ("no kernel image is available"), and an `sm_90` one
-  fails the same way on an L40S. Check what you have
+  ahead of time for whatever `TORCH_CUDA_ARCH_LIST` said at build time; an `sm_90` build
+  fails on an L40S at kernel launch ("no kernel image is available"). Check what you have
   with `cuobjdump --list-elf envs/curobo/src/curobo/curobolib/*.so | grep -o 'sm_[0-9]*'`,
   and clean-rebuild per §1.2. **Build it on a compute node, not the login node** — the
   login node's per-user memory cap kills `nvcc` mid-file, and the failure prints a bare
@@ -1184,9 +1190,9 @@ Notes:
   build needs no internet (`--no-build-isolation --no-deps`), so a compute node is fine.
 - **The critic path needs two out-of-repo checkouts — and staging them on disk is not
   enough.** `guidance_scale != 0` needs the `multisensory_steering` package and the QMFM repo
-  it imports `ReplayBuffer` from via `$QMFM_ROOT`. On Rorqual they are at
-  `/lustre09/project/6028519/natashay/multisensory-steering` and
-  `/home/natashay/links/projects/def-florian7/natashay/QMFM`, and `policy/pi05/eval.sh` exports
+  it imports `ReplayBuffer` from via `$QMFM_ROOT`. On Killarney both live under
+  `/home/natashay/projects/aip-florian7/natashay/` (`multisensory-steering` and `QMFM`;
+  that path is a symlink to `/project/6101811/natashay/`), and `policy/pi05/eval.sh` exports
   the `QMFM_ROOT` default. On a new cluster re-point that export and `critic_config_path`.
   Two traps:
   - **`multisensory_steering` is `import`ed, so it must be installed into `policy/pi05/.venv`**,
@@ -1202,10 +1208,12 @@ Notes:
     without it. Same shape as the `critic_config_path` trap in §6.2 — the guidance switch does
     not gate the guidance imports.
   See §6.2 before turning guidance on.
-- **`uv` may not exist on a new cluster.** §5.1's `uv sync` / `uv run` instructions assume it
-  (on Rorqual it is at `~/.local/bin/uv`); install it from https://astral.sh/uv/install.sh on a
-  login node if `uv: command not found`. `policy/pi05/.venv` also ships a working `pip`, so for
-  installing *into* the venv `policy/pi05/.venv/bin/python -m pip ...` works without uv.
+- **`uv` is NOT installed on Killarney.** §5.1's `uv sync` / `uv run` instructions assume it;
+  `uv: command not found` here, and there is no binary in `~/.local/bin` or `~/.cargo/bin`.
+  The existing `policy/pi05/.venv` does ship a working `pip` (24.2), so for installing *into*
+  the venv use `policy/pi05/.venv/bin/python -m pip ...`. Install uv from
+  https://astral.sh/uv/install.sh on a login node if you need to re-resolve the lockfile or run
+  `finetune.sh` / `eval.sh` unmodified (both call `uv run`).
 - **W&B must be offline on compute nodes.** No internet there, so `wandb.init()` blocks for 90 s
   and can kill the job. `cluster/finetune_pi05.sh` and `policy/pi05/eval.sh` both export
   `WANDB_MODE=offline`; push the runs later with `cluster/wandb_sync.sh` from a login node.

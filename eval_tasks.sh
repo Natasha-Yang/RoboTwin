@@ -5,10 +5,22 @@
 # and runs them one after another.
 #
 # Evals are NOT packed concurrently onto a GPU the way collection is
-# (submit_all_data.sh). eval.sh sets XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 (~32 GB
-# of an 80 GB H100 for JAX) on top of ~7 GB for SAPIEN's OptiX renderer, so two
-# concurrent evals would sit at ~78 GB and OOM the renderer. Tasks inside a job
-# therefore run sequentially; use more jobs, not more workers, to go faster.
+# (submit_all_data.sh). eval.sh sets XLA_PYTHON_CLIENT_MEM_FRACTION=0.4, which on
+# Killarney's 46 GB L40S reserves ~18 GB for JAX, on top of ~7 GB for SAPIEN's
+# OptiX renderer -> ~25 GB for one eval. Two concurrent would want ~50 GB and OOM
+# the 46 GB card. Tasks inside a job therefore run sequentially; use more jobs,
+# not more workers, to go faster. (The same held on Rorqual's 80 GB H100, where
+# 0.4 meant ~32 GB and two evals came to ~78 GB.)
+#
+# Killarney time bands: Slurm routes a GPU job to a gpubase_l40s_b* partition by
+# --time. <=3h lands in b1 (168 nodes), <=12h in b2 (126), <=1d in b3 (84), <=3d
+# in b4 (42), <=7d in b5 (17); the default here is 12h. A shorter --time gets a
+# bigger node pool but NOT necessarily a sooner start -- each band queues
+# separately, and b1 is often the more contended one (measured 2026-08-07: a 12h
+# job was scheduled ~8h earlier than an otherwise identical 3h job). Check before
+# assuming, with:
+#   sbatch --test-only --time=<HH:MM:SS> --cpus-per-task=8 --mem=48G \
+#          cluster/robotwin_gpu.sh bash -c true
 #
 # Usage:
 #   bash eval_tasks.sh <task_config> <train_config_name> <model_name> [seed]
@@ -44,7 +56,7 @@
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
 #        --tasks beat_block_hammer --guidance-scale 0.3 --guidance-ramp-updates 256
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
-#        --tasks stack_blocks_three --exclude rg12501
+#        --tasks stack_blocks_three --exclude kn117
 
 set -euo pipefail
 shopt -s nullglob

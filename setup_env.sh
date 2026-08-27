@@ -1,7 +1,7 @@
-# RoboTwin runtime environment for the Fir cluster (Alliance Canada).
+# RoboTwin runtime environment for the Killarney cluster (Alliance Canada).
 # Usage:  source setup_env.sh
 #
-# Notes specific to Fir / Alliance:
+# Notes specific to Killarney / Alliance:
 #   * We use a Miniforge conda env (not the module python) so the pinned
 #     torch/sapien/open3d stack installs cleanly from PyPI.
 #   * The CVMFS profile exports PYTHONPATH and PIP_CONFIG_FILE (their
@@ -10,14 +10,14 @@
 #   * torch ships its own CUDA runtime, so we do NOT load the cuda module at
 #     run time (that is only needed for compiling curobo/pytorch3d).
 
-export ROBOTWIN_CONDA=/project/6028519/natashay/miniforge3
+export ROBOTWIN_CONDA=/project/6101811/natashay/miniforge3
 export ROBOTWIN_ENV=RoboTwin
 
 # Keep the cluster's Python/pip config from leaking into the conda env.
 unset PYTHONPATH
 unset PIP_CONFIG_FILE
 
-# ffmpeg for the pi0.5 / LeRobot video-encoding path. The Alliance module is
+# ffmpeg for the pi0.5 / LeRobot video-encoding path. Killarney's module is
 # ffmpeg 7.1.1, --enable-shared with libx264/libx265 (matches the Pi05 doc's
 # from-source build), so there is no need to build ffmpeg ourselves. Loaded
 # before conda activate so the conda env's bin stays at the front of PATH.
@@ -64,11 +64,10 @@ fi
 source "$ROBOTWIN_CONDA/etc/profile.d/conda.sh"
 conda activate "$ROBOTWIN_ENV"
 
-# H100 architecture (compute capability 9.0) for any on-the-fly CUDA JIT.
-# Change this per GPU (L40S / Ada = 8.9) -- and note that curobo/pytorch3d are
-# compiled ahead of time against it, so switching GPU generation means rebuilding
-# them (CLAUDE.md §1.2).
-export TORCH_CUDA_ARCH_LIST="9.0"
+# L40S architecture (Ada, compute capability 8.9) for any on-the-fly CUDA JIT.
+# Change this per GPU (H100 = 9.0) -- and note that curobo/pytorch3d are compiled
+# ahead of time against it, so switching GPU means rebuilding them (CLAUDE.md §1.2).
+export TORCH_CUDA_ARCH_LIST="8.9"
 
 # --- SAPIEN / Vulkan rendering on Fir GPU nodes ---
 # The NVIDIA Vulkan driver (libGLX_nvidia.so.0, resolved by ldconfig from
@@ -88,7 +87,7 @@ if compgen -G "/usr/lib64/libnvidia-gpucomp.so*" >/dev/null 2>&1; then
     # its bundled ICD (it only recognizes the exact name nvidia_icd.json, but
     # Fir's system ICD is nvidia_icd.x86_64.json) -- and that bundled ICD fails
     # vk::PhysicalDevice::createDevice on this driver. The system ICD + the
-    # gpucomp shim above render correctly on the H100.
+    # gpucomp shim above render correctly on the GPU.
     if [ -z "${VK_ICD_FILENAMES:-}" ]; then
         for _icd in /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json \
                     /usr/share/vulkan/icd.d/nvidia_icd.json \
