@@ -444,15 +444,22 @@ class Camera:
     # Get Camera Depth
     def get_depth(self) -> dict:
 
+        # Depth is stored float32, in millimetres. float64 was pure overhead: SAPIEN's
+        # "Position" render target is itself float32, so widening the cast added no
+        # precision at all while doubling the bytes -- and depth dominates a
+        # depth-enabled config's on-disk size (measured: 1.17 GB of a 1.21 GB episode,
+        # four cameras at 240x320x477 frames). float32 still resolves ~0.001 mm at
+        # metre-scale ranges, far finer than the sensor model. This also matches what
+        # CLAUDE.md §7b already documents the column as.
         def _get_depth(camera):
             position = camera.get_picture("Position")
             depth = -position[..., 2]
-            depth_image = (depth * 1000.0).astype(np.float64)
+            depth_image = (depth * 1000.0).astype(np.float32)
             return depth_image
 
         def _get_sensor_depth(sensor):
             depth = sensor.get_depth()
-            depth = (depth * 1000.0).astype(np.float64)
+            depth = (depth * 1000.0).astype(np.float32)
             return depth
 
         res = {}

@@ -314,6 +314,20 @@ nothing is enumerated per data type). One row per saved frame, i.e. every `save_
 steps. `rgb: true` / `depth` / `pointcloud` / `endpose` / `qpos` / the segmentations all flow
 through that path automatically.
 
+**Depth is float32 millimetres, and it dominates the file.** On a depth-enabled config it is
+essentially the whole episode — measured on `demo_clean_multimodal`, 1.17 GB of a 1.21 GB
+episode, before it was narrowed from float64 to float32 (`envs/camera/camera.py::get_depth`).
+SAPIEN's `Position` render target is float32 to begin with, so the wider cast bought no
+precision; float32 still resolves ~0.0002 mm at metre-scale ranges. Budget **~0.6 GB per
+episode** for a four-camera depth config, and note that 50 tasks × 10 episodes is still ~290 GB.
+
+**Every static camera is captured, not just the ones the config names.** `collect_head_camera`
+gates only `head_camera`; `get_rgba` / `get_depth` / `get_segmentation` all loop over
+`static_camera_list` and take any *other* static camera unconditionally. The aloha-agilex
+embodiment defines `front_camera`, so a config asking for head + wrist still pays for
+`front_camera` too — a quarter of the depth bytes in the measurement above. Drop it from the
+embodiment's `static_camera_list` if you do not want it; there is no `data_type` switch for it.
+
 **SigLIP features are not collected here and cannot be.** They are π0.5's own image-tower
 output, so they exist only where a policy is loaded — that is `script/collect_dataset.py`
 (§7), not `script/collect_data.py`. They are also the single most expensive column in that
