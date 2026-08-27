@@ -70,6 +70,24 @@ must be re-checked are:
    `setup_env.sh` guards against Alliance's CVMFS profile (a dummy `opencv` wheel).
    Harmless elsewhere, keep it.
 
+> **Merging a cluster branch silently reverts all of the above.** Each cluster branch
+> (`killarney`, `rorqual`, `cluster`, `qpilots`) hard-codes *its own* cluster in the same
+> files, so a merge is a genuine content disagreement — and because only one side changed
+> those lines relative to the merge base, git resolves it **cleanly, with no conflict**, in
+> favour of whichever branch touched them last. Merging `qpilots` into `killarney` on
+> 2026-08-27 reverted `TORCH_CUDA_ARCH_LIST` to `9.0` (curobo here is built for `sm_89`),
+> `--account` to `def-florian7_gpu`, `--gpus-per-node` to `h100:1`, `submit_all_data.sh`'s
+> packing to the H100 numbers, and all of CLAUDE.md — none of it flagged. **After any such
+> merge, re-check these files before submitting anything:**
+>
+> ```bash
+> git diff <pre-merge-ref> HEAD -- setup_env.sh cluster/ submit_all_data.sh eval_tasks.sh \
+>     policy/pi05/eval.sh CLAUDE.md | grep -nE '^[+-].*(6028519|def-florian7|h100|9\.0|Rorqual|Fir)'
+> ```
+>
+> Anything that matches on a `+` line is the merge undoing a Killarney setting. The reverse
+> holds when merging *into* a rorqual branch.
+
 ---
 
 ## 1. Environment setup
