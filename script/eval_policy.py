@@ -135,6 +135,18 @@ def as_bool(value, default):
     raise ValueError(f"expected a boolean, got {value!r}")
 
 
+def as_bool_or_none(value):
+    """`as_bool` without the raise -- None when the value is not a boolean at all.
+
+    For a key that is a switch *or* something else, `resume` being the only one: `true` continues
+    the newest run, a path continues that one (see `find_resumable_run`).
+    """
+    try:
+        return as_bool(value, False)
+    except ValueError:
+        return None
+
+
 def control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward=True):
     """Reward for the control step (action chunk) that just executed.
 
@@ -545,8 +557,21 @@ def load_resume_state(save_dir):
     return state
 
 
-def find_resumable_run(run_root):
-    """The most recent run directory under `run_root` carrying resume state, if any."""
+def find_resumable_run(run_root, resume=True):
+    """The run directory to continue, or None to start a fresh one.
+
+    `resume` is normally just a switch, and picks the most recent interrupted run under
+    `run_root`. It may instead name one specific run directory, which is what you want when the
+    newest-first rule would pick the wrong one: another eval writing into the same root updates
+    its state file every episode, so it stays "most recent" no matter which run you meant.
+    """
+    if isinstance(resume, str) and as_bool_or_none(resume) is None:
+        run_dir = Path(resume).expanduser()
+        if not (run_dir / RESUME_STATE).exists():
+            raise FileNotFoundError(f"resume: {run_dir} has no {RESUME_STATE}")
+        return run_dir
+    if not as_bool(resume, False):
+        return None
     run_root = Path(run_root)
     if not run_root.is_dir():
         return None
@@ -620,10 +645,11 @@ def main(usr_args):
 
     # `resume: true` continues the newest interrupted run for this task/policy/config/checkpoint
     # in place rather than opening a fresh timestamped directory -- the episodes, the critic and
-    # the seed sequence all live in there and only mean anything together. With no such run (or
+    # the seed sequence all live in there and only mean anything together. `resume: <run dir>`
+    # continues that one instead, for when "newest" is ambiguous. With neither (or
     # `resume: false`) this is an ordinary new run.
     run_root = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}")
-    resume_dir = find_resumable_run(run_root) if usr_args.get("resume", False) else None
+    resume_dir = find_resumable_run(run_root, usr_args.get("resume", False))
     save_dir = resume_dir if resume_dir is not None else run_root / current_time
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)

@@ -559,6 +559,18 @@ class Base_Task(gym.Env):
                         os.remove(directory + file)
 
         pkl_dic = self.get_obs()
+        # Contact wrench of the primitive steps since the previous frame, one (save_freq, 6)
+        # trace per gripper link (`envs/utils/wrench.py`). Drained here rather than inside
+        # `get_obs` because contacts are a scene query, not an observation -- and because the
+        # rollout paths drain the same log themselves, at their own rate. The first frame of a
+        # motion segment has no steps behind it and gets a single sample of the contact state
+        # right now; a segment's trailing frame gets fewer than `save_freq`, NaN-padded.
+        # `save_freq` is the fixed trace length, so every frame's arrays have one shape and the
+        # HDF5 column is (num_frames, save_freq, 6); a config without one has no frame cadence
+        # to stack against, so the wrench is simply left out rather than stored ragged.
+        step_wrench = self.pop_step_wrench()
+        if step_wrench and self.save_freq:
+            pkl_dic["wrench"] = stack_step_wrench(step_wrench, self.save_freq)
         save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache
         self.FRAME_IDX += 1
 
@@ -908,6 +920,8 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
+            if self.save_data and save_freq != None:  # see take_dense_action
+                self._log_step_wrench()
             if self.render_freq and i % self.render_freq == 0:
                 self._update_render()
                 self.viewer.render()
@@ -1503,6 +1517,12 @@ class Base_Task(gym.Env):
                 )  # TODO
 
             self.scene.step()
+            # Only while a demo is actually being written: `_take_picture` is what drains the
+            # log, so logging when it early-returns would just grow the list for nobody. That
+            # keeps the per-step contact query off the seed-search phase, which throws its
+            # trajectories away.
+            if self.save_data and save_freq != None:
+                self._log_step_wrench()
 
             if self.render_freq and control_idx % self.render_freq == 0:
                 self._update_render()
@@ -1518,15 +1538,21 @@ class Base_Task(gym.Env):
         return True  # TODO: maybe need try error
 
     def _log_step_wrench(self):
-        """Record the end-effector contact wrench left by the step that just finished.
+        """Record the end-effector contact wrench left by the physics step that just finished.
 
-        One `{arm: (6,)}` sample per executed `take_action`, i.e. per primitive control step,
-        in the world frame (`envs/utils/wrench.py`). Enabled by `record_step_wrench`; a
-        `take_action` that returns without stepping the scene logs nothing.
+        One `{link_label: (6,)}` sample per primitive control step, in the world frame
+        (`envs/utils/wrench.py`). Kept **per gripper link** rather than summed per arm, so a
+        finger pushing against its opposite — equal and opposite forces that cancel in the arm
+        total — is still visible.
+
+        Called from every control loop that steps the scene on a recorded trajectory:
+        `take_action` (policy rollouts) and, when a demo is being written, `take_dense_action`
+        and `together_move_to_pose` (the scripted expert). Enabled by `record_step_wrench`; a
+        step that returns without stepping the scene logs nothing.
         """
         if not self.record_step_wrench:
             return
-        self.step_wrench.append(tcp_wrench_vector(self))
+        self.step_wrench.append(link_wrench_vector(self))
 
     def pop_step_wrench(self):
         """Return the wrench samples logged since the last call, and clear the log.
@@ -1538,13 +1564,17 @@ class Base_Task(gym.Env):
         fewer when that chunk ended early). That is the only wrench that exists before the
         current chunk has run, which is what lets it be an observation rather than an outcome.
 
+        Demo collection drains it in the same place for the same reason: `_take_picture` pops
+        it while building the frame, so a saved frame carries the trace of the `save_freq`
+        steps that led up to it.
+
         With recording on, an empty log yields one sample taken now rather than nothing at all:
         no steps have run since the last pop at the start of an episode, and a consumer that
         asked for the wrench should get the current contact state instead of a missing
         modality. Recording off yields `[]`.
         """
         if self.record_step_wrench and not self.step_wrench:
-            return [tcp_wrench_vector(self)]
+            return [link_wrench_vector(self)]
         samples, self.step_wrench = self.step_wrench, []
         return samples
 

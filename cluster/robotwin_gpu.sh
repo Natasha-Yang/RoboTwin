@@ -1,26 +1,23 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
-# RoboTwin GPU batch job for the Killarney cluster (Alliance Canada / SLURM).
+# RoboTwin GPU batch job for the Fir cluster (Alliance Canada / SLURM).
 #
 # Submit:   sbatch cluster/robotwin_gpu.sh <command...>
 #   e.g.    sbatch cluster/robotwin_gpu.sh bash collect_data.sh beat_block_hammer demo_randomized 0
 #   default (no args) runs the headless render smoke-test.
 #
 # Notes:
-#   * SAPIEN ray tracing AND rasterization both render on these GPUs. (This was
-#     first verified on H100, where the lack of RT cores does not block ray
-#     tracing -- the driver/OptiX handles it; the L40S has RT cores outright.)
+#   * Verified on H100: SAPIEN ray tracing AND rasterization both render (the
+#     lack of RT cores does not block ray tracing; the driver/OptiX handles it).
 #   * Compute nodes have no internet; do all pip/git installs on a login node.
 #   * Submit from the repo root, or set ROBOTWIN_ROOT to override its location.
 # ---------------------------------------------------------------------------
-#SBATCH --account=aip-florian7
+#SBATCH --account=def-florian7_gpu
 #SBATCH --job-name=robotwin
-#SBATCH --gpus-per-node=l40s:1
-# No --partition: Killarney's job_submit lua filter routes a GPU job to the
-# right gpubase_l40s_b* band from --gres + --time (3h -> gpubase_l40s_b1).
+#SBATCH --gpus-per-node=h100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=3:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail
@@ -33,7 +30,7 @@ if [ -z "$ROBOTWIN_ROOT" ]; then
     if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "$SLURM_SUBMIT_DIR/setup_env.sh" ]; then
         ROBOTWIN_ROOT="$SLURM_SUBMIT_DIR"
     else
-        ROBOTWIN_ROOT="/project/6101811/natashay/RoboTwin"
+        ROBOTWIN_ROOT="/project/6028519/natashay/RoboTwin"
     fi
 fi
 cd "$ROBOTWIN_ROOT"

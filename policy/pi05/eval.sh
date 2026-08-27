@@ -26,7 +26,7 @@
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
 # Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
 # `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
-export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/projects/aip-florian7/natashay/QMFM}"
+export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
 # Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
 # wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
 # `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
@@ -56,6 +56,10 @@ overrides=()
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
+# Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
+# positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
+# without editing the yml (and so without steering a concurrent eval into that run's directory).
+[ "$#" -gt 11 ] && overrides+=("${@:12}")
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"

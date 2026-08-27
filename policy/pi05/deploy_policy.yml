@@ -30,7 +30,13 @@ test_num: 100
 # rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP
 # features), so a resumed critic refills it from empty before TD updates restart.
 # `false` always starts a fresh run and leaves any interrupted one untouched.
-resume: false
+#
+# `resume: "<run dir>"` continues that specific run instead of the newest. Use it when another
+# eval is writing into the same task/policy/config/ckpt directory -- it rewrites its own
+# resume_state.json every episode, so it stays the "newest" one however long ago yours stopped.
+# (A run that predates crash recovery has no resume_state.json at all; script/
+# resume_state_from_log.py rebuilds one from that run's SLURM log.)
+resume:
 
 # ===== Online QMFM Value critic =====
 # `guidance_scale` is QMFM's steering_coeff. It and `best_of_n` (below) are the two ways the
@@ -82,10 +88,8 @@ guidance_ramp_updates: 500
 use_step_reward: false
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
 critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/2026-08-10 16:39:50/online_value_critic.pkl"
-
 # Everything below only takes effect when a critic is running, i.e. guidance_scale != 0 or
 # best_of_n > 1.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
 # (or overridden on the eval.sh command line) wins over it.
-critic_config_path: /home/natashay/projects/aip-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
-
+critic_config_path: /home/natashay/links/projects/def-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml

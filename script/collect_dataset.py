@@ -3,9 +3,9 @@
 Given a checkpoint (via the policy's ``deploy_policy`` interface), a task config and a
 task name, this collects rollout episodes and stores, for every policy inference step,
 the observations from the three cameras (head / left wrist / right wrist), the action
-chunk executed, the end-effector contact wrench at every primitive step of that chunk, and
-whether the episode ultimately succeeded. Whatever else the task config's ``data_type``
-block enables -- depth, segmentation, point cloud, third-person view, end-effector poses --
+chunk executed, the end-effector contact wrench at every primitive step of that chunk, the
+reward that chunk earned, and whether the episode ultimately succeeded. Whatever else the
+task config's ``data_type`` block enables -- depth, segmentation, point cloud, third-person view, end-effector poses --
 is recorded alongside them (see extra_obs_columns), so ``demo_clean_privileged`` yields a
 much wider dataset than ``demo_clean``.
 
@@ -48,6 +48,7 @@ from generate_episode_instructions import *
 # Reuse env-setup helpers from the evaluation entrypoint so the two stay in sync.
 from eval_policy import (
     class_decorator,
+    control_step_reward,
     eval_function_decorator,
     get_embodiment_config,
     parse_args_and_config,
@@ -58,18 +59,21 @@ import yaml
 
 
 def wrench_columns(step_wrench, num_steps):
-    """Per-arm end-effector contact wrench, one sample per primitive step since the last row.
+    """Per-link end-effector contact wrench, one sample per primitive step since the last row.
 
     `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
-    `{arm: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame. It
-    comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots use -- the
-    only difference is the rate: `eval_policy.py` samples once per policy call, here every step
-    in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
+    `{link_label: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world
+    frame. It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots
+    use -- the only difference is the rate: `eval_policy.py` samples once per policy call, here
+    every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
     fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online view
     of the same modality (`envs/utils/obs_modalities.py`).
     """
-    return {f"observation.wrench.{arm}": samples
-            for arm, samples in stack_step_wrench(step_wrench, num_steps).items()}
+    # One column per gripper link (aloha: `observation.wrench.fl_link7`, `.fl_link8`,
+    # `.fr_link7`, `.fr_link8`) rather than one per arm, because two fingers squeezing the same
+    # object exert equal and opposite forces that cancel in an arm-level sum.
+    return {f"observation.wrench.{link}": samples
+            for link, samples in stack_step_wrench(step_wrench, num_steps).items()}
 
 
 def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
@@ -277,6 +281,7 @@ def collect_rollouts(usr_args, start=None):
         instruction = TASK_ENV.get_instruction()
 
         succ = False
+        prev_success = False
         frame_records = []
         reset_func(model)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
@@ -301,11 +306,23 @@ def collect_rollouts(usr_args, start=None):
 
             actions, initial_obs = eval_func(TASK_ENV, model, observation)
 
+            # Reward for the chunk that just ran, i.e. for this row's own (state, action) --
+            # unlike the wrench above, which is an observation of what came before it. Computed
+            # by the same helper `eval_policy.py` feeds the online critic's `commit()` with, at
+            # the same point in the loop, so a critic pretrained on this column and one trained
+            # online during eval see the same reward. It has to be read here rather than
+            # reconstructed later: the task's `step_reward` is a delta against its own last
+            # call, so it exists only while the episode is running.
+            success_now = bool(TASK_ENV.eval_success)
+            reward = control_step_reward(TASK_ENV, success_now, prev_success)
+            prev_success = success_now
+
             input_rgb_arr, input_state = initial_obs
             head_rgb, right_rgb, left_rgb = input_rgb_arr
 
             record = {
                 "frame_index": frame_index,
+                "reward": reward,
                 "observation.images.head": Image.fromarray(np.asarray(head_rgb, dtype=np.uint8)),
                 "observation.images.left_wrist": Image.fromarray(np.asarray(left_rgb, dtype=np.uint8)),
                 "observation.images.right_wrist": Image.fromarray(np.asarray(right_rgb, dtype=np.uint8)),
@@ -338,7 +355,7 @@ def collect_rollouts(usr_args, start=None):
 
             frame_records.append(record)
 
-            if TASK_ENV.eval_success:
+            if success_now:
                 succ = True
                 break
 
@@ -409,6 +426,10 @@ def build_features(record):
         "observation.state": datasets.Sequence(datasets.Value("float32")),
         # Action chunk executed at this inference step: shape (chunk_len, action_dim).
         "action": datasets.Sequence(datasets.Sequence(datasets.Value("float32"))),
+        # Reward earned by that chunk -- task shaping, or 1.0 on the step that first succeeds.
+        # Point `multisensory_steering`'s `dataset.reward_col` at it to train on the shaped
+        # reward instead of deriving the sparse `terminal_reward` from `success`.
+        "reward": datasets.Value("float32"),
         "success": datasets.Value("bool"),
         "task": datasets.Value("string"),
     })

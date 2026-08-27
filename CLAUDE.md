@@ -10,10 +10,10 @@ for cluster batch jobs (`cluster/`, `submit_all_data.sh`), a contact-wrench
 observation (`envs/utils/wrench.py`), a named observation-modality layer
 (`envs/utils/obs_modalities.py`), a policy-rollout → HuggingFace dataset pipeline
 (`script/collect_dataset.py`), and a QMFM value-critic guided-inference path inside
-π0.5's flow sampler. It was developed on the **Fir** cluster (Alliance Canada), then run on
-**Rorqual** (H100), and is currently run on **Killarney** (**L40S**, account
-`aip-florian7`, repo root `/project/6101811/natashay/RoboTwin`). The sections below give the
-concrete cluster setup **and** what to change to port it elsewhere.
+π0.5's flow sampler. It was developed on the **Fir** cluster (Alliance Canada) and is
+currently run on **Rorqual** (**H100**, account `def-florian7_gpu`, repo root
+`/project/6028519/natashay/RoboTwin`). The sections below give the concrete cluster setup
+**and** what to change to port it elsewhere.
 
 > The upstream project docs live at https://robotwin-platform.github.io/doc/ —
 > refer there for task/config semantics. This file is about running it on a cluster.
@@ -46,18 +46,17 @@ concrete cluster setup **and** what to change to port it elsewhere.
 When moving to a **new cluster**, the things that are environment-specific and
 must be re-checked are:
 
-1. **Paths** — the repo hardcodes `/project/6101811/natashay/RoboTwin` (repo root) and
-   `/project/6101811/natashay/miniforge3` (conda) on Killarney. Grep and update:
-   `grep -rn "natashay/RoboTwin\|natashay/miniforge3" setup_env.sh cluster/ policy/`.
-   Some fallbacks still name the old Rorqual allocation `6028519` — e.g.
-   `cluster/finetune_pi05.sh`'s `ROBOTWIN_ROOT` default — so grep `6028519` too.
+1. **Paths** — the repo currently hardcodes `/project/6028519/natashay/RoboTwin`
+   (repo root) and `/project/6028519/natashay/miniforge3` (conda). Grep and update:
+   `grep -rn "natashay/RoboTwin\|natashay/miniforge3" setup_env.sh cluster/ policy/`
+   (and `grep -rn 6028519` for the allocation id itself).
 2. **SLURM account + partition** — `--account=rrg-florian7_gpu` and
-   `--gpus-per-node=l40s:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
-3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `8.9` (L40S / Ada /
-   sm_89). Set to your GPU's compute capability (A100 = `8.0`, H100 = `9.0`, …).
+   `--gpus-per-node=h100:1` in `cluster/robotwin_gpu.sh` and `cluster/finetune_pi05.sh`.
+3. **GPU arch** — `TORCH_CUDA_ARCH_LIST` in `setup_env.sh` is `9.0` (H100 / sm_90).
+   Set to your GPU's compute capability (A100 = `8.0`, L40S / Ada = `8.9`, …).
    This is **not** just a JIT hint: curobo and pytorch3d are compiled ahead of time
    against it, so changing GPU generation means clean-rebuilding both (§1.2) — a
-   binary built for `sm_90` will not run on an L40S.
+   binary built for `sm_90` will not run on an L40S, and vice versa.
 4. **Vulkan / SAPIEN rendering** — the `setup_env.sh` gpucomp-shim + `VK_ICD_FILENAMES`
    block is Fir-specific (see §1.3). On a cluster where SAPIEN renders out of the
    box (e.g. a normal workstation with an NVIDIA driver), it no-ops harmlessly; on
@@ -116,7 +115,7 @@ curobo and pytorch3d compile CUDA kernels. On the login node (no GPU) they will
 ```bash
 module load cuda/12.2              # do NOT pipe `module load` — a pipe subshells it
 export CUDA_HOME=$EBROOTCUDA
-export TORCH_CUDA_ARCH_LIST=8.9    # L40S (Ada / sm_89); change per §0.3
+export TORCH_CUDA_ARCH_LIST=9.0    # H100 (sm_90); change per §0.3
 export FORCE_CUDA=1                # force the CUDA build on the GPU-less login node
 ```
 
@@ -157,9 +156,8 @@ no-op on the login node / non-Fir hosts):
 - **pin the render GPU**: `envs/_base_task.py` constructs the renderer with
   `sapien.Device("cuda:0")` so it doesn't probe every GPU on a busy shared node.
 
-**Ray-tracing note:** the L40S has RT cores, so `rt` is native there. It also worked
-on H100 despite that chip having none — the driver/OptiX runs it. Either way, no
-`_base_task.py` edit is needed to fall back to rasterization.
+**H100 note:** ray tracing works even though H100 has no RT cores — the driver/OptiX
+runs it. No `_base_task.py` edit needed to fall back to rasterization.
 
 **Verify rendering on a GPU node** before collecting anything:
 
@@ -168,11 +166,6 @@ sbatch cluster/robotwin_gpu.sh          # no args -> runs the headless render sm
 # or directly on an salloc'd GPU node:
 python cluster/test_render_headless.py  # runs rt + raster in isolated subprocesses
 ```
-
-**Killarney L40S nodes need none of the above fixes.** Verified on `kn119` (driver 580.159.03):
-`raytracing=True rasterization=True` with `VK_ICD_FILENAMES` **unset** — SAPIEN's own bundled
-ICD works, and the gpucomp shim never triggers (no `/usr/lib64/libnvidia-gpucomp.so*` there).
-The whole Fir block correctly no-ops, as §0.4 predicts; don't mistake it for load-bearing here.
 
 ### 1.4 Download assets
 
@@ -192,12 +185,12 @@ source setup_env.sh
 This unsets the CVMFS `PYTHONPATH`/`PIP_CONFIG_FILE`, `module load ffmpeg/7.1.1`
 (see below), activates the conda env, sets `TORCH_CUDA_ARCH_LIST`, and installs the
 Vulkan shim. **Every** SLURM job script sources it (`cluster/robotwin_gpu.sh`,
-`cluster/rollout.sh`).
+`submit_all_data.sh`).
 
 **ffmpeg (do NOT build from source).** The π0.5 doc's §1.1 tells you to compile
 ffmpeg 7.1 — but that step only exists as a fallback for when `uv sync` fails
 building **PyAV (`av`)** ("if error occured while build av, you should update
-ffmpeg"). On Killarney you don't build anything: `module load ffmpeg/7.1.1` gives
+ffmpeg"). On Alliance clusters you don't build anything: `module load ffmpeg/7.1.1` gives
 ffmpeg 7.1.1 built `--enable-shared` with **libx264/libx265** *and* the dev headers
 + pkg-config `.pc` files. `setup_env.sh` loads it (and puts its pkgconfig dir on
 `PKG_CONFIG_PATH`), so `uv sync` in `policy/pi05` compiles `av` cleanly against 7.1.
@@ -231,7 +224,7 @@ harmless there since it only supplies codec sonames nothing else uses.)
 
 | Script | Purpose |
 |---|---|
-| `cluster/robotwin_gpu.sh` | Generic single-GPU (L40S) job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
+| `cluster/robotwin_gpu.sh` | Generic single-H100 GPU job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
 | `cluster/finetune_pi05.sh` | π0.5 fine-tuning job. Runs in the `policy/pi05` uv venv (JAX), **not** the SAPIEN conda env — no Vulkan needed. |
 | `submit_all_data.sh` | Fan out data collection over many SLURM jobs (batches). |
 | `cluster/convert_molmoact_checkpoint.sh` | Convert a native MolmoAct checkpoint into the HF layout (§5.2). |
@@ -304,6 +297,44 @@ bash submit_all_data.sh demo_randomized 5 --sequential  # 5 jobs, one task at a 
 Logs land in `logs/data_collection/`. **Fir-specific:** it pins collection to
 `render_nodes=fc10508,fc10519,fc10604,fc10612` (the nodes whose Vulkan works) —
 change or drop this on another cluster (see §0.5).
+
+### 3.4 What ends up in the demo HDF5
+
+The per-episode HDF5 mirrors whatever `get_obs` returned, so the task config's `data_type`
+block decides its columns (`envs/utils/pkl2hdf5.py` infers the layout from the first frame —
+nothing is enumerated per data type). One row per saved frame, i.e. every `save_freq` physics
+steps. `rgb: true` / `depth` / `pointcloud` / `endpose` / `qpos` / the segmentations all flow
+through that path automatically.
+
+**SigLIP features are not collected here and cannot be.** They are π0.5's own image-tower
+output, so they exist only where a policy is loaded — that is `script/collect_dataset.py`
+(§7), not `script/collect_data.py`. They are also the single most expensive column in that
+pipeline (~576 KB/row per view).
+
+**The contact wrench is the one exception to the `get_obs` rule**, because contacts are a scene
+query rather than an observation. With `data_type.wrench: true`:
+
+| HDF5 path | Shape | Contents |
+|---|---|---|
+| `wrench/<link>` | `(num_frames, save_freq, 6)` float32 | one group member per end-effector link — aloha gives `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8` |
+
+Per **link**, not summed per arm (§6.2). Each row is the trace of the `save_freq` primitive
+steps that led up to that frame, one `[Fx, Fy, Fz, Tx, Ty, Tz]` sample per step, world frame,
+torque about that arm's TCP. `_base_task._log_step_wrench` samples after every `scene.step()` of
+`take_dense_action` / `together_move_to_pose`, and `_take_picture` drains the log while building
+the frame — so this is exactly the `pi0_step`-rate column §7a records, at the demo cadence.
+Short traces are **NaN**-padded (zero is a meaningful reading): a motion segment's first frame
+has no steps behind it and carries a single sample of the contact state at that instant, its
+last frame carries however many steps ran since the previous one.
+
+Two consequences worth knowing:
+
+- Logging is gated on `save_data`, so it costs nothing during the seed-search phase, whose
+  trajectories are thrown away. It does add a `scene.get_contacts()` scan to **every** physics
+  step of the replay phase, which is not free on a CPU-bound collection run — turn
+  `data_type.wrench` off if you don't want the columns.
+- A config with `save_freq: null` has no frame cadence to stack against, so the wrench is left
+  out rather than stored ragged.
 
 ---
 
@@ -531,7 +562,10 @@ atomically. The json is the commit marker, so an interruption rewinds to the las
 completed all three; a csv row one ahead of it is trimmed on resume.
 
 `resume: true` (`deploy_policy.yml`) then continues the newest interrupted run for this
-task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one:
+task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one.
+`resume: "<run dir>"` names one specific run instead — needed when a second eval is writing into
+the same directory, since it rewrites its own `resume_state.json` every episode and so stays the
+"newest" one however long ago the run you meant stopped.
 
 | Restored | From | Why it cannot be recomputed |
 |---|---|---|
@@ -574,15 +608,32 @@ keeps its weights and optimizer but refills the buffer from empty and runs no TD
 
 `_episode_results.csv` gained explicit `episode` and `seed` columns and lost its unnamed index.
 
+**A run started before this landed can still be resumed**, because its job log already recorded
+per episode everything `resume_state.json` holds: the `Success rate: <suc>/<test_num> … current
+seed: <n>` line is the episode counter, the success count and the seed, and the seeds that reach
+that print are exactly the ones the expert check accepted. `script/resume_state_from_log.py
+<slurm_log> <run_dir>` parses them back into a `resume_state.json` (and reconstructs
+`_episode_results.csv`), after which `resume` continues the run normally. Run it once the job has
+actually exited, and only for a run with **no critic** — a critic's weights are not in any log, so
+the reconstructed `chunk_count`/`critic_updates`/`critic_ramp_baseline` are zeros, true only when
+`guidance_scale` was 0 and `best_of_n` 1. Two of the columns are inexact and neither is load-bearing:
+`num_steps` is the last step the episode printed, and `reward` is recovered by inverting the printed
+moving average (`r_n = S_n - S_{n-1} + r_{n-window}`), which accumulates the print's 3-decimal
+rounding. The numpy RNG state is the one field genuinely not in the log, and it does not matter:
+`_init_task_env_` reseeds numpy from the episode's own seed at every `setup_demo`, so nothing
+downstream depends on the state the loop carried in. (The instruction is drawn by
+`generate_episode_descriptions` from the `random` module, which nothing seeds and
+`resume_state.json` does not carry — so instructions already differ across any resume.)
+
 Setting `debug: true` in the **task config** turns on extra per-episode diagnostics
 (`script/eval_policy.py::visualize_debug_obs`), all written into `debug_vis/episode<N>/`
 under that same result dir:
 
 | Output | File (under `debug_vis/episode<N>/`) | Notes |
 |---|---|---|
-| TCP wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), left and right arm overlaid |
-| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); the wrench traces with a step cursor on the right |
-| Raw series | `wrench_episode<N>.npz` | `step`, `left`, `right` — `(num_samples, 6)` each |
+| Per-link wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), every gripper link overlaid (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) |
+| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); one trace column per gripper link with a step cursor on the right |
+| Raw series | `wrench_episode<N>.npz` | `step`, `components`, `links`, plus one `(num_samples, 6)` array per link name |
 | Critic Q trace | `q_episode<N>.png` | guided runs only (see below) |
 | Rollout + Q GIF | `q_episode<N>.gif` | head camera on the left, the Q and reward traces with a step cursor on the right |
 | Raw series | `q_episode<N>.npz` | `step`, `q` `(num_samples, num_qs)`, `reward`, `guidance_scale`, `return_to_go`, plus the scalars `return_mean` / `return_std` / `gamma_h` |
@@ -608,13 +659,13 @@ rollout dataset, for when you want the distribution over a whole run rather than
 
 ### 6.2 Critic gradient guidance (`guidance_scale` is the on/off switch)
 
-> **Status on Killarney: both dependencies are staged and installed.**
+> **Status on Rorqual: both dependencies are staged and installed.**
 > `multisensory_steering` is checked out at
-> `/home/natashay/projects/aip-florian7/natashay/multisensory-steering` **and editable-installed
+> `/lustre09/project/6028519/natashay/multisensory-steering` **and editable-installed
 > into `policy/pi05/.venv`** (`pip install -e … --no-deps`) — cloning alone is not enough, since
 > `pi_model.py` imports it at module scope and a *baseline* eval fails without it (§8). The
 > **QMFM repo** it imports `ReplayBuffer` from (by explicit path, `$QMFM_ROOT/utils/datasets.py`)
-> is at `/home/natashay/projects/aip-florian7/natashay/QMFM`. `eval.sh` exports that as the
+> is at `/home/natashay/links/projects/def-florian7/natashay/QMFM`. `eval.sh` exports that as the
 > `QMFM_ROOT` default — override the env var to point elsewhere. It also forces
 > `WANDB_MODE=offline`: compute nodes have no internet, and the guided path opens a W&B run
 > per eval, so an online `wandb.init()` times out (90 s) and can take the job down. Sync the
@@ -624,6 +675,20 @@ rollout dataset, for when you want the distribution over a whole run rather than
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
+Everything that records the wrench keeps it **per link** (`link_wrench_vector`, one `(6,)`
+per gripper finger) rather than per arm, so a finger squeezing against its opposite — equal and
+opposite forces that cancel in the arm total — is still visible. That is the debug plots, the
+demo HDF5's `wrench/<link>` groups (§3.4), the rollout dataset's `observation.wrench.<link>`
+columns (§7a) and the critic's `wrench.<link>` modality alike. `compute_tcp_wrench` /
+`tcp_wrench_vector` are that same decomposition summed per arm; nothing on the recording path
+calls them any more, they are kept as the arm-level summary for analysis.
+
+> **Breaking change (2026-08-26).** The per-arm `wrench.left` / `wrench.right` modality and the
+> `observation.wrench.{left,right}` dataset columns are gone, replaced by one per link. A critic
+> checkpoint trained on the old names will not load against the new `encoder_modalities`, and a
+> rollout dataset collected before this date has the old two columns — retrain, or sum the link
+> columns back into two if you need the old shape.
+
 The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
 `guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
 writes none. Each row
@@ -744,7 +809,7 @@ only override them (pass `0` and `1` to force the baseline). The critic's own hy
 `deploy_policy.yml` — it carries `critic_config_path`, and `parse_args_and_config` merges that
 file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
 critic implementation and its config both come from the `multisensory_steering` package
-(editable install from `/home/natashay/projects/aip-florian7/natashay/multisensory-steering`, config at
+(editable install from `/lustre09/project/6028519/natashay/multisensory-steering`, config at
 `cfgs/qmfm.yaml`), which imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` — see the status note
 at the top of this section for where both are staged. Only the guided path logs to W&B, collects replay transitions, and honors
 `save_critic` / `critic_ckpt` / the TD hyperparameters; `script/eval_policy.py` keys all of it
@@ -788,7 +853,7 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.{left,right}` | per-step contact wrench, logged by the env | `(pi0_step, 6)` |
+| `wrench.<link>` | per-step contact wrench, one modality per gripper link (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`), logged by the env | `(pi0_step, 6)` each |
 
 The names are the §7a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -919,7 +984,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.{left,right}` | world-frame TCP contact wrench, one row per executed step | `(pi0_step, 6)` |
+| `observation.wrench.<link>` | world-frame contact wrench per gripper link, one row per executed step | `(pi0_step, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
@@ -956,10 +1021,12 @@ siglip.right_wrist]` at them and skip that pass entirely. At ~576 KB/row **each*
 dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well as
 `true`/`false`, and dropping the wrists is the cheapest way to shrink a run.
 
-`observation.wrench.left` / `.right` are the **same quantity** §6.1's debug GIF plots — net contact
-wrench on that arm's end-effector links, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
-about the TCP — computed by the shared `envs/utils/wrench.py::tcp_wrench_vector` so the eval and
-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
+`observation.wrench.<link>` — one column per gripper link (aloha: `fl_link7`, `fl_link8`,
+`fr_link7`, `fr_link8`) — is the **same quantity** §6.1's debug GIF plots draw: net contact
+wrench on that link, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque about that arm's TCP
+(the same reference point for all of an arm's links, so they stay comparable with each other and
+with their sum). Computed by the shared `envs/utils/wrench.py::link_wrench_vector`, so the eval,
+demo-collection and rollout-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
 call, while collection samples after **every** primitive step, so a row carries a whole
 `(pi0_step, 6)` trace rather than a single vector.
 
@@ -1002,7 +1069,8 @@ flag itself: contacts are a scene query, not part of `get_obs`. So each driver r
 `data_type.wrench` and passes `record_step_wrench` into the env — `collect_data.py`,
 `collect_dataset.py` and `eval_policy.py` all do, and nothing logs a wrench with the flag off.
 Turning it off drops these columns from the dataset entirely (and makes a `wrench.*` critic
-modality unavailable, §6.2).
+modality unavailable, §6.2). What differs between the drivers is only *where* the log is drained
+— see §3.4 for the expert-demo path.
 
 
 ### 7b. Extra data types (privileged task configs)
@@ -1068,11 +1136,12 @@ Notes:
 - **Offline compute nodes**: pre-download HF checkpoints/assets and set `HF_HOME` on
   the login node; only *record* rollouts on the compute node, build/push datasets on
   the login node.
-- **pytorch3d is needed only for point clouds — and on Killarney it is installed in
-  *neither* env.** `fps` in `envs/camera/camera.py` (point-cloud downsampling) imports a
-  compiled `_C.so` pinned to a torch ABI, and the two envs run different torch (conda
-  RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you do need it, **both** need
-  their own build — collection runs in the first, eval/rollout-collection in the second.
+- **pytorch3d is needed only for point clouds — and on Rorqual it is installed in the
+  conda env (0.7.8) but *not* in `policy/pi05/.venv`.** `fps` in `envs/camera/camera.py`
+  (point-cloud downsampling) imports a compiled `_C.so` pinned to a torch ABI, and the two
+  envs run different torch (conda RoboTwin = 2.4.1, `policy/pi05/.venv` = 2.7.0), so if you
+  do need it, **both** need their own build — collection runs in the first,
+  eval/rollout-collection in the second.
   But `fps` is only reached from `camera.py`'s point-cloud path behind
   `pcd_down_sample_num > 0`, and every task config that ships here sets
   `data_type.pointcloud: false`, so nothing calls it and its absence is harmless. Two
@@ -1094,7 +1163,7 @@ Notes:
   ```bash
   cd envs/curobo
   module load cuda/12.6; export CUDA_HOME=$EBROOTCUDA
-  export TORCH_CUDA_ARCH_LIST=8.9 FORCE_CUDA=1
+  export TORCH_CUDA_ARCH_LIST=9.0 FORCE_CUDA=1
   ../../policy/pi05/.venv/bin/python -m pip install -e . \
       --no-build-isolation --no-deps --force-reinstall
   ```
@@ -1105,8 +1174,9 @@ Notes:
   Building against torch `cu128` with the `cuda/12.6` module is fine — same CUDA major, so
   torch's `cpp_extension` warns rather than raising.
 - **Switching GPU generation means rebuilding curobo.** Its CUDA extensions are compiled
-  ahead of time for whatever `TORCH_CUDA_ARCH_LIST` said at build time; an `sm_90` build
-  fails on an L40S at kernel launch ("no kernel image is available"). Check what you have
+  ahead of time for whatever `TORCH_CUDA_ARCH_LIST` said at build time; an `sm_89` build
+  fails on an H100 at kernel launch ("no kernel image is available"), and an `sm_90` one
+  fails the same way on an L40S. Check what you have
   with `cuobjdump --list-elf envs/curobo/src/curobo/curobolib/*.so | grep -o 'sm_[0-9]*'`,
   and clean-rebuild per §1.2. **Build it on a compute node, not the login node** — the
   login node's per-user memory cap kills `nvcc` mid-file, and the failure prints a bare
@@ -1114,9 +1184,9 @@ Notes:
   build needs no internet (`--no-build-isolation --no-deps`), so a compute node is fine.
 - **The critic path needs two out-of-repo checkouts — and staging them on disk is not
   enough.** `guidance_scale != 0` needs the `multisensory_steering` package and the QMFM repo
-  it imports `ReplayBuffer` from via `$QMFM_ROOT`. On Killarney both live under
-  `/home/natashay/projects/aip-florian7/natashay/` (`multisensory-steering` and `QMFM`;
-  that path is a symlink to `/project/6101811/natashay/`), and `policy/pi05/eval.sh` exports
+  it imports `ReplayBuffer` from via `$QMFM_ROOT`. On Rorqual they are at
+  `/lustre09/project/6028519/natashay/multisensory-steering` and
+  `/home/natashay/links/projects/def-florian7/natashay/QMFM`, and `policy/pi05/eval.sh` exports
   the `QMFM_ROOT` default. On a new cluster re-point that export and `critic_config_path`.
   Two traps:
   - **`multisensory_steering` is `import`ed, so it must be installed into `policy/pi05/.venv`**,
@@ -1132,12 +1202,10 @@ Notes:
     without it. Same shape as the `critic_config_path` trap in §6.2 — the guidance switch does
     not gate the guidance imports.
   See §6.2 before turning guidance on.
-- **`uv` is NOT installed on Killarney.** §5.1's `uv sync` / `uv run` instructions assume it;
-  `uv: command not found` here, and there is no binary in `~/.local/bin` or `~/.cargo/bin`.
-  The existing `policy/pi05/.venv` does ship a working `pip` (24.2), so for installing *into*
-  the venv use `policy/pi05/.venv/bin/python -m pip ...`. Install uv from
-  https://astral.sh/uv/install.sh on a login node if you need to re-resolve the lockfile or run
-  `finetune.sh` / `eval.sh` unmodified (both call `uv run`).
+- **`uv` may not exist on a new cluster.** §5.1's `uv sync` / `uv run` instructions assume it
+  (on Rorqual it is at `~/.local/bin/uv`); install it from https://astral.sh/uv/install.sh on a
+  login node if `uv: command not found`. `policy/pi05/.venv` also ships a working `pip`, so for
+  installing *into* the venv `policy/pi05/.venv/bin/python -m pip ...` works without uv.
 - **W&B must be offline on compute nodes.** No internet there, so `wandb.init()` blocks for 90 s
   and can kill the job. `cluster/finetune_pi05.sh` and `policy/pi05/eval.sh` both export
   `WANDB_MODE=offline`; push the runs later with `cluster/wandb_sync.sh` from a login node.

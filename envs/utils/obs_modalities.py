@@ -9,7 +9,7 @@ in the online (eval) and offline (rollout-dataset) paths:
     ``images.third_view``                                              (H, W, 3) uint8
     ``depth.head``      ``depth.left_wrist``   ``depth.right_wrist``   (H, W) float32, mm
     ``pointcloud``      (N, 6) float32, world-frame xyz + rgb
-    ``wrench.left``     ``wrench.right``       (num_steps, 6) float32, world-frame TCP wrench
+    ``wrench.<link>``   one per gripper link   (num_steps, 6) float32, world-frame contact wrench
 
 The names are the rollout dataset's column names minus their ``observation.`` prefix (see
 `script/collect_dataset.py::extra_obs_columns`), which is what lets a critic trained offline on
@@ -69,7 +69,9 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     if len(pointcloud) > 0:
         mods["pointcloud"] = np.asarray(pointcloud, dtype=np.float32)
 
-    for arm, samples in stack_step_wrench(step_wrench, num_steps).items():
-        mods[f"wrench.{arm}"] = samples
+    # One key per end-effector link (aloha: `wrench.fl_link7`, `wrench.fl_link8`,
+    # `wrench.fr_link7`, `wrench.fr_link8`), not one per arm -- see `wrench.link_wrench_vector`.
+    for link, samples in stack_step_wrench(step_wrench, num_steps).items():
+        mods[f"wrench.{link}"] = samples
 
     return mods
