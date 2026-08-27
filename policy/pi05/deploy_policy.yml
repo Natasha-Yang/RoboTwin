@@ -70,7 +70,7 @@ resume: false
 # Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
 # denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
 best_of_n: 1
-guidance_scale: 0.2
+guidance_scale: 0.1
 guidance_ramp_updates: 500
 # The reward the run scores itself with -- what `commit()` feeds the online critic, what the
 # W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
@@ -81,7 +81,7 @@ guidance_ramp_updates: 500
 # arg overrides it.
 use_step_reward: false
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
-critic_ckpt: /home/natasha/multisensory-steering/checkpoints/critic_offline/best.pkl
+critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/2026-08-10 16:39:50/online_value_critic.pkl"
 
 # Everything below only takes effect when a critic is running, i.e. guidance_scale != 0 or
 # best_of_n > 1.

@@ -43,3 +43,9 @@ logs/
 # nested here (see .claude/README.md). Never let them enter this public fork.
 /.claude/conversations/
 /.claude/memory/
+
+# Second curobo checkout, built against policy/pi05/.venv's torch (CLAUDE.md §8).
+envs/curobo_pi05
+envs/curobo_pi05/*
+# Miniforge installer blob (~100M).
+miniforge.sh

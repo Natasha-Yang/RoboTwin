@@ -31,6 +31,14 @@ export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/projects/aip-florian7/natashay/QMF
 # wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
 # `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
 export WANDB_MODE="${WANDB_MODE:-offline}"
+# Same reason: `offline_mix` calls datasets.load_dataset(), which otherwise re-resolves the repo
+# against the Hub on every eval and re-downloads any shard the cache is missing (gigabytes, and
+# it will hang rather than fail on a node with no route out). Force the local $HF_HOME cache.
+# Pre-warm it from a login node first -- both the parquet snapshot *and* the arrow builder cache:
+#   policy/pi05/.venv/bin/python -c "import datasets; datasets.load_dataset('<repo_id>', split='train')"
+# (that venv's python specifically, so nothing rewrites the cache with a newer datasets -- see
+# build_dataset()'s note in multisensory_steering/utils.py).
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 policy_name=pi05
 task_name=${1}
