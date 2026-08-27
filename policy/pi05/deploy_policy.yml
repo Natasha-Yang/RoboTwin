@@ -92,4 +92,4 @@ critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/202
 # best_of_n > 1.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
 # (or overridden on the eval.sh command line) wins over it.
-critic_config_path: /home/natashay/links/projects/def-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
+critic_config_path: /home/natashay/projects/aip-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
