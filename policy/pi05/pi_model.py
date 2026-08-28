@@ -25,9 +25,33 @@ from openpi.shared import download
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
+from openpi.policies.demo_retrieval import DemoRetriever
+
 from multisensory_steering import load_critic
+from multisensory_steering.critics.dsrl import noise_latent_shape
 
 import os
+
+# The two demo-retrieval modalities, switched by the task config's `data_type` block like the
+# rest of them (see envs/utils/obs_modalities.py for the sensor ones). Unlike those, these are
+# produced by the policy rather than by the sim, so the flags reach the model through
+# `deploy_policy.get_model` instead of through the observation.
+PROPOSAL_MODALITIES = ("action_proposals", "noise_proposals")
+
+# The critic families `multisensory_steering.load_critic` can build, and how each one gets to
+# act on the frozen sampler:
+#
+#   qmfm  an ensemble Q over *action chunks*. It steers the denoising by value gradient
+#         (`guidance_scale`) and/or ranks the chunks it produces (`best_of_n`); either one on
+#         its own turns the critic path on.
+#   dsrl  SAC over the sampler's *latent noise*. The denoising itself is untouched -- the actor
+#         picks the noise chunk pi0.5 denoises from, inside `Pi0.sample_actions`
+#         (`noise_apply`), and its Q is over that latent rather than over the chunk.
+#
+# They are mutually exclusive by construction: a DSRL Q(s, w) cannot score an action chunk, so
+# it has nothing to guide or rank with, and `_init_critic` refuses the combination.
+CRITIC_TYPES = ("qmfm", "dsrl")
+
 
 class PI0:
 
@@ -35,8 +59,9 @@ class PI0:
                  critic_ckpt=None, guidance_scale=0.0, best_of_n=1,
                  guidance_ramp_updates=0, critic_ramp_baseline=None,
                  online_critic=False, train_critic_online=True,
-                 critic_config=None, critic_seed=0,
-                 collect_critic_obs=False, collect_siglip=True):
+                 critic_config=None, critic_seed=0, noise_warmup_chunks=0,
+                 collect_critic_obs=False, collect_siglip=True,
+                 demo_proposals=(), demo_retrieval=None, task_name=None):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
@@ -71,16 +96,42 @@ class PI0:
         # actually running. Never affects sampling: it reads the chunk after it was drawn.
         self.record_q_values = False
         self.last_q_values = None
+        # The same idea for demo retrieval: keep a thumbnail of every bank row and remember which
+        # rows each control step matched, so `envs/utils/debug_vis.py::DemoRetrievalRecorder` can
+        # draw the query frame beside the demo frames it retrieved. Set by the eval driver when
+        # the task config has `debug: true`; must be set before the first bank is built.
+        self.record_demo_retrieval = False
+        self.last_demo_retrieval = None
+        # The bank the critic's offline half was ranked against, so it happens exactly once.
+        self._offline_retrieval_bank = None
+        # Which key modalities each cross-attending proposal set needs, filled in from the
+        # critic's own config once it exists (`_init_critic`).
+        self._proposal_key_modalities = {}
+
+        # Demo retrieval (see openpi/policies/demo_retrieval.py). `demo_proposals` names which
+        # of the two proposal modalities the task config's `data_type` block turned on:
+        # `action_proposals` (the retrieved demo chunks) and/or `noise_proposals` (the seeds that
+        # map to them under the current observation). They are critic inputs and nothing else, so
+        # a run without a critic never builds the retriever -- there would be no consumer, and
+        # the inversion is the most expensive thing in the control step.
+        self.proposal_modalities = tuple(demo_proposals or ())
+        if unknown := sorted(set(self.proposal_modalities) - set(PROPOSAL_MODALITIES)):
+            raise ValueError(f"unknown proposal modalities {unknown}; expected {list(PROPOSAL_MODALITIES)}.")
+        self.demo_retriever = None
+        self._demo_retrieval_config = dict(demo_retrieval or {})
+        self.task_name = task_name
 
         config = _config.get_config(self.train_config_name)
         self.model_config = config.model
         checkpoint_dir = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}"
 
-        # Online QMFM Value-critic gradient guidance for the flow-matching sampler (see
-        # multisensory_steering and Pi0.sample_actions). Enabled by the caller iff the target
-        # guidance_scale is nonzero. The critic (an ensemble Q) is trained ONLINE during eval
-        # rollouts; its d(value)/d(action), differentiated through pi0.5's velocity, steers
-        # each denoising step toward higher Q (QMFM denoised-estimate steering).
+        # Online critic for the flow-matching sampler (see multisensory_steering and
+        # Pi0.sample_actions), of whichever family CRITIC_TYPES names. The QMFM one is an
+        # ensemble Q over action chunks whose d(value)/d(action), differentiated through pi0.5's
+        # velocity, steers each denoising step toward higher Q (QMFM denoised-estimate
+        # steering); the DSRL one is a SAC actor-critic over the sampler's latent noise, which
+        # leaves the denoising alone and changes what it starts from. Either way the critic is
+        # trained ONLINE during the eval rollouts, off the same transitions.
         #
         # The critic scores the action chunk in *embodiment* dims -- the width of
         # observation["joint_action"]["vector"] -- which nothing here knows until the sim hands
@@ -98,6 +149,27 @@ class PI0:
         self.train_critic_online = bool(train_critic_online)
         self.online_critic = None
         self.critic_action_dim = None
+        # Which family that critic is, and therefore how it acts on the sampler (CRITIC_TYPES).
+        # It is a critic-side choice, so it arrives in the critic config like every other one.
+        self.critic_type = str((critic_config or {}).get("critic_type") or "qmfm")
+        if self.critic_type not in CRITIC_TYPES:
+            raise ValueError(
+                f"unknown critic_type {self.critic_type!r}; expected one of {list(CRITIC_TYPES)}."
+            )
+        if self.critic_type == "dsrl" and (self.guidance_scale_target != 0.0 or self.best_of_n > 1):
+            raise ValueError(
+                f"critic_type: dsrl steers by choosing the sampler's noise, so it has no Q over "
+                f"action chunks to guide or rank with, but guidance_scale="
+                f"{self.guidance_scale_target} / best_of_n={self.best_of_n} ask it for one. Set "
+                f"guidance_scale: 0 and best_of_n: 1 (they are what turn the *qmfm* critic on)."
+            )
+        # DSRL only: control steps to spend on the base policy's own Gaussian latent before the
+        # actor takes over, so the buffer starts with transitions from the distribution pi0.5
+        # was trained to denoise rather than from an untrained tanh actor (dsrl_pi0 collects its
+        # whole first trajectory this way). Counted across the run, not per episode.
+        self._noise_warmup_left = (max(0, int(noise_warmup_chunks or 0))
+                                   if self.critic_type == "dsrl" else 0)
+        self._noise_rng = np.random.default_rng(critic_seed)
         # Sensor modalities from the sim observation (depth / point cloud / contact wrench --
         # see envs/utils/obs_modalities.py), handed in by deploy_policy.eval. The model itself
         # only produces `state` and a `siglip.<view>` map per camera; everything else the critic
@@ -125,10 +197,10 @@ class PI0:
                   f"and running the plain pi0.5 baseline")
         if online_critic and not self.train_critic_online and not critic_ckpt:
             # A frozen critic never leaves its initialization, so this would steer the sampler
-            # by the gradients of a randomly initialized network for the whole run.
+            # off a randomly initialized network for the whole run.
             raise ValueError(
                 "train_critic_online is false and critic_ckpt is null: the critic would stay at "
-                "its random initialization and guide the sampler with meaningless gradients. "
+                "its random initialization and steer the sampler on meaningless values. "
                 "Point critic_ckpt at an offline-trained critic, or set train_critic_online "
                 "true to train one during the rollouts."
             )
@@ -141,6 +213,52 @@ class PI0:
         self.img_size = (224, 224)
         self.observation_window = None
         self.pi0_step = pi0_step
+
+        if self.proposal_modalities and not self.uses_online_critic:
+            print(f"[pi_model] no critic this run -- ignoring data_type "
+                  f"{list(self.proposal_modalities)} (nothing would consume the proposals)")
+            self.proposal_modalities = ()
+        if self.proposal_modalities:
+            self._init_demo_retriever()
+
+    def _init_demo_retriever(self):
+        """Open the demo dataset and index its episodes by RoboTwin task.
+
+        Up front rather than on the first observation: it reads a dataset off disk and matches
+        every episode's instruction back to a task, so a bad `repo_id` or a task the dataset
+        does not cover should stop the run before it spends an hour of rollouts. Only the
+        *bank* is per-episode (`set_language`), and only the encoding in it is expensive.
+        """
+        cfg = dict(self._demo_retrieval_config)
+        repo_id = cfg.pop("repo_id", None)
+        if not repo_id:
+            raise ValueError(
+                f"data_type {list(self.proposal_modalities)} needs a demo dataset: set "
+                f"`demo_retrieval.repo_id` in deploy_policy.yml to the LeRobot dataset the "
+                f"demonstrations come from."
+            )
+        if not self.task_name:
+            raise ValueError("demo retrieval needs `task_name` to pick demonstrations of the right task.")
+        cfg.pop("enabled", None)
+        cfg = {k: v for k, v in cfg.items() if v is not None}
+        self.demo_retriever = DemoRetriever(
+            self.policy._model,
+            self.policy._input_transform,
+            repo_id=repo_id,
+            invert="noise_proposals" in self.proposal_modalities,
+            **cfg,
+        )
+        episodes = self.demo_retriever.episodes_for_task(self.task_name)
+        print(f"[pi_model] retrieval similarity: {self.demo_retriever.describe_similarity()}")
+        print(f"[pi_model] proposal action space: {self.demo_retriever.describe_action_space()}")
+        print(f"[pi_model] demo retrieval: {list(self.proposal_modalities)} from {repo_id} "
+              f"({len(episodes)} episodes of {self.task_name}), "
+              f"{self.demo_retriever.num_demos} demo(s) per episode, top_k="
+              f"{self.demo_retriever.top_k}, views="
+              f"{[v.split('.', 1)[1] for v in self.demo_retriever.views]}"
+              + (f", inverted at num_steps={self.demo_retriever.num_steps} x "
+                 f"{self.demo_retriever.num_inner_steps} fixed-point iterations"
+                 if self.demo_retriever.invert else ", no inversion (action_proposals only)"))
 
     @staticmethod
     def _siglip_views(collect_siglip):
@@ -191,12 +309,37 @@ class PI0:
                       f"collection (action chunk={chunk}, {siglip})")
             return
 
+        if self.demo_retriever is not None:
+            # The proposals are model-produced, so unlike the sim's sensor modalities they are
+            # not in `critic_obs_extra` yet -- the first one is retrieved on the first
+            # get_action. Seeding them here puts them in `obs_shapes` (and so in
+            # `_critic_extra_shapes`) alongside everything else, with the width the critic
+            # scores in: the proposal is the same kind of object as the chunk it is compared to.
+            shape = (self.demo_retriever.top_k, horizon, self.critic_action_dim)
+            for name in self.proposal_modalities:
+                self.critic_obs_extra[name] = np.zeros(shape, dtype=np.float32)
+
         cc = dict(self._critic_config)
-        cc["action_dim_flat"] = horizon * self.critic_action_dim
         # State is the model-space state narrowed back to the embodiment's own dims, exactly as
         # the sampler emits it (Pi0.sample_actions::critic_observation) and as the collected
         # `observation.state.model` column stores it -- not the padded action_dim.
         cc["state_dim"] = self.critic_action_dim
+        # What the critic's Q takes as its *action*, which is what distinguishes the two
+        # families. For qmfm it is the chunk the sampler produces, in embodiment dims. For DSRL
+        # it is the latent that chunk was denoised from, and that lives in the model's own
+        # padded `action_dim` (32): the trailing dims are dead in an *action* but not in a
+        # *noise*, since all 32 go through `action_in_proj` and shape the 14 that come out.
+        # The full latent is `horizon x action_dim` (50 x 32 = 1600), far too wide for SAC to
+        # act in, so the actor acts in a low-rank family inside it and `noise_param` says which
+        # one: `noise_horizon` rows held out to the horizon (dsrl_pi0's scheme), or the factors
+        # of a rank-`noise_rank` product. `dsrl.noise_latent_shape` is the one place that turns
+        # that choice into a width.
+        if self.critic_type == "dsrl":
+            cc["noise_action_dim"] = int(self.model_config.action_dim)
+            cc["sampler_horizon"] = horizon
+            cc["action_dim_flat"] = int(np.prod(noise_latent_shape(cc, horizon)))
+        else:
+            cc["action_dim_flat"] = horizon * self.critic_action_dim
         cc["siglip_channels"] = 1152
         cc["siglip_grid"] = 16
         # Everything the critic *may* condition on this run: the modalities the sampler produces
@@ -213,13 +356,56 @@ class PI0:
             **{key: tuple(np.shape(value)) for key, value in self.critic_obs_extra.items()},
         }
         self.online_critic = load_critic(cc, self._critic_ckpt)
+        if self.demo_retriever is not None and not set(self.proposal_modalities) & set(self.online_critic.obs_keys):
+            # The data_type flags only *offer* the proposals; the critic's own
+            # `encoder_modalities` decides whether it reads them, exactly as for every other
+            # modality. Retrieval is the most expensive thing in a control step, so a critic
+            # that ignores them must not be charged for them -- and a config that turned the
+            # flags on and forgot the encoder side should hear about it rather than pay
+            # silently.
+            print(f"[pi_model] critic does not read {list(self.proposal_modalities)} "
+                  f"(encoder_modalities: {list(self.online_critic.obs_keys)}) -- turning demo "
+                  f"retrieval off for this run")
+            self.demo_retriever = None
+            for name in PROPOSAL_MODALITIES:
+                self.critic_obs_extra.pop(name, None)
+            self.proposal_modalities = ()
+        elif self.demo_retriever is not None:
+            # How the critic consumes the pool: attended (the distance only shortlists) or
+            # pooled (the distance is the whole selection). Per modality, since the two
+            # proposal forms can be configured with different encoders.
+            attends = getattr(self.online_critic, "proposal_modalities", ())
+            for name in self.proposal_modalities:
+                candidates = f"the {self.demo_retriever.top_k} retrieved candidate(s)"
+                print(f"[pi_model] {name}: the critic "
+                      + (f"cross-attends {candidates} -- keys from "
+                         f"{list(self.online_critic.proposal_keys[name])}, query from all of "
+                         f"{list(self.online_critic.obs_keys)}"
+                         if name in attends else f"pools {candidates} (max+mean over the set)"))
+        # The candidates' own observations, one `(top_k, *shape)` array per key modality of
+        # every proposal set the critic cross-attends. Unlike everything else here these are not
+        # a modality the run offers -- the critic decides which of them it needs and how wide
+        # they are (`OnlineValueCritic.obs_shapes`), and `_refresh_demo_proposals` fills them in
+        # per control step from the rows retrieval returned. Seeded now so they take part in
+        # `_critic_extra_shapes` like any other per-step array.
+        self._proposal_key_modalities = {
+            name: tuple(self.online_critic.proposal_keys[name])
+            for name in getattr(self.online_critic, "proposal_modalities", ())
+            if name in self.proposal_modalities
+        }
+        for name, modalities in self._proposal_key_modalities.items():
+            for modality in modalities:
+                entry = f"{name}.keys.{modality}"
+                self.critic_obs_extra[entry] = np.zeros(
+                    self.online_critic.obs_shapes[entry], self.online_critic.buffer_dtype(entry)
+                )
         # The subset that has to be shipped into the sampler on every call (the other two are
         # built in there). Their shapes are fixed here and enforced per step: a point cloud
         # collected with `pcd_down_sample_num: 0` has a different N every step, which would
         # otherwise surface as an XLA recompile per control step.
         self._critic_extra_shapes = {
-            key: cc["obs_shapes"][key]
-            for key in self.online_critic.obs_keys
+            key: self.online_critic.obs_shapes[key]
+            for key in self.online_critic.buffer_keys
             if key in self.critic_obs_extra
         }
         # A warm-started critic restores its lifetime update counter from the checkpoint (an
@@ -238,17 +424,34 @@ class PI0:
         # this cannot tell a *raw-space* critic apart from a model-space one: the raw
         # observation.state / action columns have the same widths as their .model counterparts,
         # differing only in normalization. Getting that right is on whoever trains the critic.
+        if self.critic_type == "dsrl":
+            scored = (f"the {cc['action_dim_flat'] // cc['noise_action_dim']}x"
+                      f"{cc['noise_action_dim']} noise chunk pi0.5 denoises from")
+            fix = ("Only a DSRL checkpoint of the same embodiment and `noise_horizon` fits.")
+        else:
+            scored = f"the {chunk} normalized action chunk"
+            fix = ("Collect a rollout dataset with collect_critic_obs and train on the "
+                   "observation.state.model / action.model columns.")
         for key in ("action_dim_flat", "state_dim"):
             got, want = int(self.online_critic.config[key]), int(cc[key])
             if got != want:
                 raise ValueError(
                     f"critic checkpoint {self._critic_ckpt!r} was trained with {key}={got}, but "
-                    f"pi0.5 guidance feeds {key}={want} (state is the "
-                    f"{self.critic_action_dim}-dim model state; the action chunk is "
-                    f"{chunk} normalized). Collect a rollout dataset with collect_critic_obs "
-                    f"and train on the observation.state.model / action.model columns."
+                    f"this run feeds {key}={want} (state is the {self.critic_action_dim}-dim "
+                    f"model state; the action is {scored}). {fix}"
                 )
 
+        if self.critic_type == "dsrl":
+            self._wire_dsrl_sampler(cc)
+        else:
+            self._wire_qmfm_sampler(cc, chunk)
+        unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
+        print(f"[pi_model] critic observation: "
+              + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
+              + (f" (available but unused: {', '.join(unused)})" if unused else ""))
+
+    def _wire_qmfm_sampler(self, cc, chunk):
+        """Point the sampler at the Value critic: gradient guidance and/or best-of-N."""
         self.policy._sample_kwargs.update({
             "critic_apply": self.online_critic.critic_apply,
             # A `None` guidance scale switches the value gradient off entirely, which is what a
@@ -261,9 +464,6 @@ class PI0:
             "best_of_n": self.best_of_n,
             "critic_action_dim": self.critic_action_dim,
         })
-        warm = (f"warm-started from {self._critic_ckpt} at "
-                f"{int(self.online_critic.num_updates)} updates" if self._critic_ckpt
-                else "from scratch")
         if not self.train_critic_online:
             ramp = "no ramp (frozen critic), "
         elif self._critic_ramp_baseline is None:
@@ -275,8 +475,6 @@ class PI0:
             ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (resumed at update "
                     f"{int(self.online_critic.num_updates) - self._critic_updates_at_start} of "
                     f"the ramp -> guidance {self.scheduled_guidance_scale():.4g}), ")
-        mode = "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
-        unused = sorted(set(cc["obs_shapes"]) - set(self.online_critic.obs_keys))
         if self.guidance_scale_target == 0.0:
             # Best-of-N only: the sampler is the plain pi0.5 one and the critic never enters a
             # gradient, it only ranks. Say so, rather than printing a guidance target of 0.
@@ -286,13 +484,40 @@ class PI0:
             steering = f"guidance_scale_target={self.guidance_scale_target}, "
         select = (f"best-of-{self.best_of_n} (highest ensemble-mean Q per control step), "
                   if self.best_of_n > 1 else "")
-        print(f"[pi_model] QMFM Value critic enabled, critic {mode} ({warm}, "
-              f"{steering}{select}{ramp}"
+        print(f"[pi_model] QMFM Value critic enabled, critic {self._critic_mode()} "
+              f"({self._critic_warm()}, {steering}{select}{ramp}"
               f"num_qs={cc['num_qs']}, action chunk={chunk} "
               f"-> action_dim_flat={cc['action_dim_flat']})")
-        print(f"[pi_model] critic observation: "
-              + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
-              + (f" (available but unused: {', '.join(unused)})" if unused else ""))
+
+    def _wire_dsrl_sampler(self, cc):
+        """Point the sampler at the DSRL actor: it picks the noise, the denoising is untouched.
+
+        No guidance kwargs and no `critic_apply` -- there is nothing for the denoising loop to
+        climb, so the sampler stays byte-for-byte the frozen pi0.5 one and only the latent it
+        starts from changes. `return_critic_obs` is what carries the actor's choice back out
+        (`critic_noise`) along with the observation it was made against.
+        """
+        self.policy._sample_kwargs.update({
+            "noise_apply": self.online_critic.noise_apply,
+            "critic_action_dim": self.critic_action_dim,
+            "return_critic_obs": True,
+        })
+        noise_h, noise_d = self.online_critic.action_chunk_shape
+        warmup = (f"{self._noise_warmup_left} warmup chunk(s) on Gaussian noise first, "
+                  if self._noise_warmup_left else "")
+        print(f"[pi_model] DSRL noise-space actor enabled, agent {self._critic_mode()} "
+              f"({self._critic_warm()}, {warmup}noise chunk={noise_h}x{noise_d} held out to "
+              f"{self.model_config.action_horizon} denoising rows "
+              f"-> action_dim_flat={cc['action_dim_flat']}, "
+              f"|w| <= {float(self.online_critic.config['action_magnitude']):g})")
+
+    def _critic_warm(self):
+        return (f"warm-started from {self._critic_ckpt} at "
+                f"{int(self.online_critic.num_updates)} updates" if self._critic_ckpt
+                else "from scratch")
+
+    def _critic_mode(self):
+        return "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
 
     @property
     def critic_ramp_baseline(self):
@@ -339,6 +564,18 @@ class PI0:
     def set_language(self, instruction):
         self.instruction = instruction
         print(f"successfully set instruction:{instruction}")
+        if self.demo_retriever is not None:
+            # One draw of demonstrations for the whole run, built on the first episode and held
+            # for every later one -- the proposals are a critic input, and re-drawing would move
+            # what the critic is conditioned on partway through the eval (see
+            # DemoRetriever.ensure_bank). The instruction plays no part in the choice:
+            # demonstrations are selected by RoboTwin *task*, and one task's episodes carry
+            # hundreds of different instructions (see demo_retrieval).
+            self.demo_retriever.record_retrieval = self.record_demo_retrieval
+            first = self.demo_retriever.bank is None
+            bank = self.demo_retriever.ensure_bank(self.task_name)
+            if first:
+                print(f"[pi_model] demo bank (fixed for this run): {bank.describe()}")
 
     # Update the observation window buffer
     def update_observation_window(self, img_arr, state, critic_obs=None):
@@ -403,12 +640,75 @@ class PI0:
             obs[key] = value
         return obs
 
+    def _refresh_demo_proposals(self):
+        """Retrieve this control step's demo proposals into the critic's extra observation.
+
+        Narrowed to `critic_action_dim` on the way in, exactly as the sampler narrows the chunk
+        it scores: the model pads both to `action_dim` (32) and those trailing dims are constant
+        zero for aloha, so a proposal keeps only the embodiment's own dims and lines up
+        term-for-term with the action the critic is judging.
+
+        Costs one image tower + prefix pass on top of the sampler's own, plus -- when
+        `noise_proposals` is on -- `num_steps * num_inner_steps` action-expert passes at batch
+        `top_k` for the inversion. That is the dominant cost of the whole control step, which is
+        why nothing builds a retriever unless a critic asked for these.
+        """
+        if self.demo_retriever is None:
+            return
+        proposals = self.demo_retriever.propose(self.observation_window)
+        for name in self.proposal_modalities:
+            self.critic_obs_extra[name] = proposals[name][..., : self.critic_action_dim]
+        self._refresh_proposal_keys(proposals["proposal_rows"])
+        self.last_demo_retrieval = self.demo_retriever.retrieved()
+
+    def _refresh_proposal_keys(self, rows):
+        """Encode the retrieved rows' own observations, for a critic that cross-attends them.
+
+        The keys' side of the attention: the same modalities the critic encodes the live
+        observation with, run over the demo frames the distance shortlisted. They are computed
+        here, per control step, rather than held for every frame of the bank -- a SigLIP patch
+        map is ~0.6 MB per view, so a resident bank of them was ~0.9 GB of device memory that
+        grew with `bank_size` (see `demo_retrieval.DemoRetriever.critic_keys`). The cost is one
+        image-tower pass at batch `top_k`.
+
+        One pass covers both proposal sets: they are retrieved together and so share their rows,
+        and the two may still be configured with different `key_modalities`, so the union is
+        encoded once and fanned out.
+        """
+        if not self._proposal_key_modalities:
+            return
+        # The offline half of a co-trained batch retrieves against this same bank, ranked once
+        # (`OnlineValueCritic.attach_demo_retrieval`). Here rather than at `_init_critic`
+        # because the bank is drawn on the first episode, and idempotent by the same flag the
+        # proposals themselves are refreshed under.
+        if self._offline_retrieval_bank is not self.demo_retriever.bank:
+            self.online_critic.attach_demo_retrieval(self.demo_retriever)
+            self._offline_retrieval_bank = self.demo_retriever.bank
+        wanted = sorted({m for ms in self._proposal_key_modalities.values() for m in ms})
+        keys = self.demo_retriever.critic_keys(rows, wanted, state_dim=self.critic_action_dim)
+        for name, modalities in self._proposal_key_modalities.items():
+            for modality in modalities:
+                entry = f"{name}.keys.{modality}"
+                # A patch map arrives as the flat `(top_k, 256, 1152)` sequence the tower emits;
+                # the critic's encoder takes the `(16, 16, 1152)` grid.
+                self.critic_obs_extra[entry] = keys[modality].reshape(
+                    self._critic_extra_shapes[entry]
+                )
+
     def get_action(self):
         assert self.observation_window is not None, "update observation_window first!"
-        if self.online_critic is not None:
-            # Inject the current (traced) critic params so online updates take effect without an
-            # XLA recompile. The scheduled guidance scale is also traced, so changing it per
-            # call ramps guidance without compiling a sampler for each scalar value.
+        if self.online_critic is None:
+            out = self.policy.infer(self.observation_window)
+            self._stash_critic_obs(out)
+            return out["actions"]
+
+        # Inject the current (traced) network params so online updates take effect without an
+        # XLA recompile.
+        if self.critic_type == "dsrl":
+            self.policy._sample_kwargs["actor_params"] = self.online_critic.actor_params
+        else:
+            # The scheduled guidance scale is traced too, so changing it per call ramps guidance
+            # without compiling a sampler for each scalar value.
             self.current_guidance_scale = self.scheduled_guidance_scale()
             self.policy._sample_kwargs["critic_params"] = self.online_critic.params
             if self.guidance_scale_target != 0.0:
@@ -417,35 +717,70 @@ class PI0:
                 self.policy._sample_kwargs["guidance_scale"] = jnp.asarray(
                     self.current_guidance_scale, dtype=jnp.float32
                 )
-            extra = self._critic_extra_obs()
-            self.policy._sample_kwargs["critic_obs_extra"] = {
-                key: jnp.asarray(value)[None, ...] for key, value in extra.items()
-            }
-            # Stash this control step's (obs, action) for the replay buffer. Every SigLIP view
-            # the sampler produced is offered; `stash` keeps only the critic's own
-            # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
-            # skips this entirely -- nothing would ever train on the transitions, and the buffer
-            # is allocated lazily, so it never costs the run any memory.
-            out = self.policy.infer(self.observation_window)
-            critic_obs = {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra}
-            if self.best_of_n > 1:
-                # Which of the N candidates was executed, and what the critic scored all of them
-                # at. `critic_action` below is already the winner, so everything downstream --
-                # the replay transition, the Q log -- is about the chunk that actually ran.
-                self.last_best_index = int(out["critic_best_index"])
-                self.last_best_scores = np.asarray(out["critic_best_scores"], dtype=np.float32)
-            if self.train_critic_online:
-                self.online_critic.stash(critic_obs, out["critic_action"])
-            if self.record_q_values:
-                # The value the guidance was climbing, at the chunk it actually arrived at:
-                # `critic_action` is the normalized chunk the sampler scored (embodiment dims),
-                # and `critic_obs` the observation it scored it against.
-                self.last_q_values = self.online_critic.q_values(critic_obs, out["critic_action"])
-            self._stash_critic_obs(out)
-            return out["actions"]
-        out = self.policy.infer(self.observation_window)
+        self._refresh_demo_proposals()
+        extra = self._critic_extra_obs()
+        # The candidates' own observations go in under the names the critic's cross attention
+        # reads them by (`OnlineValueCritic.proposal_key_obs`); everything else goes in as it
+        # stands, under its own modality name.
+        self.policy._sample_kwargs["critic_obs_extra"] = {
+            **{key: jnp.asarray(value)[None, ...]
+               for key, value in extra.items() if key in self.online_critic.obs_keys},
+            **self.online_critic.proposal_key_obs(extra),
+        }
+
+        warmup_noise = self._warmup_noise()
+        out = self.policy.infer(
+            self.observation_window,
+            # Expanded by the agent, not here: the latent the warmup draws is in the actor's own
+            # parameterization, so what it means as a 50x32 chunk is the agent's to say.
+            noise=(None if warmup_noise is None
+                   else self.online_critic.expand_noise(warmup_noise)[None]),
+        )
+        critic_obs = {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra}
+        if self.best_of_n > 1:
+            # Which of the N candidates was executed, and what the critic scored all of them
+            # at. `critic_action` below is already the winner, so everything downstream --
+            # the replay transition, the Q log -- is about the chunk that actually ran.
+            self.last_best_index = int(out["critic_best_index"])
+            self.last_best_scores = np.asarray(out["critic_best_scores"], dtype=np.float32)
+        # What this critic's Q takes as its action, and therefore what the replay transition and
+        # the Q log are about: the normalized chunk the sampler scored, or -- for DSRL -- the
+        # latent it denoised that chunk from, which during warmup is the draw made here.
+        if self.critic_type != "dsrl":
+            critic_action = out["critic_action"]
+        else:
+            critic_action = out["critic_noise"] if warmup_noise is None else warmup_noise
+        # Stash this control step's (obs, action) for the replay buffer. Every SigLIP view
+        # the sampler produced is offered; `stash` keeps only the critic's own
+        # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
+        # skips this entirely -- nothing would ever train on the transitions, and the buffer
+        # is allocated lazily, so it never costs the run any memory.
+        if self.train_critic_online:
+            self.online_critic.stash(critic_obs, critic_action)
+        if self.record_q_values:
+            self.last_q_values = self.online_critic.q_values(critic_obs, critic_action)
         self._stash_critic_obs(out)
         return out["actions"]
+
+    def _warmup_noise(self):
+        """The Gaussian latent for this control step, while a DSRL run is still warming up.
+
+        dsrl_pi0 collects its first trajectory from the base policy's own noise before letting
+        SAC choose, so the buffer's first transitions come from the distribution pi0.5 was
+        trained to denoise rather than from an untrained tanh actor. Drawn here rather than
+        inside the sampler because it is also what gets stashed as the transition's action.
+
+        None once the actor takes over -- and always for every other critic -- which is what
+        makes `Pi0.sample_actions` fall through to `noise_apply`. The switch costs one sampler
+        recompile, since passing a `noise=` argument at all is what changes.
+        """
+        if self._noise_warmup_left <= 0:
+            return None
+        self._noise_warmup_left -= 1
+        if self._noise_warmup_left == 0:
+            print("[pi_model] DSRL noise warmup over -- the actor picks the latent from the "
+                  "next control step (one sampler recompile)")
+        return self._noise_rng.standard_normal(self.online_critic.action_chunk_shape).astype(np.float32)
 
     def _stash_critic_obs(self, out):
         """Keep the last control step's model-space critic view for dataset collection.

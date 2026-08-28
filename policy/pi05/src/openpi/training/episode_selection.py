@@ -68,8 +68,7 @@ def select_episodes_per_task(repo_id: str, episodes_per_task: int, seed: int) ->
         else:
             instructions.append(ep_tasks[0].strip())
 
-    matchers = _task_matchers()
-    ep_task_names = _assign_episodes_to_tasks(instructions, matchers)
+    ep_task_names = assign_episode_tasks(instructions)
 
     task_to_eps: dict[str, list[int]] = collections.defaultdict(list)
     for ep_idx, task_name in zip(ep_indices, ep_task_names):
@@ -96,6 +95,19 @@ def select_episodes_per_task(repo_id: str, episodes_per_task: int, seed: int) ->
         {name: info["num_available"] for name, info in per_task.items()},
     )
     return selected, per_task
+
+
+def assign_episode_tasks(instructions: list[str | None]) -> list[str]:
+    """The RoboTwin task name of every episode, given their instructions in episode-index order.
+
+    The module docstring explains how: regex-match the resolved instructions back to the
+    templates in `description/task_instruction`, then use episode-index contiguity to settle the
+    ones several tasks could have produced. Shared with inference-time demo retrieval
+    (`openpi.policies.demo_retrieval`), which needs the same episode -> task map to pick
+    demonstrations of the task being evaluated -- whatever instruction each of them happens to
+    carry.
+    """
+    return _assign_episodes_to_tasks(instructions, _task_matchers())
 
 
 def _assign_episodes_to_tasks(instructions: list[str | None], matchers: list[tuple[str, re.Pattern]]) -> list[str]:

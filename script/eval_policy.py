@@ -21,7 +21,7 @@ sys.path.append(f"./policy")
 sys.path.append("./description/utils")
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
-from envs.utils.debug_vis import QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
+from envs.utils.debug_vis import DemoRetrievalRecorder, QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
 
 import numpy as np
 from pathlib import Path
@@ -221,19 +221,14 @@ def log_critic_update(wandb_run, online_critic, model, info, chunk_count, episod
     if wandb_run is None or info is None:
         return
     buf = online_critic.buffer.size if online_critic.buffer is not None else 0
-    wandb_run.log({
+    # Whatever the update reported, under its own name -- the two critic families share the TD
+    # diagnostics (`critic_loss`, `q_mean`, `target_q_mean`, `reward_mean`, and the `lr` the
+    # Adam schedule reached) and each adds its own on top, DSRL's actor and temperature among
+    # them. `critic/loss` is kept as an alias so a run's curves stay comparable with older ones.
+    metrics = {f"critic/{key}": _scalar(value) for key, value in info.items()}
+    metrics.update({
         "critic/update": int(online_critic.num_updates),
         "critic/loss": _scalar(info["critic_loss"]),
-        "critic/q_mean": _scalar(info["q_mean"]),
-        "critic/q_max": _scalar(info["q_max"]),
-        "critic/q_min": _scalar(info["q_min"]),
-        "critic/target_q_mean": _scalar(info["target_q_mean"]),
-        "critic/reward_mean": _scalar(info["reward_mean"]),
-        # The rate this update was actually taken at: the critic's Adam warms up over
-        # `lr_warmup_steps` and cosine-decays over `lr_decay_steps` (cfgs/qmfm.yaml), both
-        # counted in updates of this run, so the curve doubles as a check that the schedule
-        # covers the update budget the run really has.
-        "critic/lr": _scalar(info["lr"]),
         "critic/buffer_size": int(buf),
         "critic/guidance_scale": float(model.scheduled_guidance_scale()),
         "critic/guidance_scale_target": float(model.guidance_scale_target),
@@ -241,6 +236,7 @@ def log_critic_update(wandb_run, online_critic, model, info, chunk_count, episod
         "rollout/episode": int(episode_idx),
         "rollout/action_count": int(action_count),
     })
+    wandb_run.log(metrics)
 
 
 def log_episode(
@@ -701,6 +697,16 @@ def main(usr_args):
     # Off leaves the sparse terminal reward, which is what the critic is then trained on.
     args["use_step_reward"] = usr_args["use_step_reward"]
 
+    # Demo-retrieval proposals are `data_type`s like the rest (see the task config), but the
+    # policy produces them rather than the sim, so they cannot reach the model on the
+    # observation the way depth or a point cloud does -- they are forwarded to `get_model`
+    # instead. Everything else about retrieval (which demo dataset, how many demos, how many
+    # neighbours) is in deploy_policy.yml under `demo_retrieval`; these two only say whether
+    # the critic is offered them. Both default off.
+    usr_args["demo_proposals"] = {
+        name: bool(args["data_type"].get(name, False)) for name in ("action_proposals", "noise_proposals")
+    }
+
     st_seed = 100000 * (1 + seed)
     suc_nums = []
     test_num = usr_args.get("test_num", 100)
@@ -838,6 +844,15 @@ def eval_policy(task_name,
     q_recorder = QValueRecorder(debug_save_dir, frame_log) if debug and _uses_online_critic(model) else None
     if q_recorder is not None:
         model.record_q_values = True
+    # Demo retrieval diagnostics: what the top-K similarity actually matched, per control step.
+    # Needs the policy to be retrieving at all (the two proposal `data_type` flags), and the flag
+    # has to be set before the first bank is built -- the thumbnails it draws are the only part
+    # of a demo episode that would otherwise be dropped after encoding.
+    retriever = getattr(model, "demo_retriever", None)
+    retrieval_recorder = (DemoRetrievalRecorder(debug_save_dir, frame_log)
+                          if debug and retriever is not None else None)
+    if retrieval_recorder is not None:
+        model.record_demo_retrieval = True
     # Best-of-N selection diagnostics. Unlike the Q recorder this costs nothing (the scores are
     # a by-product of the selection the sampler already made) and needs no `debug`, so it is on
     # whenever the policy is actually choosing between candidates.
@@ -849,10 +864,17 @@ def eval_policy(task_name,
     if debug:
         print(f"\033[93m[debug] depth/point-cloud visualization ON "
               f"(interactive={debug_show}, saving to {debug_save_dir})\033[0m")
-        print(f"\033[93m[debug] TCP wrench logging ON (saving to {debug_save_dir}/episode<N>/)\033[0m")
+        print(f"\033[93m[debug] end-effector wrench logging ON, per gripper link "
+              f"(saving to {debug_save_dir}/episode<N>/)\033[0m")
         print(f"\033[93m[debug] critic Q logging "
               + (f"ON (saving to {debug_save_dir}/episode<N>/)" if q_recorder is not None
-                 else "OFF (no critic: guidance_scale is 0 and best_of_n is 1)") + "\033[0m")
+                 else "OFF (no critic: guidance_scale is 0, best_of_n is 1 and critic_type is "
+                      "not dsrl)") + "\033[0m")
+        print(f"\033[93m[debug] demo retrieval logging "
+              + (f"ON, top-{max(retriever.top_k, retriever.debug_top_k)} "
+                 f"(saving to {debug_save_dir}/episode<N>/)"
+                 if retrieval_recorder is not None
+                 else "OFF (no data_type.action_proposals / data_type.noise_proposals)") + "\033[0m")
 
     # Where each finished episode is committed (see the notes above `append_episode_row`).
     csv_path = save_dir / EPISODE_CSV
@@ -989,6 +1011,10 @@ def eval_policy(task_name,
             # observation it was drawn from was taken at, so it lines up with that frame.
             if q_recorder is not None:
                 q_recorder.record(model, observation, step, reward)
+            # Retrieval happens *before* the chunk is drawn, so it belongs to `observation`; it
+            # is read here only because the policy runs it inside `get_action`.
+            if retrieval_recorder is not None:
+                retrieval_recorder.record(model, observation, step)
             if best_of_n_recorder is not None:
                 best_of_n_recorder.record(model)
 
@@ -1031,6 +1057,8 @@ def eval_policy(task_name,
             wrench_recorder.flush(TASK_ENV.test_num)
         if q_recorder is not None:
             q_recorder.flush(TASK_ENV.test_num)
+        if retrieval_recorder is not None:
+            retrieval_recorder.flush(TASK_ENV.test_num)
         if frame_log is not None:
             frame_log.flush()  # last: both GIFs above are drawn from it
 
@@ -1144,17 +1172,6 @@ def parse_args_and_config():
     with Path(args.config).open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    # Policy-specific hyperparameters may be factored out into a file that ships with the
-    # implementation they configure (e.g. the critic config in the multisensory_steering
-    # repo, so it stays in sync with the critic that reads it). Merge it in *underneath* the
-    # deploy config: precedence is CLI overrides > deploy config > included file.
-    include_path = config.get("critic_config_path")
-    if include_path:
-        with Path(include_path).open("r", encoding="utf-8") as f:
-            included = yaml.safe_load(f) or {}
-        config = {**included, **config}
-
-    # Parse overrides
     def parse_override_pairs(pairs):
         override_dict = {}
         for i in range(0, len(pairs), 2):
@@ -1167,9 +1184,23 @@ def parse_args_and_config():
             override_dict[key] = value
         return override_dict
 
-    if args.overrides:
-        overrides = parse_override_pairs(args.overrides)
-        config.update(overrides)
+    overrides = parse_override_pairs(args.overrides) if args.overrides else {}
+
+    # Policy-specific hyperparameters may be factored out into a file that ships with the
+    # implementation they configure (e.g. the critic config in the multisensory_steering
+    # repo, so it stays in sync with the critic that reads it). Merge it in *underneath* the
+    # deploy config: precedence is CLI overrides > deploy config > included file.
+    #
+    # Which file that is has to be resolved against the overrides first, or `--overrides
+    # critic_config_path .../dsrl.yaml` would swap the recorded path while still merging in the
+    # defaults of the file it replaced -- silently mixing two critic families' configs.
+    include_path = overrides.get("critic_config_path", config.get("critic_config_path"))
+    if include_path:
+        with Path(include_path).open("r", encoding="utf-8") as f:
+            included = yaml.safe_load(f) or {}
+        config = {**included, **config, "critic_config_path": include_path}
+
+    config.update(overrides)
 
     # Kept so `main` can copy the deploy config into the eval_result dir.
     config["_config_path"] = args.config

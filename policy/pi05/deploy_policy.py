@@ -28,8 +28,8 @@ def encode_obs(observation):
 def critic_obs_modalities(TASK_ENV, model, observation):
     """The sim's sensor modalities for this control step, or None when nothing consumes them.
 
-    Only the guided path has a critic, so the baseline and dataset-collection runs skip this
-    entirely rather than copying depth maps for nobody.
+    Only a run with a critic has anything to condition on them, so the baseline and
+    dataset-collection runs skip this entirely rather than copying depth maps for nobody.
 
     The contact-wrench trace is the one thing here that is not part of the observation: it is
     logged per primitive step by the env and drained here, which means what a control step sees
@@ -43,6 +43,42 @@ def critic_obs_modalities(TASK_ENV, model, observation):
     # Draining here is also what keeps the log bounded during eval. Rollout collection has its
     # own drain at its own observation, and never runs a critic, so the two never compete.
     return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.pi0_step)
+
+
+# Keys of the `critic_config_path` file that are the critic's own hyperparameters, forwarded
+# into `load_critic`. They reach `usr_args` flattened alongside the deploy config
+# (`eval_policy.parse_args_and_config` merges the included file underneath it), so this is what
+# separates them back out again -- anything not listed stays a deploy-side knob.
+CRITIC_CONFIG_KEYS = (
+    # Which family to build, and what it observes.
+    "critic_type", "encoder_modalities",
+    # Value network / TD / replay, shared by both families.
+    "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
+    # Control steps of reward the TD target carries before it bootstraps (1 = QMFM's one-step
+    # target).
+    "n_steps",
+    "lr_warmup_steps", "lr_decay_steps", "lr_final_frac",
+    "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
+    "start_training", "utd_ratio",
+    # Offline rollouts mixed into every TD batch (a `{enabled, frac, config, ...}` block; see
+    # cfgs/qmfm.yaml). `train_online` rides along with it so the critic can skip loading the
+    # dataset when no update is going to run -- it is otherwise read as `train_critic_online`
+    # below.
+    "offline_mix", "train_online",
+    # Train the value head only, keeping the checkpoint's observation encoder.
+    "freeze_encoder",
+    # Set by eval_policy when it resumes a run: take Adam's moments and the LR schedule
+    # position from `critic_ckpt` too, rather than restarting the schedule at the bottom of
+    # warmup. Off for an ordinary warm start.
+    "restore_optimizer",
+    # ---- critic_type: dsrl only (see cfgs/dsrl.yaml) ----
+    # SAC's actor and temperature, the noise space it acts in, and jaxrl2's pixel augmentation.
+    "actor_hidden_dims", "actor_lr", "temp_lr", "init_temperature", "target_entropy",
+    "backup_entropy", "critic_reduction", "latent_dim", "use_bottleneck", "dropout_rate",
+    "action_magnitude", "noise_horizon", "noise_param", "noise_rank",
+    "color_jitter", "aug_next", "crop_padding",
+    "num_proposals", "proposal_key", "proposal_hidden_dims", "proposal_out_dim",
+)
 
 
 def _as_bool(value, default):
@@ -82,7 +118,11 @@ def get_model(usr_args):
     # ramp was measured from, so the resumed critic comes back at the guidance it had reached
     # instead of re-ramping from 0 against its own checkpoint. Not a user-facing config key.
     critic_ramp_baseline = usr_args.get("critic_ramp_baseline")
-    online_critic = guidance_scale != 0.0 or best_of_n > 1
+    # The third way, and the only one that is not a knob: `critic_type: dsrl` steers by picking
+    # the sampler's noise, so it needs no guidance scale and no candidate count -- naming the
+    # family is what turns it on (pi_model.CRITIC_TYPES).
+    critic_type = str(usr_args.get("critic_type") or "qmfm")
+    online_critic = critic_type == "dsrl" or guidance_scale != 0.0 or best_of_n > 1
     # Whether that critic keeps learning during the rollouts. False freezes it at whatever
     # `critic_ckpt` holds: it still steers the sampler, but nothing is stashed into the replay
     # buffer and no TD update runs. Only meaningful when a critic exists at all.
@@ -92,36 +132,25 @@ def get_model(usr_args):
     # and keep training the value head) and reaches usr_args through that include. The attribute
     # keeps the longer name on this side, where "online" alone would not say online *what*.
     train_critic_online = _as_bool(usr_args.get("train_online"), True)
-    # Online QMFM Value-critic hyperparameters. These reach usr_args via the deploy config's
-    # `critic_config_path` include (see eval_policy.parse_args_and_config), so the critic's
-    # own cfg file stays the source of truth for them.
-    critic_config = {
-        k: usr_args[k]
-        for k in (
-            "value_hidden_dims", "value_layer_norm", "num_qs", "rho", "discount", "tau", "lr",
-            # Control steps of reward the TD target carries before it bootstraps (1 = QMFM's
-            # one-step target).
-            "n_steps",
-            "lr_warmup_steps", "lr_decay_steps", "lr_final_frac",
-            "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
-            "start_training", "utd_ratio",
-            # Offline rollouts mixed into every TD batch (a `{enabled, frac, config, ...}`
-            # block; see cfgs/qmfm.yaml). `train_online` rides along with it so the critic can
-            # skip loading the dataset when no update is going to run -- it is otherwise read
-            # as `train_critic_online` above.
-            "offline_mix", "train_online",
-            # Train the value head only, keeping the checkpoint's observation encoder.
-            "freeze_encoder",
-            # Set by eval_policy when it resumes a run: take Adam's moments and the LR
-            # schedule position from `critic_ckpt` too, rather than restarting the schedule
-            # at the bottom of warmup. Off for an ordinary warm start.
-            "restore_optimizer",
-            # Which observation modalities the critic conditions on, and with what encoders.
-            "encoder_modalities",
-        )
-        if k in usr_args
-    }
+    # The critic's own hyperparameters. These reach usr_args via the deploy config's
+    # `critic_config_path` include (see eval_policy.parse_args_and_config), so the critic's own
+    # cfg file stays the source of truth for them.
+    critic_config = {k: usr_args[k] for k in CRITIC_CONFIG_KEYS if k in usr_args}
     critic_seed = usr_args.get("critic_seed", usr_args.get("seed", 0) or 0)
+    # DSRL only: control steps to spend on the base policy's own Gaussian latent before the
+    # actor starts choosing. A rollout-loop knob rather than a critic hyperparameter, so it is
+    # kept out of `critic_config` (and out of the critic checkpoint it would otherwise land in).
+    noise_warmup_chunks = int(usr_args.get("noise_warmup_chunks", 0) or 0)
+    # Demo retrieval (openpi/policies/demo_retrieval.py). Which of the two proposal modalities
+    # is on comes from the *task config's* `data_type` block, like every other modality --
+    # `script/eval_policy.py` forwards the two flags as `demo_proposals` because these are
+    # produced by the policy rather than by the sim, so they cannot ride in on the observation.
+    # `demo_retrieval` in deploy_policy.yml carries the rest (which dataset, how many demos,
+    # how many neighbours, how hard to invert). Both are inert without a critic to feed.
+    demo_proposals = tuple(name for name, on in (usr_args.get("demo_proposals") or {}).items() if on)
+    demo_retrieval = dict(usr_args.get("demo_retrieval") or {})
+    demo_retrieval.setdefault("seed", usr_args.get("seed", 0) or 0)
+
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
                best_of_n=best_of_n,
@@ -129,8 +158,11 @@ def get_model(usr_args):
                critic_ramp_baseline=critic_ramp_baseline,
                online_critic=online_critic, train_critic_online=train_critic_online,
                critic_config=critic_config, critic_seed=critic_seed,
+               noise_warmup_chunks=noise_warmup_chunks,
                collect_critic_obs=usr_args.get("collect_critic_obs", False),
-               collect_siglip=usr_args.get("collect_siglip", True))
+               collect_siglip=usr_args.get("collect_siglip", True),
+               demo_proposals=demo_proposals, demo_retrieval=demo_retrieval,
+               task_name=usr_args.get("task_name"))
 
 
 def eval(TASK_ENV, model, observation):

@@ -21,7 +21,12 @@
 # success. Unlike the args above it applies to the baseline too (it is what the csv's per-episode
 # `reward` column and the W&B reward curves measure).
 # It defaults to whatever policy/pi05/deploy_policy.yml says; the 7th arg overrides it.
-# The critic's own hyperparameters come from the `critic_config_path` file in that yml.
+# The critic's own hyperparameters come from the `critic_config_path` file in that yml, and the
+# 12th arg swaps that file -- which is also how the *other* critic family is selected:
+#   cfgs/qmfm.yaml  (default)  an ensemble Q over action chunks; `guidance_scale` / `best_of_n`.
+#   cfgs/dsrl.yaml             SAC over the sampler's latent noise. The denoising is untouched
+#                              and the actor chooses the noise chunk it starts from, so there is
+#                              nothing to guide or rank: leave args 7 and 11 at 0 and 1.
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
 export PATH="/home/natasha/miniconda3/envs/cuda128/bin:$PATH" # CUDA 12.8 for curobo on RTX 5090
@@ -35,7 +40,7 @@ model_name=${4}
 seed=${5}
 gpu_id=${6}
 
-# Optional 7th..11th args override deploy_policy.yml. Omit them to take the yml's values;
+# Optional 7th..12th args override deploy_policy.yml. Omit them to take the yml's values;
 # pass `0` as guidance_scale and `1` as best_of_n to force the plain pi0.5 baseline.
 overrides=()
 [ -n "${7}" ] && overrides+=(--guidance_scale "${7}")          # target QMFM steering_coeff
@@ -43,6 +48,7 @@ overrides=()
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
+[ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
