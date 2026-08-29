@@ -1513,13 +1513,20 @@ class Base_Task(gym.Env):
     def _log_step_wrench(self):
         """Record the end-effector contact wrench left by the step that just finished.
 
-        One `{arm: (6,)}` sample per executed `take_action`, i.e. per primitive control step,
-        in the world frame (`envs/utils/wrench.py`). Enabled by `record_step_wrench`; a
-        `take_action` that returns without stepping the scene logs nothing.
+        One `{key: (6,)}` sample per executed `take_action`, i.e. per primitive control step, in
+        the world frame (`envs/utils/wrench.py::wrench_vectors`). Both granularities are logged
+        from the one contact query: a key per **end-effector link** (aloha: `fl_link7`,
+        `fl_link8`, `fr_link7`, `fr_link8`), so a finger pushing against its opposite -- equal
+        and opposite forces that cancel in the arm total -- stays visible, and a key per **arm**
+        (`left`, `right`), the sum of that arm's links, for a consumer that wants the coarser
+        signal. Everything downstream names the keys it wants, so a rollout dataset carries both
+        column families and a critic can condition on either or both. Enabled by
+        `record_step_wrench`; a `take_action` that returns without stepping the scene logs
+        nothing.
         """
         if not self.record_step_wrench:
             return
-        self.step_wrench.append(tcp_wrench_vector(self))
+        self.step_wrench.append(wrench_vectors(self))
 
     def pop_step_wrench(self):
         """Return the wrench samples logged since the last call, and clear the log.
@@ -1537,7 +1544,7 @@ class Base_Task(gym.Env):
         modality. Recording off yields `[]`.
         """
         if self.record_step_wrench and not self.step_wrench:
-            return [tcp_wrench_vector(self)]
+            return [wrench_vectors(self)]
         samples, self.step_wrench = self.step_wrench, []
         return samples
 

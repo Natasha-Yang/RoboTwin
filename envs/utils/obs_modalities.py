@@ -9,7 +9,7 @@ in the online (eval) and offline (rollout-dataset) paths:
     ``images.third_view``                                              (H, W, 3) uint8
     ``depth.head``      ``depth.left_wrist``   ``depth.right_wrist``   (H, W) float32, mm
     ``pointcloud``      (N, 6) float32, world-frame xyz + rgb
-    ``wrench.left``     ``wrench.right``       (num_steps, 6) float32, world-frame TCP wrench
+    ``wrench.<link>``   ``wrench.<arm>``       (num_steps, 6) float32, N / N*m -- both, see below
 
 The names are the rollout dataset's column names minus their ``observation.`` prefix (see
 `script/collect_dataset.py::extra_obs_columns`), which is what lets a critic trained offline on
@@ -69,7 +69,12 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     if len(pointcloud) > 0:
         mods["pointcloud"] = np.asarray(pointcloud, dtype=np.float32)
 
-    for arm, samples in stack_step_wrench(step_wrench, num_steps).items():
-        mods[f"wrench.{arm}"] = samples
+    # Both granularities, since the env logs both (`envs/utils/wrench.py::wrench_vectors`): one
+    # trace per end-effector link -- `wrench.fl_link7` and friends, whose labels are the
+    # embodiment's URDF link names, so which of them exist follows the robot -- and one per arm,
+    # `wrench.left` / `wrench.right`, each the sum of that arm's links. A critic names whichever
+    # it wants; naming both is legal and just gives its encoder the sum twice over.
+    for link, samples in stack_step_wrench(step_wrench, num_steps).items():
+        mods[f"wrench.{link}"] = samples
 
     return mods

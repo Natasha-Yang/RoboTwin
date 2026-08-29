@@ -9,7 +9,7 @@ from collections import Counter
 
 import numpy as np
 
-# Component order of the flat (6,) vector `tcp_wrench_vector` returns.
+# Component order of the flat (6,) vector `link_wrench_vector` / `tcp_wrench_vector` return.
 WRENCH_COMPONENTS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
 ARM_TAGS = ("left", "right")
@@ -113,8 +113,10 @@ def compute_tcp_wrench(task_env):
 def tcp_wrench_vector(task_env):
     """`compute_tcp_wrench` flattened to one ``(6,)`` vector per arm, in WRENCH_COMPONENTS order.
 
-    Returns ``{"left": (6,), "right": (6,)}`` — the layout the rollout dataset's wrench columns
-    and the critic's `wrench.*` modality store.
+    Returns ``{"left": (6,), "right": (6,)}`` in N and N*m — the whole-arm total, i.e. the
+    ``wrench.left`` / ``wrench.right`` half of what `wrench_vectors` records. Kept as its own
+    entry point for a caller that wants only the arm totals; `ee_link_labels` gives the link →
+    arm grouping they are summed over.
     """
     return {
         arm: np.concatenate([force, torque])
@@ -122,12 +124,46 @@ def tcp_wrench_vector(task_env):
     }
 
 
+def wrench_vectors(task_env):
+    """Both layouts of the same reading, from one contact query: per link **and** per arm.
+
+    Returns ``{link_label: (6,), arm_tag: (6,)}`` — every end-effector link (aloha agilex:
+    ``fl_link7``, ``fl_link8``, ``fr_link7``, ``fr_link8``) plus ``left`` and ``right``, each a
+    ``[Fx, Fy, Fz, Tx, Ty, Tz]`` in the world frame with torque about that arm's TCP. An arm's
+    entry is exactly the sum of its links', so the two families are one decomposition at two
+    granularities and never disagree.
+
+    This is what `_base_task._log_step_wrench` records, which is why a rollout dataset carries
+    both column families and a critic can name either (`wrench.fl_link7` or `wrench.left`) or
+    both. The links keep a finger pushing against its opposite visible — those forces cancel in
+    the arm total — while the arm total is the coarser signal a critic trained before the split
+    was configured for. Neither costs a second `scene.get_contacts()`: the arms are summed from
+    the links this call already computed.
+
+    An arm tag can never collide with a link label: `ee_link_labels` either passes the URDF name
+    through (``fl_link7``) or prefixes it with the arm tag (``left_link7``), so nothing is named
+    plain ``left``.
+    """
+    out = {}
+    for arm, per_link in compute_link_wrench(task_env).items():
+        force = np.zeros(3)
+        torque = np.zeros(3)
+        for label, (link_force, link_torque) in per_link.items():
+            out[label] = np.concatenate([link_force, link_torque])
+            force = force + link_force
+            torque = torque + link_torque
+        out[arm] = np.concatenate([force, torque])
+    return out
+
+
 def link_wrench_vector(task_env):
     """`compute_link_wrench` flattened to one ``(6,)`` vector per link, in WRENCH_COMPONENTS order.
 
-    Returns ``{link_label: (6,)}`` over both arms, left arm's links first — the layout the debug
-    wrench plots and their ``.npz`` store, so a gripper's two fingers can be read apart instead
-    of only their sum.
+    Returns ``{link_label: (6,)}`` over both arms, left arm's links first — the links alone,
+    which is what the debug wrench plots and their ``.npz`` draw (an arm total overlaid on its
+    own links would just be their sum drawn twice). The recording path uses `wrench_vectors`
+    instead, which adds the two arm totals to this so a dataset and a critic can have either
+    granularity.
     """
     return {
         label: np.concatenate([force, torque])
@@ -137,10 +173,12 @@ def link_wrench_vector(task_env):
 
 
 def stack_step_wrench(step_wrench, num_steps):
-    """Stack the per-step samples of one action chunk into ``{arm: (num_steps, 6)}``.
+    """Stack the per-step samples of one action chunk into ``{link_label: (num_steps, 6)}``.
 
     ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected over the chunk that ran
-    since the last drain: one ``tcp_wrench_vector`` dict per ``take_action``. Padded to
+    since the last drain: one ``wrench_vectors`` dict per ``take_action``, so the result holds a
+    trace per end-effector link *and* one per arm. Keys are passed through untouched -- this
+    fixes the length, not the layout. Padded to
     ``num_steps`` (i.e. ``pi0_step``) with **NaN**, so the result has one fixed shape whether or
     not that chunk ran to completion — an episode's first drain has no chunk behind it and
     carries a single sample of the current contact state, and a chunk cut short by success or
@@ -154,9 +192,9 @@ def stack_step_wrench(step_wrench, num_steps):
     if not step_wrench:
         return {}
     stacked = {}
-    for arm in step_wrench[0]:
-        samples = np.asarray([sample[arm] for sample in step_wrench], dtype=np.float32)[:num_steps]
+    for key in step_wrench[0]:
+        samples = np.asarray([sample[key] for sample in step_wrench], dtype=np.float32)[:num_steps]
         padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
         padded[:len(samples)] = samples
-        stacked[arm] = padded
+        stacked[key] = padded
     return stacked

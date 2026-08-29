@@ -322,13 +322,28 @@ across steps as the gripper rotates. It is contact-only: an arm moving through f
 zero — this is not a joint-torque estimate. One sample is taken per policy call (so
 `pi0_step` sim frames apart), paired with that call's head-camera frame.
 
-The debug plots keep it **per link** (`link_wrench_vector`, one `(6,)` per gripper finger)
-rather than per arm, so a finger squeezing against its opposite — equal and opposite forces
-that cancel in the arm total — is still visible. `compute_tcp_wrench` is that same
-decomposition summed over each arm's links, which is what the dataset's
-`observation.wrench.{left,right}` columns and the critic's `wrench.*` modality still store
-(§5a, §6a): those shapes are baked into collected datasets and critic checkpoints, so only the
-plots split by link.
+It is recorded at **two granularities at once**, from the one contact query
+(`wrench_vectors`): one `(6,)` per gripper **link**, and one per **arm** that is exactly the sum
+of that arm's links. The links are what keep a finger squeezing against its opposite — equal and
+opposite forces that cancel in the arm total — visible; the arm totals are the coarser
+two-signal version. `_base_task._log_step_wrench` logs both once per primitive step and
+everything downstream just names the keys it wants, so the rollout dataset carries both column
+families (§6a) and a critic can condition on either or both (§5a). The link labels are the
+embodiment's URDF link names, so **which** `wrench.<link>` keys exist follows the robot: aloha
+agilex gives four (`fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`), plus `left` and `right`.
+`ee_link_labels` is the link → arm grouping; `compute_tcp_wrench` / `tcp_wrench_vector` are the
+arm half on their own. The debug plots draw the **link** half only — an arm total overlaid on
+its own links is just their sum drawn twice — and `analysis/plot_wrench_hist.py` takes
+`--family links|arms|all` for the same reason.
+
+> Changed on 2026-08-28. Datasets collected before it carry only `observation.wrench.{left,right}`.
+> Those keep working unchanged: the arm columns and the `wrench.left` / `wrench.right` modalities
+> mean exactly what they did, so an existing critic checkpoint still warm-starts as long as its
+> `encoder_modalities` names them (it is an architecture key — a checkpoint trained on the arm
+> totals cannot be pointed at the link modalities without retraining, and vice versa). What
+> changed for such a checkpoint is the **encoder**: `wrench.*` now defaults to a 2-D `map_cnn`
+> over the trace's (T, 6) time × component grid rather than a temporal `conv1d`, so an older one
+> has to pin `encoder: conv1d` in its modality mapping to keep loading.
 
 The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
 `guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
@@ -483,7 +498,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.{left,right}` | per-step contact wrench, logged by the env | `(pi0_step, 6)` |
+| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-step contact wrench per end-effector link, logged by the env | `(pi0_step, 6)` each |
+| `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(pi0_step, 6)` each |
 | `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
 | `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
 
@@ -511,7 +527,7 @@ Three things to keep in mind:
   critic trained offline on it needs no realignment. (Datasets collected before 2026-07-30 store
   the *following* chunk's trace instead — see §6a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§6a); a critic configured for `wrench.*` against a config
-  that has it off fails at startup.
+  that has it off — or naming a link this embodiment does not have — fails at startup.
 - **The proposal modalities are retrieved, not sensed.** `action_proposals` /
   `noise_proposals` come from a bank of demonstrations rather than from the sim (§5b), so they
   are the two `data_type` flags nothing in `get_obs` produces — `script/eval_policy.py` forwards
@@ -815,9 +831,12 @@ tanh actor; dsrl_pi0 spends its whole first trajectory this way. It is a rollout
 critic hyperparameter, so it is read by `deploy_policy.py` and kept out of the critic checkpoint.
 The switchover costs one sampler recompile — passing a `noise=` argument at all is what changes.
 
-**What does not carry over from §5a:** `offline_mix` (rollout datasets record the *denoised*
-chunks, and DSRL's transitions are over latents no dataset has — it raises rather than mixing
-something else in), the guidance ramp (nothing to ramp), and best-of-N. `train_online: false`,
+**What does not carry over from §5a:** `offline_mix` (it raises for `critic_type: dsrl` rather
+than mixing something else in — though the reason is now only half true: rollout datasets
+collected since 2026-08-28 do carry the sampler's latent as `action.noise` (§6a), so the
+transitions exist; what is missing is the loader-side support for reading them, and a latent
+recorded under a `hold`/`lowrank` parameterization would still have to be projected back into
+whatever family the agent acts in), the guidance ramp (nothing to ramp), and best-of-N. `train_online: false`,
 `freeze_encoder`, `critic_ckpt`, `restore_optimizer`, `save_critic`, the resume machinery,
 `use_step_reward` and the W&B/debug outputs all work exactly as they do for the QMFM critic —
 `script/eval_policy.py` keys off `model.online_critic` and never learns which family it got.
@@ -825,6 +844,82 @@ The per-update W&B log now forwards whatever keys the update reported, so a DSRL
 `critic/actor_loss`, `critic/entropy`, `critic/temperature` and `critic/policy_std_mean` appear
 alongside the shared TD curves. `debug: true` still writes `q_episode<N>.*` — the Q plotted there
 is over the latent the actor chose, against the same realized return-to-go.
+
+### 5d. Co-training the critic on the fine-tuning demonstrations (`offline_mix`, `kind: demo`)
+
+`offline_mix` (`cfgs/qmfm.yaml`) draws `frac` of every TD batch from a fixed dataset instead of
+from the live replay buffer, which otherwise holds only what the policy being steered just did —
+small, correlated, and on a task the policy fails at, quite possibly containing no success at
+all. It normally points at a **rollout** dataset (§6). It can now point at the **supervised
+fine-tuning set** instead: the LeRobot dataset of expert demonstrations the policy was trained
+on, e.g. `NatashaYang/robotwin_demo_clean_50_lerobot`.
+
+```yaml
+# whatever `offline_mix.config` names (default cfgs/train_offline.yaml)
+dataset:
+  kind: demo                                        # `rollout` is the default
+  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  task: null                                        # null = the task being evaluated
+  reward_col: terminal_reward                       # the only one a demonstration can have
+```
+```yaml
+# or without editing that file, from cfgs/qmfm.yaml
+offline_mix:
+  enabled: true
+  set: ["dataset.kind=demo",
+        "dataset.repo_id=NatashaYang/robotwin_demo_clean_50_lerobot",
+        "dataset.reward_col=terminal_reward"]
+```
+
+**Two episodes of the same task, not the same instruction.** An SFT dataset covers every task
+the policy was fine-tuned on at once (2500 episodes over 50 tasks here), and a demonstration of
+another task is a different MDP wearing the same observation shapes, so the first thing that
+happens is the filter: `episode_selection.assign_episode_tasks` maps each episode back to its
+RoboTwin task through the instruction templates in `description/task_instruction/` — the same
+mapping §5b's bank uses, and not the dataset's own `task_index`, which indexes instructions.
+`dataset.task` pins a different task deliberately (does a related task's demonstrations
+transfer?); blank means the one under evaluation. `split` / `num_episodes` / `episode_seed` then
+choose among the matching episodes exactly as they do for a rollout dataset.
+
+**A demo dataset has none of the critic's columns**, and does not need them: every one of them is
+*derived from the frame by the policy*. So the rows are built at startup by the run's own pi0.5 —
+`DemoRetriever.cotrain_rows`, through the same image tower and the same input transform §5b's
+bank goes through — and `pi_model.py::_attach_demo_cotrain` hands them to the critic. Which is
+why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
+`pending_demo_cotrain` and refuses to build a batch until the policy has attached one.
+
+| | a demo row | how |
+|---|---|---|
+| `siglip.{head,left_wrist,right_wrist}` | ✔ `(16, 16, 1152)` fp16 | this run's own tower pass |
+| `state` | ✔ normalized, embodiment dims | this run's own input transform |
+| action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
+| `wrench.*`, `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
+| `images.<cam>` | ✘ | a demo frame is 480x640, the sim's is 240x320 — not the same array |
+
+A critic naming one of the ✘ modalities is refused **at startup**, listing them, rather than an
+hour into the rollouts (`offline_replay.check_demo_modalities`). Note that `cfgs/qmfm.yaml`'s
+default `encoder_modalities` lists the `wrench.*` modalities at whichever granularity, so
+turning this on means turning those off.
+
+Rows are the frames at `frame_index % horizon == 0` — the control steps the online critic takes,
+so a demo row and a live transition are the same distance apart in time and the same discount
+applies to both. Only those frames are decoded (`LeRobotEpisodeReader.read_episode(frames=...)`;
+states and actions still come back whole, since a chunk reaches 50 steps past its frame). At
+`pi0_step: 50` a ~220-frame demonstration is ~5 rows, so 50 episodes of a task cost ~250 rows,
+~0.4 GB resident over three SigLIP views.
+
+**Two things to weigh.** The reward: nothing recorded a `step_reward()` while a demonstration was
+collected — it is a delta against its own previous call and exists only while an episode runs —
+so a demo row's reward is the sparse success it earns by definition, 1.0 on its last control
+step. Against a run scoring itself with the shaped reward (`use_step_reward: true`, §5) the two
+halves of the batch are then **not the same reward function**; `use_step_reward: false` makes
+them agree exactly. And the demonstrations came from the expert motion planner, not from pi0.5,
+so their SARSA next-actions are further off-policy than a rollout dataset's — the offline half is
+a stabilizer and a source of what success looks like, not an estimate of *this* policy's value.
+Lower `frac` rather than changing how the batch is drawn.
+
+`train_offline.py` refuses a `kind: demo` config outright: it has no policy to encode a frame
+with, so demonstrations can be co-trained on from inside an eval run and not fitted offline.
 
 For remote / server-based inference see `policy/pi05/docs/remote_inference.md`
 (`scripts/serve_policy.py`).
@@ -854,7 +949,8 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
     expose) a dataset that has been pushed before. To change an existing repo, use
     `HfApi().update_repo_settings(repo_id, repo_type="dataset", private=...)`.
   - `checkpoint_id: 30000`, `pi0_step: 50`, `instruction_type: unseen`.
-  - `collect_critic_obs: true` — also record the policy's **model-space** view of each step.
+  - `collect_critic_obs: true` — also record the policy's **model-space** view of each step,
+    including `action.noise`, the flow-matching latent each chunk was denoised from.
   - `collect_siglip: true` — within that, also record the SigLIP patch features of **every**
     camera the policy sees (`siglip.head`, `siglip.left_wrist`, `siglip.right_wrist`). Set
     `false` to keep the dataset small, or list the views you want (`[head, left_wrist]`).
@@ -888,14 +984,17 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action` | raw robot, unnormalized by the output transform | `(50, 14)` |
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
+| `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.{left,right}` | world-frame TCP contact wrench, one row per executed step | `(pi0_step, 6)` |
+| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per executed step | `(pi0_step, 6)` each |
+| `observation.wrench.<arm>` | the same, summed over that arm's links | `(pi0_step, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
 different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
 have not. Neither carries the model's internal zero padding to `action_dim=32` — it is stripped
-before the tensors leave the sampler, so `state_dim` is `14`, not `32`. Only `pi0_step` of the
+before the tensors leave the sampler, so `state_dim` is `14`, not `32`. `action.noise` is the
+one exception, and deliberately so (see below). Only `pi0_step` of the
 50 chunk steps are actually executed before the next inference call; the whole chunk is recorded
 because that is what the sampler scores.
 
@@ -914,6 +1013,31 @@ critic intended to steer inside the sampler (§5a) **must** be trained on these;
 `state_col: observation.state.model` / `action_col: action.model`. The raw columns remain for
 behavior cloning and for critics that score executed robot actions.
 
+`action.noise` is the third thing that call returns (`sample_noise`): the noise chunk the action
+expert integrated from to produce this row's `action.model`. It is the action of a **noise-space**
+agent's MDP (§5c) rather than of the robot's, so it is what an offline `Q(s, w)` would be trained
+on — `action_col: action.noise` — and it is meaningless to a QMFM critic, which scores chunks.
+Three things make it unlike every other column:
+
+- **It is `(50, 32)`, not `(50, 14)`.** The padded width is not padding here. The trailing dims of
+  an *action* normalize to constant zero for aloha and are stripped, but all 32 dims of a *noise*
+  go through `action_in_proj` and shape the 14 that come out, so a narrowed seed no longer
+  reproduces its chunk.
+- **It is a draw, not a function of the observation.** Everything else in the row could be
+  recomputed from a stored frame by a later pass; the seed is what made this chunk *this* sample
+  rather than another one, and once the sampler has returned, only `Pi0.invert_actions` (§5b) can
+  recover it — 100 action-expert passes a row, and only for the unguided sampler. That is why it
+  has no switch of its own: it rides along with `collect_critic_obs` at 6.4 KB/row, against the
+  576 KB a single SigLIP view costs.
+- **Rows collected under a critic are not seeds of what ran.** Collection runs the plain sampler,
+  so the column is exactly the Gaussian the chunk came from. A guided (§5a) sampler moves the
+  chunk off that seed's own trajectory, and best-of-N reports the winning candidate's — neither
+  applies to `collect_dataset.py`, which never builds a critic, but both matter if the aux dict is
+  read anywhere else.
+
+`policy/pi05/src/openpi/models/pi0_sample_noise_test.py` pins the property the column rests on:
+feeding `sample_noise` back in as `noise=` reproduces the chunk it came with.
+
 The `siglip.*` columns are the visual thing the critic conditions on, and are written **during
 collection** (`collect_siglip`) from `critic_obs_siglip` — the exact patch maps
 `Pi0.sample_actions` feeds the critic, computed by the same `PaliGemma.img` tower on the same
@@ -926,12 +1050,17 @@ siglip.right_wrist]` at them and skip that pass entirely. At ~576 KB/row **each*
 dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well as
 `true`/`false`, and dropping the wrists is the cheapest way to shrink a run.
 
-`observation.wrench.left` / `.right` are the **same quantity** §5's debug GIF plots — net contact
-wrench on that arm's end-effector links, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
-about the TCP — computed by the shared `envs/utils/wrench.py::tcp_wrench_vector` so the eval and
-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
-call, while collection samples after **every** primitive step, so a row carries a whole
-`(pi0_step, 6)` trace rather than a single vector.
+`observation.wrench.*` is the **same quantity** §5's debug GIF plots — net contact wrench,
+`[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame with torque about that arm's TCP — computed by the
+shared `envs/utils/wrench.py::wrench_vectors` so the eval and collection paths cannot drift
+apart. There is one column per end-effector link (aloha agilex:
+`observation.wrench.{fl_link7,fl_link8,fr_link7,fr_link8}`) **and** one per arm
+(`observation.wrench.{left,right}`, each the sum of that arm's links), so a critic can be trained
+offline on whichever granularity it observes online; at 480 B/row apiece the six together are
+under 3 KB/row, cheaper than choosing. The rate differs from the debug plots': `eval_policy.py`
+samples once per policy call for those, while the dataset (and the critic's own view) samples
+after **every** primitive step, so a row carries a whole `(pi0_step, 6)` trace rather than a
+single vector. Datasets collected before 2026-08-28 have only the two arm columns.
 
 Which trace matters: it is the one the **previous** chunk produced — the steps between the
 previous row's observation and this one. The env logs a sample after each `take_action`
@@ -961,11 +1090,12 @@ episode runs. Train on it with `reward_col: reward` in `multisensory_steering`'s
 `success` and ignores the shaping). Datasets collected before 2026-08-07 have no such column.
 
 `envs/utils/wrench.py::stack_step_wrench` does the stacking, shared with the critic's online
-view of the same modality. A trace can be short — an episode's first row has no previous chunk
+view of the same modality and blind to which family a key belongs to. A trace can be short — an episode's first row has no previous chunk
 and carries a single sample of the contact state at that instant, and a chunk cut off by success
 or `step_lim` contributes only the steps it ran — so the tail is padded with **NaN**, not zeros,
-since zero is a meaningful reading (the arm touching nothing). At 480 B/row they are the
-cheapest column here.
+since zero is a meaningful reading (the arm touching nothing). At 480 B/row apiece they are
+still the cheapest columns here — six of them for aloha come to under 3 KB/row, against the
+576 KB a single SigLIP view costs.
 
 `wrench` is a `data_type` like the others, but it is the one the env cannot pick up from the
 flag itself: contacts are a scene query, not part of `get_obs`. So each driver reads
