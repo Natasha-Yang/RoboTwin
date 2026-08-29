@@ -224,12 +224,20 @@ class LeRobotEpisodeReader:
             raise ValueError(f"{self.repo_id} has non-contiguous episode indices; cannot order them.")
         return [rows[i] for i in range(len(rows))]
 
-    def read_episode(self, episode_index: int) -> dict:
-        """One episode's `{state, action, images}`, states and actions as `(T, 14)` float32.
+    def read_episode(self, episode_index: int, frames=None) -> dict:
+        """One episode's `{state, action, images, frames}`, states/actions as `(T, 14)` float32.
 
-        `images` maps each camera to a `(T, H, W, 3)` uint8 array in the layout the policy's
-        input transform expects -- channel-first, as `AlohaInputs` reads it -- decoded here so
-        the caller never sees the storage format.
+        `images` maps each camera to a `(len(frames), H, W, 3)` uint8 array in the layout the
+        policy's input transform expects -- channel-first, as `AlohaInputs` reads it -- decoded
+        here so the caller never sees the storage format.
+
+        `frames` selects which frames are *decoded*, as indices into the episode's own time
+        order; `None` is all of them. The states and actions are always returned whole, because
+        a frame's action chunk reaches `action_horizon` steps past it and would otherwise be cut
+        off -- they are two float32 columns, while decoding a frame is three JPEGs. So a caller
+        that only wants every horizon-th frame (`DemoRetriever.cotrain_rows`) pays for the
+        frames it keeps rather than for the episode. `frames` is returned alongside, since the
+        image arrays are indexed by *position in it*, not by frame index.
         """
         import pyarrow.parquet as pq
 
@@ -248,14 +256,17 @@ class LeRobotEpisodeReader:
         order = np.argsort(np.asarray(table["frame_index"]))
         state = np.stack(table["observation.state"].to_numpy(zero_copy_only=False))[order].astype(np.float32)
         action = np.stack(table["action"].to_numpy(zero_copy_only=False))[order].astype(np.float32)
+        keep = np.arange(len(order)) if frames is None else np.asarray(frames, dtype=np.int64).reshape(-1)
+        if keep.size and (keep.min() < 0 or keep.max() >= len(order)):
+            raise IndexError(f"episode {episode_index} has {len(order)} frames; asked for {keep.tolist()}.")
         images = {}
         for camera in DEMO_CAMERAS:
             encoded = table[f"observation.images.{camera}"].to_pylist()
-            frames = np.stack([_decode_image(encoded[i]) for i in order])
+            decoded = np.stack([_decode_image(encoded[i]) for i in order[keep]])
             # AlohaInputs takes [channel, height, width] and transposes it back itself; the eval
             # path hands it images the same way round (see deploy_policy.encode_obs).
-            images[camera] = np.transpose(frames, (0, 3, 1, 2))
-        return {"state": state, "action": action, "images": images}
+            images[camera] = np.transpose(decoded, (0, 3, 1, 2))
+        return {"state": state, "action": action, "images": images, "frames": keep}
 
 
 _V3_LOCATOR = ("data/chunk_index", "data/file_index")
@@ -641,19 +652,58 @@ class DemoRetriever:
         if episode in self._encoded:
             return self._encoded[episode]
 
-        raw = self.reader.read_episode(episode)
+        frames = np.arange(0, self.reader.episode_length(episode), self.frame_stride)
+        transformed = self._transform_frames(episode, frames, thumbnails=self.record_retrieval)
+        obs = transformed["obs"]
+
+        embeddings = []
+        for maps in self._tower_batches(obs):
+            if missing := [view for view in self.views if view not in maps]:
+                raise ValueError(f"the policy does not expose {missing} to the critic.")
+            stack = np.stack([np.asarray(maps[view], dtype=np.float32) for view in self.views], axis=1)
+            # Pooled here and the maps dropped: the pooling is a sum over 256 terms and is done
+            # once per row rather than per query, so the distance's side of the bank is fp32 and
+            # 256x smaller than what it came from.
+            embeddings.append(stack.mean(axis=-2))
+
+        encoded = {
+            "embeddings": np.concatenate(embeddings).astype(np.float32),
+            "obs": obs,
+            "actions": transformed["actions"],
+            "states": transformed["states"],
+            "thumbnails": transformed["thumbnails"],
+        }
+        self._encoded[episode] = encoded
+        return encoded
+
+    def _transform_frames(self, episode: int, frames, *, thumbnails: bool = False) -> dict:
+        """Push `frames` of one demo episode through the policy's own input transform.
+
+        The shared half of `encode_episode` and `cotrain_rows`: everything a demo frame becomes
+        before a tower ever runs -- its model inputs, its normalized pose, and the normalized
+        action chunk that was the policy's training target at it. Going through the transform
+        rather than reading the parquet's columns directly is the whole point: the same resize,
+        the same aloha decoding, the same delta-action conversion against that frame's own
+        state, and the same normalization the policy was trained with, so nothing here can drift
+        from what the policy sees.
+
+        Returns ``{"obs", "actions", "states", "thumbnails", "frames"}``.
+        """
+        frames = np.asarray(frames, dtype=np.int64).reshape(-1)
+        raw = self.reader.read_episode(episode, frames=frames)
         instruction = self.reader.instructions()[episode] or ""
         length = len(raw["state"])
-        indices = range(0, length, self.frame_stride)
 
-        batch, chunks, thumbnails, states = [], [], [], []
-        for t in indices:
+        batch, chunks, thumbs, states = [], [], [], []
+        for i, t in enumerate(frames.tolist()):
             # The chunk that was the training target at frame t. LeRobot pads a chunk that runs
             # past the end of the episode by holding the last action, and so does this.
             window = np.arange(t, t + self.action_horizon).clip(max=length - 1)
             inputs = self.input_transform(
                 {
-                    "images": {camera: raw["images"][camera][t] for camera in DEMO_CAMERAS},
+                    # The image arrays hold only the frames that were decoded, so they are
+                    # indexed by position in `frames` rather than by frame index.
+                    "images": {camera: raw["images"][camera][i] for camera in DEMO_CAMERAS},
                     "state": raw["state"][t],
                     "actions": self._relative_actions(raw["action"][window], raw["state"][t]),
                     "prompt": instruction,
@@ -672,36 +722,35 @@ class DemoRetriever:
             # model's own 224x224: `Observation.from_dict` is what turns those into floats, and
             # doing it here would quadruple what the bank holds.
             batch.append(jax.tree.map(np.asarray, inputs))
-            if self.record_retrieval:
+            if thumbnails:
                 # The head camera as the sim shows it, not as the model sees it: the debug GIF
                 # is for a human comparing the rollout with the demo, so the un-resized,
                 # un-padded frame is the honest one to draw.
-                thumbnails.append(_thumbnail(raw["images"]["cam_high"][t]))
+                thumbs.append(_thumbnail(raw["images"]["cam_high"][i]))
 
-        obs = jax.tree.map(lambda *xs: np.stack(xs), *batch)
-        embeddings = []
-        for start in range(0, len(batch), self.encode_batch_size):
+        return {
+            "obs": jax.tree.map(lambda *xs: np.stack(xs), *batch),
+            "actions": np.stack(chunks),
+            "states": np.stack(states),
+            "thumbnails": np.stack(thumbs) if thumbs else None,
+            "frames": frames,
+        }
+
+    def _tower_batches(self, obs):
+        """Yield the image tower's un-pooled patch maps for `obs`, ``encode_batch_size`` at a time.
+
+        Batched rather than run whole because a patch map is ~1.2 MB per view per frame in
+        float32: a 220-frame episode over three views is most of a gigabyte, and both callers
+        immediately reduce it (pooled to 1152 dims for the bank, cast to fp16 for a co-training
+        row). Keeping the reduction inside the loop is what makes an episode's encoding cost
+        bounded by `encode_batch_size` rather than by its length.
+        """
+        rows = len(jax.tree.leaves(obs)[0])
+        for start in range(0, rows, self.encode_batch_size):
             group = jax.tree.map(
                 lambda x: jnp.asarray(x[start : start + self.encode_batch_size]), obs  # noqa: B023
             )
-            maps = self._embed(_model.Observation.from_dict(group))
-            if missing := [view for view in self.views if view not in maps]:
-                raise ValueError(f"the policy does not expose {missing} to the critic.")
-            stack = np.stack([np.asarray(maps[view], dtype=np.float32) for view in self.views], axis=1)
-            # Pooled here and the maps dropped: the pooling is a sum over 256 terms and is done
-            # once per row rather than per query, so the distance's side of the bank is fp32 and
-            # 256x smaller than what it came from.
-            embeddings.append(stack.mean(axis=-2))
-
-        encoded = {
-            "embeddings": np.concatenate(embeddings).astype(np.float32),
-            "obs": obs,
-            "actions": np.stack(chunks),
-            "states": np.stack(states),
-            "thumbnails": np.stack(thumbnails) if thumbnails else None,
-        }
-        self._encoded[episode] = encoded
-        return encoded
+            yield self._embed(_model.Observation.from_dict(group))
 
     def _relative_actions(self, actions: np.ndarray, state: np.ndarray) -> np.ndarray:
         """A demo's raw action chunk, made relative to the pose it was taken from.
@@ -913,6 +962,102 @@ class DemoRetriever:
                 states if state_dim is None else states[..., : int(state_dim)], dtype=np.float32
             )
         return out
+
+    # -----------------------------------------------------------------------------------------
+    # Co-training on the demonstrations themselves
+    # -----------------------------------------------------------------------------------------
+
+    #: What a demo frame can be to a critic. A demonstration is a camera frame and a pose, and
+    #: that is all -- there is no wrench, depth, point cloud or privileged task state anywhere in
+    #: the demo pipeline (`collect_data.py` computes the wrench live and never writes it to the
+    #: HDF5, and neither `process_data.py` nor the LeRobot converter carries anything else
+    #: downstream). The `images.<cam>` modality is missing for a different reason: a demo dataset
+    #: stores 480x640 frames while the sim hands the critic 240x320, so the two are not the same
+    #: array. Everything here is what the *policy* makes of the frame, which is exactly the space
+    #: the online transitions are in.
+    COTRAIN_MODALITIES = (*SIGLIP_VIEWS, "state")
+
+    def cotrain_rows(
+        self,
+        episodes,
+        *,
+        horizon: int,
+        modalities: tuple[str, ...] = COTRAIN_MODALITIES,
+        state_dim: int | None = None,
+    ) -> dict:
+        """Whole demo episodes as critic-space rows, one per control step.
+
+        This is the demonstrations turned into the same kind of object a rollout dataset's rows
+        are (`multisensory_steering.critics.offline_replay`), so the supervised fine-tuning set
+        the policy was trained on can be co-trained into the critic's TD batch alongside the
+        rollouts it is steering. What makes that possible without collecting anything is that
+        every column a critic reads off a rollout dataset is *derived from the frame by the
+        policy*: the SigLIP patch map is this tower's, the state and the action chunk are this
+        transform's output. So they can be produced here, from the demo parquet, at the cost of
+        one tower pass per kept frame.
+
+        Rows are the frames at ``frame_index % horizon == 0`` -- the control steps the online
+        critic actually takes, so a demo row and a live transition are the same distance apart
+        in time and the same discount applies to both. Only those frames are decoded.
+
+        Args:
+            episodes: which demo episodes to encode (already filtered to one task by the caller,
+                see `episodes_for_task`).
+            horizon: primitive sim steps per control step (`pi0_step`).
+            modalities: which of `COTRAIN_MODALITIES` to produce. A view not asked for costs
+                nothing but the tower pass that produced it.
+            state_dim: narrow the model-space pose and action chunk to the embodiment's own dims,
+                exactly as the sampler narrows what it hands the critic. None keeps the model's
+                padded width.
+
+        Returns:
+            ``{"obs": {modality: (N, ...)}, "action": (N, action_horizon, d),
+            "episode_index": (N,), "frame_index": (N,)}``. A SigLIP map is the flat
+            ``(256, 1152)`` patch sequence the tower emits, at fp16 -- the same form (and dtype)
+            a rollout dataset's `siglip.<view>` column stores, so the consumer reshapes it to the
+            critic's grid the same way for both.
+        """
+        if unknown := [name for name in modalities if name not in self.COTRAIN_MODALITIES]:
+            raise KeyError(
+                f"a demonstration has no {unknown}: a demo frame is a camera view and a pose, "
+                f"i.e. {list(self.COTRAIN_MODALITIES)}. Drop them from the critic's "
+                f"`encoder_modalities`, or co-train on a rollout dataset instead."
+            )
+        views = tuple(name for name in modalities if name != "state")
+        horizon = int(horizon)
+        if horizon < 1:
+            raise ValueError(f"horizon must be >= 1 primitive step, got {horizon}.")
+
+        maps = {view: [] for view in views}
+        chunks, states, episode_index, frame_index = [], [], [], []
+        for episode in episodes:
+            frames = np.arange(0, self.reader.episode_length(episode), horizon)
+            transformed = self._transform_frames(episode, frames)
+            for group in self._tower_batches(transformed["obs"]):
+                if missing := [view for view in views if view not in group]:
+                    raise ValueError(f"the policy does not expose {missing} to the critic.")
+                for view in views:
+                    # fp16, the dtype the critic's replay buffer stores a SigLIP map in and the
+                    # dtype a collected dataset's column has -- these go straight into a stored
+                    # transition and the encoder casts on the way in anyway.
+                    maps[view].append(np.asarray(group[view], dtype=np.float16))
+            chunks.append(transformed["actions"])
+            states.append(transformed["states"])
+            episode_index.append(np.full(len(frames), episode, dtype=np.int64))
+            frame_index.append(frames.astype(np.int64))
+
+        if not episode_index:
+            raise ValueError("cotrain_rows was given no episodes to encode.")
+        narrow = slice(None) if state_dim is None else slice(0, int(state_dim))
+        obs = {view: np.concatenate(parts) for view, parts in maps.items()}
+        if "state" in modalities:
+            obs["state"] = np.concatenate(states)[..., narrow].astype(np.float32)
+        return {
+            "obs": obs,
+            "action": np.concatenate(chunks)[..., narrow].astype(np.float32),
+            "episode_index": np.concatenate(episode_index),
+            "frame_index": np.concatenate(frame_index),
+        }
 
     def _query_extra(self, inputs) -> dict:
         """This observation's own non-visual signals, unit-norm and batched, keyed like the bank.

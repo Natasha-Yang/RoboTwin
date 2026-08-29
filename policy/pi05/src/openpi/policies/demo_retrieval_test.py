@@ -566,3 +566,99 @@ def test_retrieved_is_none_without_record_retrieval():
 
     assert bank.thumbnails is None
     assert retriever.retrieved() is None
+
+
+# ---------------------------------------------------------------------------------------------
+# Co-training on the demonstrations themselves (`cotrain_rows`)
+# ---------------------------------------------------------------------------------------------
+
+
+@requires_v21
+def test_read_episode_decodes_only_the_frames_asked_for():
+    """`frames=` selects what is decoded; states and actions still come back whole.
+
+    A frame's action chunk reaches `action_horizon` steps past it, so the two float columns have
+    to be the episode's own -- it is the JPEGs that are worth not decoding, and a co-training
+    pass keeps one frame in every `horizon`.
+    """
+    reader = demo_retrieval.LeRobotEpisodeReader(V21_REPO)
+    length = reader.episode_length(3)
+    frames = np.arange(0, length, 25)
+
+    whole = reader.read_episode(3)
+    subset = reader.read_episode(3, frames=frames)
+
+    np.testing.assert_array_equal(subset["state"], whole["state"])
+    np.testing.assert_array_equal(subset["action"], whole["action"])
+    np.testing.assert_array_equal(subset["frames"], frames)
+    for camera in demo_retrieval.DEMO_CAMERAS:
+        assert len(subset["images"][camera]) == len(frames)
+        # Indexed by position in `frames`, not by frame index.
+        np.testing.assert_array_equal(subset["images"][camera], whole["images"][camera][frames])
+
+    with pytest.raises(IndexError):
+        reader.read_episode(3, frames=[length])
+
+
+@requires_v21
+def test_cotrain_rows_are_control_steps_in_the_critics_space():
+    """One row per `horizon` frames, at the critic's own widths, and the chunk is the bank's.
+
+    The rows are what an offline `(s, a)` for this critic *is*: the SigLIP patch maps the
+    sampler feeds it, the normalized pose narrowed to the embodiment's dims, and the same
+    normalized delta chunk `encode_episode` puts in the bank. If the chunk here and the chunk
+    there disagreed, a co-trained batch and a retrieved proposal would be two different spaces.
+    """
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model)
+    episodes = retriever.episodes_for_task("beat_block_hammer")[:2]
+    horizon = 40
+    state_dim = 14
+
+    rows = retriever.cotrain_rows(episodes, horizon=horizon, state_dim=state_dim)
+
+    expected = sum(len(range(0, retriever.reader.episode_length(ep), horizon)) for ep in episodes)
+    assert len(rows["frame_index"]) == expected
+    assert rows["action"].shape == (expected, config.action_horizon, state_dim)
+    assert rows["obs"]["state"].shape == (expected, state_dim)
+    for view in pi0.SIGLIP_VIEWS:
+        assert rows["obs"][view].shape == (expected, 256, 1152)
+        assert rows["obs"][view].dtype == np.float16
+
+    # Rows are the control steps, in episode order, restarting at 0 for each episode.
+    for episode in episodes:
+        where = rows["episode_index"] == episode
+        np.testing.assert_array_equal(
+            rows["frame_index"][where],
+            np.arange(0, retriever.reader.episode_length(episode), horizon),
+        )
+
+    # The same frame, encoded by the bank path, gives the same chunk and pose.
+    encoded = retriever.encode_episode(episodes[0])  # frame_stride=20, so frame 40 is row 2
+    first = np.flatnonzero(rows["episode_index"] == episodes[0])
+    np.testing.assert_allclose(
+        rows["action"][first[1]], encoded["actions"][2, :, :state_dim], rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        rows["obs"]["state"][first[1]], encoded["states"][2, :state_dim], rtol=1e-6, atol=1e-6
+    )
+
+
+@requires_v21
+def test_cotrain_rows_can_be_narrowed_to_the_modalities_a_critic_reads():
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model)
+    episodes = retriever.episodes_for_task("beat_block_hammer")[:1]
+
+    rows = retriever.cotrain_rows(
+        episodes, horizon=60, modalities=("siglip.head", "state"), state_dim=14
+    )
+    assert set(rows["obs"]) == {"siglip.head", "state"}
+
+
+@requires_v21
+def test_cotrain_rows_reject_a_modality_no_demonstration_carries():
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model)
+    with pytest.raises(KeyError, match="wrench.left"):
+        retriever.cotrain_rows([0], horizon=50, modalities=("state", "wrench.left"))
