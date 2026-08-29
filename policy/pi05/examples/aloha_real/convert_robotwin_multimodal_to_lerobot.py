@@ -246,6 +246,12 @@ def main(
             frame["task"] = instruction
             dataset.add_frame(frame)
         dataset.save_episode()
+        # LeRobotDataset._save_episode_table concatenates every episode into an in-memory
+        # `hf_dataset` (with the image bytes embedded) that nothing here reads -- each episode
+        # is already written to its own parquet. With these columns that grows ~160 MB per
+        # episode and OOMs the job partway through, so drop it after each save. The stock
+        # rgb-only converter gets away with it at ~40 MB/episode.
+        dataset.hf_dataset = dataset.create_hf_dataset()
 
     print(f"done: {HF_LEROBOT_HOME / repo_id}")
 

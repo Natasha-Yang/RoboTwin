@@ -21,6 +21,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=3:00:00
+# kn117 has a failing ECC GPU that Slurm still schedules; jobs landing there die in
+# the render pre-flight. Every collection/eval job goes through this script.
+#SBATCH --exclude=kn117
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail

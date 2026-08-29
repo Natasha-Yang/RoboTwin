@@ -63,8 +63,11 @@ cd "$ROBOTWIN_ROOT/policy/pi05"
 PY="$ROBOTWIN_ROOT/policy/pi05/.venv/bin/python"
 [ -x "$PY" ] || { echo "no venv interpreter at $PY" >&2; exit 1; }
 
-mapfile -t TASKS < <(ls -d "$ROBOTWIN_ROOT/data"/*/"$TASK_CONFIG" 2>/dev/null | awk -F/ '{print $(NF-1)}' | sort)
-[ "${#TASKS[@]}" -gt 0 ] || { echo "no tasks found with config '$TASK_CONFIG' under $ROBOTWIN_ROOT/data" >&2; exit 1; }
+# DATA_ROOT overrides where the collected demos live -- a task config may set an absolute
+# `save_path` (e.g. /scratch) when /project cannot hold the run.
+DATA_ROOT="${DATA_ROOT:-$ROBOTWIN_ROOT/data}"
+mapfile -t TASKS < <(ls -d "$DATA_ROOT"/*/"$TASK_CONFIG" 2>/dev/null | awk -F/ '{print $(NF-1)}' | sort)
+[ "${#TASKS[@]}" -gt 0 ] || { echo "no tasks found with config '$TASK_CONFIG' under $DATA_ROOT" >&2; exit 1; }
 echo "=== ${#TASKS[@]} tasks with config '$TASK_CONFIG', $EPISODES episodes each ==="
 
 # --- stage (a): raw demo HDF5 -> intermediate aloha format ------------------
