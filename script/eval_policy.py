@@ -313,10 +313,11 @@ def eval_function_decorator(policy_name, model_name):
 def visualize_debug_obs(observation, step_idx=0, save_dir=None, show=True, task_env=None, wrench_recorder=None):
     """Visualize per-camera images (rgb / depth / segmentation) and the point cloud.
 
-    When a ``wrench_recorder`` is passed it also samples the end-effector contact wrench
-    from ``task_env`` at this step (see ``envs/utils/debug_vis.py::TCPWrenchRecorder``); that
-    part needs neither depth nor point clouds, so it works under any task config that sets
-    `debug: true`.
+    When a ``wrench_recorder`` is passed it also drains the end-effector contact wrench the
+    previous chunk logged -- one sample per physics step, not one per call (see
+    ``envs/utils/debug_vis.py::TCPWrenchRecorder``). That part needs neither depth nor point
+    clouds, so it works under any task config that sets `debug: true`; with `data_type.wrench`
+    off there is no log to drain and it falls back to a single sample taken here.
 
     Enabled by `debug: true` in the task config. The observation layout follows
     ``_base_task.get_obs`` (see envs/_base_task.py); each entry is present only when
@@ -733,10 +734,12 @@ def main(usr_args):
     # Off leaves the sparse terminal reward, which is what the critic is then trained on.
     args["use_step_reward"] = usr_args["use_step_reward"]
     # Fixed length of the `wrench.*` trace a control step sees, and the cap on the env's log
-    # (`_base_task._init_task_env_`). It is an architecture key in all but name: the critic's
-    # obs shape is fixed when it is built, so a checkpoint warm-started here -- or pretrained
-    # on a rollout dataset -- has to have been made with the same value.
-    args["wrench_trace_len"] = int(usr_args.get("wrench_trace_len", 1024))
+    # (`_base_task._init_task_env_`). The env commits one row per primitive step, so a chunk
+    # drains exactly the policy's steps-per-call and `pi0_step` is the right width -- the config
+    # only has to say so when it wants a different one. It is an architecture key in all but
+    # name: the critic's obs shape is fixed when it is built, so a checkpoint warm-started here
+    # -- or pretrained on a rollout dataset -- has to have been made with the same value.
+    args["wrench_trace_len"] = int(usr_args.get("wrench_trace_len") or usr_args.get("pi0_step", 10))
 
     # Demo-retrieval proposals are `data_type`s like the rest (see the task config), but the
     # policy produces them rather than the sim, so they cannot reach the model on the
@@ -846,6 +849,11 @@ def eval_policy(task_name,
     # critic configured for `wrench.*` against a config that has it off fails at startup,
     # saying which modalities the run does provide.
     args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
+    # The debug recorder plots the same per-physics-step trace, but it reads *before* the
+    # control step and so cannot drain the critic's log; the env keeps it a second copy of the
+    # same samples instead (`_base_task._log_step_wrench`). Only worth the memory when there is
+    # a recorder to consume it.
+    args["record_debug_wrench"] = bool(args["record_step_wrench"] and args.get("debug", False))
 
     # ===== Online QMFM Value critic (trained across the whole eval run) =====
     # The critic object is read fresh via `getattr(model, "online_critic", None)` at each use
@@ -913,8 +921,10 @@ def eval_policy(task_name,
     if debug:
         print(f"\033[93m[debug] depth/point-cloud visualization ON "
               f"(interactive={debug_show}, saving to {debug_save_dir})\033[0m")
-        print(f"\033[93m[debug] end-effector wrench logging ON, per gripper link "
-              f"(saving to {debug_save_dir}/episode<N>/)\033[0m")
+        print(f"\033[93m[debug] end-effector wrench logging ON, per gripper link, "
+              + ("every physics step" if args["record_debug_wrench"] else
+                 "one sample per policy call (data_type.wrench is off)")
+              + f" (saving to {debug_save_dir}/episode<N>/)\033[0m")
         print(f"\033[93m[debug] critic Q logging "
               + (f"ON (saving to {debug_save_dir}/episode<N>/)" if q_recorder is not None
                  else "OFF (no critic: guidance_scale is 0, best_of_n is 1 and critic_type is "

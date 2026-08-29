@@ -741,8 +741,8 @@ under that same result dir:
 | Output | File (under `debug_vis/episode<N>/`) | Notes |
 |---|---|---|
 | Per-link wrench histograms | `wrench_hist_episode<N>.png` | one histogram per component (Fx/Fy/Fz/Tx/Ty/Tz), every gripper link overlaid (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) |
-| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); one trace column per gripper link with a step cursor on the right |
-| Raw series | `wrench_episode<N>.npz` | `step`, `components`, `links`, plus one `(num_samples, 6)` array per link name |
+| Rollout + wrench GIF | `wrench_episode<N>.gif` | head camera on the left with the **world** axes drawn as labelled x/y/z arrows, projected into the camera and anchored at each arm's TCP (the axes the components are resolved in, at the point they act); one trace column per gripper link with a step cursor on the right. One GIF frame per policy call; the traces behind the cursor carry every primitive step, `pi0_step` of them per call |
+| Raw series | `wrench_episode<N>.npz` | `step` (the control step each row belongs to, one per primitive step), `control_step` / `rows_per_call` (the policy calls the rows were drained at, and how many each drained), `components`, `links`, plus one `(num_rows, 6)` array per link name |
 | Critic Q trace | `q_episode<N>.png` | guided runs only (see below) |
 | Rollout + Q GIF | `q_episode<N>.gif` | head camera on the left, the Q and reward traces with a step cursor on the right |
 | Raw series | `q_episode<N>.npz` | `step`, `q` `(num_samples, num_qs)`, `reward`, `guidance_scale`, `return_to_go`, plus the scalars `return_mean` / `return_std` / `gamma_h` |
@@ -763,9 +763,12 @@ fingers + any `fix_gripper_name` links), summed from `scene.get_contacts()` impu
 by the sim timestep, with torque taken about the TCP origin. Both vectors are resolved in the
 **world** frame (N and N·m) — only the moment arm is TCP-relative, so a trace stays comparable
 across steps as the gripper rotates. It is contact-only: an arm moving through free space reads exactly
-zero — this is not a joint-torque estimate. The debug recorder is the one consumer that still
-takes **one sample per policy call**, paired with that call's head-camera frame; everything that
-*records* the wrench samples every physics step (below).
+zero — this is not a joint-torque estimate. Every consumer sees it at the same
+**primitive-step** rate (below), the debug plots included: the recorder drains the `pi0_step`
+rows the previous chunk left and pairs them with that call's head-camera frame, so the x axis is
+exact `take_action_cnt` and the frames, the world-axis overlay and the GIF cursor sit on it.
+Under a task config with `data_type.wrench` off there is no log to drain and the recorder falls
+back to a single instantaneous reading per policy call.
 
 It is recorded at **two granularities at once**, from the one contact query
 (`wrench_vectors`): one `(6,)` per gripper **link**, and one per **arm** that is exactly the sum
@@ -779,23 +782,36 @@ follows the robot: aloha agilex gives four (`fl_link7`, `fl_link8`, `fr_link7`, 
 plus `left` and `right`. `ee_link_labels` is the link → arm grouping; `compute_tcp_wrench` /
 `tcp_wrench_vector` are the arm half on their own, `link_wrench_vector` the link half.
 
-**The rate is one sample per physics step** — 1/250 s of simulated time — in all three control
-loops that run a recorded trajectory, so a demo HDF5, a rollout dataset and the critic's live
-view hold the same kind of trace. In the expert loops (`take_dense_action`,
-`together_move_to_pose`) one loop iteration *is* one `scene.step()`, so a saved frame carries
-exactly `save_freq` samples. A single `take_action` instead runs a whole TOPP-interpolated
-trajectory: measured on this machine at **34–196** physics steps depending on the size of the
-joint delta (median 94 for a 0.02 rad chunk step, 45 at 0.005, 146 at 0.05), so a `pi0_step: 10`
-chunk drains ~950 samples rather than 10.
+**The log holds one row per primitive step**, in all three control loops that run a recorded
+trajectory, so a demo HDF5, a rollout dataset and the critic's live view hold the same kind of
+trace. The contact query itself still runs after **every** `scene.step()` — 1/250 s of simulated
+time — but what a row records is their **time average**:
 
-That variable-length burst is stacked to a **fixed** `wrench_trace_len` (`deploy_policy.yml` /
-`collect_dataset.yml`, default **1024**), NaN-padded when short. It has to be fixed — the
-critic's obs shape and the dataset's `Array2D` column width are both settled before the first
-sample arrives — and it is an architecture key in all but name: a critic warm-started from
+- In the expert loops (`take_dense_action`, `together_move_to_pose`) one iteration *is* one
+  `scene.step()`, so the two rates coincide and a saved frame still carries exactly `save_freq`
+  rows, one per physics step. Nothing changed on the demo path.
+- A single `take_action` instead runs a whole TOPP-interpolated trajectory — measured on this
+  machine at **34–196** physics steps depending on the size of the joint delta (median 94 for a
+  0.02 rad chunk step, 45 at 0.005, 146 at 0.05) — and `_close_step_wrench` commits **one** row
+  for it: the total contact impulse the step delivered divided by the time it took
+  (`sum(J_i) / (n · dt)`, which with a fixed timestep is exactly the mean of the per-step
+  wrenches). Dividing by the elapsed time rather than by `dt` is what makes rows comparable —
+  an un-normalized sum would read as a bigger force for nothing but a longer move. So a
+  `pi0_step: 10` chunk drains exactly **10** rows.
+
+That is why a brief contact reads as a fraction of its peak: 10 of a step's 40 physics steps at
+5 N is a row of 1.25 N. The peak is not recoverable from a row — this is an average force, not
+an envelope.
+
+The drain is stacked to a **fixed** `wrench_trace_len` (`deploy_policy.yml` /
+`collect_dataset.yml`, **`pi0_step`** — the drivers derive it from `pi0_step` when the key is
+absent), NaN-padded when a chunk was cut short by success or `step_lim`. It has to be fixed —
+the critic's obs shape and the dataset's `Array2D` column width are both settled before the
+first row arrives — and it is an architecture key in all but name: a critic warm-started from
 `critic_ckpt`, and any rollout dataset it was pretrained on, must have been made with the same
 value. `_base_task` holds the log in a `maxlen` deque of that size, so an overlong drain has
-already dropped its **oldest** samples (the ones furthest from the observation the trace is
-paired with), and a run that never drains — a baseline eval has no critic, and
+already dropped its **oldest** rows (the ones furthest from the observation the trace is paired
+with), and a run that never drains — a baseline eval has no critic, and
 `critic_obs_modalities` returns before draining — cannot grow it without bound.
 
 Cost is one contact query per physics step: `wrench_vectors` measured at **223 µs** here at 35
@@ -808,6 +824,13 @@ their sum drawn twice. `analysis/plot_wrench_hist.py` plots the same histograms 
 collected rollout dataset, for when you want the distribution over a whole run rather than per
 episode, and takes `--family links|arms|all` for the same reason.
 
+> Changed on 2026-08-29. A rollout row's wrench trace is now `(pi0_step, 6)` — one averaged row
+> per primitive step — where it used to be `(wrench_trace_len, 6)` at one sample per physics step
+> (1024, mostly NaN padding). `wrench_trace_len` is unchanged as a key and still means "rows per
+> drain"; only its correct value moved, from 1024 to `pi0_step`. It remains an architecture key,
+> so a critic checkpoint or rollout dataset made before this cannot be mixed with one made after:
+> the shapes differ, and so does what a row means. The demo-collection path (§3.4) is untouched.
+>
 > Changed on 2026-08-28. Datasets collected before it carry only `observation.wrench.{left,right}`.
 > Those keep working unchanged: the arm columns and the `wrench.left` / `wrench.right` modalities
 > mean exactly what they did, so an existing critic checkpoint still warm-starts as long as its
@@ -1002,7 +1025,7 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-physics-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
+| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-primitive-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
 | `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
 | `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
@@ -1523,7 +1546,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per physics step | `(wrench_trace_len, 6)` each |
+| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per primitive step (that step's physics steps averaged) | `(wrench_trace_len, 6)` each, i.e. `(pi0_step, 6)` |
 | `observation.wrench.<arm>` | the same, summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
@@ -1594,18 +1617,19 @@ their sum) — computed by the shared `envs/utils/wrench.py::wrench_vectors`, so
 demo-collection and rollout-collection paths cannot drift apart. There is one column per
 end-effector link (aloha agilex: `observation.wrench.{fl_link7,fl_link8,fr_link7,fr_link8}`)
 **and** one per arm (`observation.wrench.{left,right}`, each the sum of that arm's links), so a
-critic can be trained offline on whichever granularity it observes online. The rate differs from
-the debug plots': `eval_policy.py` samples once per policy call for those, while the dataset (and
-the critic's own view) samples after **every physics step**, so a row carries a whole
-`(wrench_trace_len, 6)` trace rather than a single vector — ~950 real samples at `pi0_step: 10`,
-NaN-padded out to 1024. That is 24 KB/row per column at the default, so the six together are
-~147 KB/row: no longer the free columns they were at one sample per control step, but still a
-fraction of the 576 KB a single SigLIP view costs. Datasets collected before 2026-08-28 have
-only the two arm columns, at one sample per control step.
+critic can be trained offline on whichever granularity it observes online. The dataset (like the
+critic's own view and, since 2026-08-28, like the debug plots) carries **one row per primitive
+step** — the contact wrench averaged over the whole TOPP trajectory that step ran, §6.1 — so the
+column is a `(wrench_trace_len, 6)` trace rather than a single vector: exactly `pi0_step` rows,
+NaN-padded only when a chunk was cut short. That is 240 B/row per column at `pi0_step: 10`, so
+the six together are ~1.4 KB/row — negligible beside the 576 KB a single SigLIP view costs.
+Datasets collected before 2026-08-29 hold `(1024, 6)` at one sample per physics step instead,
+and those before 2026-08-28 have only the two arm columns, at one sample per control step.
 
-Which trace matters: it is the one the **previous** chunk produced — the steps between the
-previous row's observation and this one. The env logs a sample after each `take_action`
-(`_base_task.py::_log_step_wrench`, so the reading belongs to the action that just executed),
+Which trace matters: it is the one the **previous** chunk produced — the primitive steps between
+the previous row's observation and this one. The env commits a row at the end of each
+`take_action` (`_base_task.py::_close_step_wrench`, so the reading belongs to the action that
+just executed),
 and the rollout loop drains the log with `pop_step_wrench()` **before** running the chunk, at
 the same point in the loop the guided eval path drains it (§6.2). The column is therefore an
 observation — something the policy could have conditioned on — not the outcome of the row's own

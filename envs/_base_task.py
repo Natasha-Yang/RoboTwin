@@ -103,15 +103,34 @@ class Base_Task(gym.Env):
         # from the task config's `data_type.wrench`, which cannot reach it the way the other
         # data types do -- contacts are a scene query, not part of `get_obs`.
         self.record_step_wrench = kwags.get("record_step_wrench", False)
-        # How many samples one drain keeps, i.e. the fixed trace length every consumer stacks
-        # to (`envs/utils/wrench.py::stack_step_wrench`). The log is a bounded deque rather than
-        # a list so that it can never grow past that even when nothing drains it -- a baseline
-        # eval has no critic, and `critic_obs_modalities` returns early without draining, so an
-        # unbounded list would accumulate every sim step of an entire episode. Overflow drops
-        # the OLDEST samples, keeping the ones nearest in time to the observation the trace is
-        # about to be paired with.
-        self.wrench_trace_len = int(kwags.get("wrench_trace_len", 1024))
+        # How many rows one drain keeps -- i.e. **primitive steps**, one per `take_action`, and
+        # the fixed trace length every consumer stacks to
+        # (`envs/utils/wrench.py::stack_step_wrench`). A policy drains once per inference, so
+        # this is that policy's steps-per-call (`pi0_step`); the expert-demo path stacks to
+        # `save_freq` instead and ignores it. The log is a bounded deque rather than a list so
+        # that it can never grow past that even when nothing drains it -- a baseline eval has
+        # no critic, and `critic_obs_modalities` returns early without draining, so an
+        # unbounded list would accumulate every step of an entire episode. Overflow drops the
+        # OLDEST rows, keeping the ones nearest in time to the observation the trace is about
+        # to be paired with.
+        self.wrench_trace_len = int(kwags.get("wrench_trace_len", 10))
         self.step_wrench = deque(maxlen=self.wrench_trace_len)
+        # The debug recorder's own copy of the very same samples, drained independently by
+        # `pop_debug_step_wrench`. It cannot share the log above: it reads at the same cadence
+        # but *before* the control step (`visualize_debug_obs` runs ahead of the policy call),
+        # so draining there would empty what the critic is about to read -- and peeking instead
+        # would be wrong for a baseline run, where nothing drains and the deque is a sliding
+        # `wrench_trace_len` window over the last few chunks rather than this chunk's own
+        # burst. One contact query still feeds both. Off unless a recorder asks for it, since
+        # it is pure debug memory.
+        self.record_debug_wrench = kwags.get("record_debug_wrench", False)
+        self.debug_step_wrench = deque(maxlen=self.wrench_trace_len)
+        # The primitive step in progress: the running sum of its per-physics-step wrenches and
+        # how many there were, which `_close_step_wrench` divides into one committed row. Only
+        # `take_action` accumulates -- in the expert loops one physics step already is one
+        # primitive step, so they commit directly (`_log_step_wrench`).
+        self._wrench_accum = None
+        self._wrench_accum_n = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
         self.save_freq = kwags.get("save_freq")
@@ -1546,26 +1565,24 @@ class Base_Task(gym.Env):
         return True  # TODO: maybe need try error
 
     def _log_step_wrench(self):
-        """Record the end-effector contact wrench left by the physics step that just finished.
+        """Commit the end-effector contact wrench of the physics step that just finished.
 
-        One `{key: (6,)}` sample per **physics step**, in the world frame
-        (`envs/utils/wrench.py::wrench_vectors`). Both granularities are logged from the one
-        contact query: a key per **end-effector link** (aloha: `fl_link7`, `fl_link8`,
-        `fr_link7`, `fr_link8`), so a finger pushing against its opposite — equal and opposite
-        forces that cancel in the arm total — stays visible, and a key per **arm** (`left`,
-        `right`), the sum of that arm's links, for a consumer that wants the coarser signal.
-        Everything downstream names the keys it wants, so a rollout dataset carries both column
-        families and a critic can condition on either or both.
+        **The log holds one row per primitive step**, and this is the form for a loop where a
+        primitive step *is* a `scene.step()`: the scripted expert's `take_dense_action` and
+        `together_move_to_pose`, called once per iteration while a demo is being written. A
+        policy rollout's `take_action` runs a whole TOPP-interpolated trajectory per primitive
+        step instead, so it accumulates (`_accumulate_step_wrench`) and closes one row at the
+        end (`_close_step_wrench`); either way a row means the same thing to everything
+        downstream.
 
-        Called after every `scene.step()` of every control loop that runs a recorded
-        trajectory: `take_action` (policy rollouts) and, when a demo is being written,
-        `take_dense_action` and `together_move_to_pose` (the scripted expert). The three
-        therefore sample at the same rate -- one reading per 1/250 s of simulated time -- which
-        is what lets a demo HDF5, a rollout dataset and the critic's live view hold the same
-        kind of trace. In the expert loops one loop iteration *is* one `scene.step()`; a single
-        `take_action` runs a whole TOPP-interpolated trajectory, measured at 34-196 steps here
-        depending on the size of the joint delta (median 94 for a 0.02 rad chunk step), so a
-        control step contributes a burst of samples rather than one.
+        A row is `{key: (6,)}` in the world frame (`envs/utils/wrench.py::wrench_vectors`),
+        with both granularities taken from the one contact query: a key per **end-effector
+        link** (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`), so a finger pushing
+        against its opposite — equal and opposite forces that cancel in the arm total — stays
+        visible, and a key per **arm** (`left`, `right`), the sum of that arm's links, for a
+        consumer that wants the coarser signal. Everything downstream names the keys it wants,
+        so a rollout dataset carries both column families and a critic can condition on either
+        or both.
 
         Enabled by `record_step_wrench`; a step that returns without stepping the scene logs
         nothing. Costs one `wrench_vectors` contact query per physics step -- 223 us measured
@@ -1575,37 +1592,97 @@ class Base_Task(gym.Env):
         """
         if not self.record_step_wrench:
             return
-        self.step_wrench.append(wrench_vectors(self))
+        self._commit_step_wrench(wrench_vectors(self))
+
+    def _accumulate_step_wrench(self):
+        """Add this physics step's wrench to the primitive step in progress.
+
+        `take_action`'s form of `_log_step_wrench`: its TOPP trajectory runs 34-196 physics
+        steps (median 94 for a 0.02 rad chunk step) for the one primitive step, and the row it
+        commits is their **time average**, not 34-196 rows. See `_close_step_wrench`.
+        """
+        if not self.record_step_wrench:
+            return
+        sample = wrench_vectors(self)
+        if self._wrench_accum is None:
+            self._wrench_accum = {key: np.array(vec, dtype=np.float64) for key, vec in sample.items()}
+        else:
+            for key, vec in sample.items():
+                self._wrench_accum[key] += vec
+        self._wrench_accum_n += 1
+
+    def _close_step_wrench(self):
+        """Commit the accumulated primitive step as one row: total impulse / elapsed time.
+
+        Each accumulated sample is already that physics step's impulse over the scene timestep
+        (`compute_link_wrench`), so with a fixed timestep the mean of `n` of them is exactly
+        ``sum(impulse) / (n * dt)`` -- the average contact force the primitive step actually
+        applied. Dividing by the elapsed time rather than by `dt` is what makes rows
+        comparable: a trajectory's physics-step count varies with the size of the joint delta,
+        so an un-normalized sum would read as a bigger force for nothing but a longer move.
+
+        No-op when nothing has been accumulated, so it is safe on every exit path of
+        `take_action` (including the early return the moment the task succeeds, which commits
+        the steps that had run by then rather than dropping them).
+        """
+        if not self._wrench_accum_n:
+            return
+        self._commit_step_wrench({key: (vec / self._wrench_accum_n).astype(np.float32)
+                                  for key, vec in self._wrench_accum.items()})
+        self._wrench_accum, self._wrench_accum_n = None, 0
+
+    def _commit_step_wrench(self, row):
+        """Append one primitive step's row to the log, and to the debug recorder's copy."""
+        self.step_wrench.append(row)
+        if self.record_debug_wrench:
+            # By reference: nothing mutates a row once committed, and both sides only ever read
+            # it into a stacked array.
+            self.debug_step_wrench.append(row)
 
     def pop_step_wrench(self):
         """Return the wrench samples logged since the last call, and clear the log.
 
         Drained once per policy inference, *before* the chunk runs — by
         `script/collect_dataset.py` and by `policy/pi05/deploy_policy.py::critic_obs_modalities`
-        alike — so what comes back is the trace of the chunk *before* this one: the wrench at
-        every **physics** step executed since the last observation. That is the only wrench that
+        alike — so what comes back is the trace of the chunk *before* this one: one row per
+        **primitive step** executed since the last observation, each the average contact wrench
+        over that step's physics steps (`_close_step_wrench`). That is the only wrench that
         exists before the current chunk has run, which is what lets it be an observation rather
         than an outcome.
 
-        A chunk of `pi0_step` control steps contributes `pi0_step` bursts of ~34-196 samples
-        each, so a drain runs to the high hundreds or low thousands rather than to `pi0_step`.
-        `wrench_trace_len` is what bounds it: the log is a `maxlen` deque, so an overlong drain
-        has already dropped its oldest samples by the time it gets here, and `stack_step_wrench`
-        only has to pad a short one.
+        A chunk of `pi0_step` primitive steps therefore yields exactly `pi0_step` rows, which
+        is what `wrench_trace_len` is set to: the log is a `maxlen` deque, so a drain that
+        somehow ran long has already dropped its oldest rows by the time it gets here, and
+        `stack_step_wrench` only has to pad a short one.
 
         Demo collection drains it in the same place for the same reason: `_take_picture` pops
         it while building the frame, so a saved frame carries the trace of the `save_freq`
-        physics steps that led up to it (one per loop iteration there, so exactly `save_freq`).
+        primitive steps that led up to it (one physics step per loop iteration in the expert
+        loops, so exactly `save_freq` rows).
 
         With recording on, an empty log yields one sample taken now rather than nothing at all:
         no steps have run since the last pop at the start of an episode, and a consumer that
         asked for the wrench should get the current contact state instead of a missing
-        modality. Recording off yields `[]`.
+        modality. That one is an instantaneous reading rather than an average, there being no
+        step behind it to average over. Recording off yields `[]`.
         """
         if self.record_step_wrench and not self.step_wrench:
             return [wrench_vectors(self)]
         samples = list(self.step_wrench)
         self.step_wrench = deque(maxlen=self.wrench_trace_len)
+        return samples
+
+    def pop_debug_step_wrench(self):
+        """Drain the debug recorder's copy of the log (see `_log_step_wrench`), and clear it.
+
+        The same rows, at the same one-per-primitive-step rate and under the same
+        `wrench_trace_len` cap as `pop_step_wrench`; a separate deque only so that the two
+        consumers do not take each other's. Returns `[]` when nothing is being logged
+        (`data_type.wrench` off, or no recorder asked for the copy), which is the caller's cue
+        to fall back to a single instantaneous sample rather than draw nothing.
+        """
+        samples = list(self.debug_step_wrench)
+        self.debug_step_wrench = deque(maxlen=self.wrench_trace_len)
         return samples
 
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
@@ -1784,16 +1861,20 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
-            self._log_step_wrench()
+            # One row per primitive step, not per physics step: the whole trajectory is
+            # averaged into a single wrench when the loop ends.
+            self._accumulate_step_wrench()
             self._update_render()
 
             if self.check_success():
                 self.eval_success = True
+                self._close_step_wrench()  # the steps that ran before success still count
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
+        self._close_step_wrench()
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()

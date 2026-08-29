@@ -31,10 +31,11 @@ def critic_obs_modalities(TASK_ENV, model, observation):
     Only a run with a critic has anything to condition on them, so the baseline and
     dataset-collection runs skip this entirely rather than copying depth maps for nobody.
 
-    The contact-wrench trace is the one thing here that is not part of the observation: it is
-    logged per *physics* step by the env and drained here, which means what a control step sees
-    is the trace of the *previous* chunk -- every sim step between the last observation and this
-    one, stacked to the fixed `wrench_trace_len` width the critic's obs shape was built with.
+    The contact-wrench trace is the one thing here that is not part of the observation: the env
+    commits a row per primitive step -- the contact wrench averaged over that step's physics
+    steps -- and this drains them, which means what a control step sees is the trace of the
+    *previous* chunk, one row per action executed since the last observation, stacked to the
+    fixed `wrench_trace_len` width the critic's obs shape was built with.
     That is the only wrench a policy could ever condition on (the current chunk has not been
     executed yet), and rollout collection drains it at the same point, so `observation.wrench.*`
     in a dataset is the same array against the same row's state and action.
@@ -164,7 +165,7 @@ def get_model(usr_args):
                collect_siglip=usr_args.get("collect_siglip", True),
                demo_proposals=demo_proposals, demo_retrieval=demo_retrieval,
                task_name=usr_args.get("task_name"),
-               wrench_trace_len=usr_args.get("wrench_trace_len", 1024))
+               wrench_trace_len=usr_args.get("wrench_trace_len"))  # None -> pi0_step
 
 
 def eval(TASK_ENV, model, observation):
