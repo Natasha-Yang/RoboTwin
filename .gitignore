@@ -32,3 +32,14 @@ envs/curobo/*
 policy/*/training_data/*
 
 rollout_datasets/*
+# RoboTwin cluster render smoke-test artifacts
+cluster/render_check*.png
+
+*.out
+*.log
+logs/
+
+# Claude conversations + memory are each tracked in a SEPARATE private repo
+# nested here (see .claude/README.md). Never let them enter this public fork.
+/.claude/conversations/
+/.claude/memory/

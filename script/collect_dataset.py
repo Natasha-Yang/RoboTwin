@@ -66,18 +66,18 @@ def wrench_columns(step_wrench, num_steps):
     (`observation.wrench.{left,right}`, each the sum of that arm's links) -- the same pair of
     granularities the online critic sees as `wrench.*` modalities, so a critic trained offline on
     either lines up with the run it steers. The links keep a finger pushing against its opposite
-    visible; the arm totals are what a critic configured before the split reads. Six columns come
-    to under 3 KB/row, so carrying both is cheaper than deciding later.
+    visible -- two fingers squeezing the same object exert equal and opposite forces that cancel
+    in an arm-level sum; the arm totals are what a critic configured before the split reads. Six
+    columns come to under 3 KB/row, so carrying both is cheaper than deciding later.
 
     `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
     `{key: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
     about that key's arm TCP. It comes from the same `envs/utils/wrench.py` the eval driver's
-    debug plots read (`wrench_vectors`, of which the plots draw the link half), so the two
-    cannot drift apart -- the
-    only difference is the rate: `eval_policy.py` samples once per policy call, here every step
-    in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
-    fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online view
-    of the same modality (`envs/utils/obs_modalities.py`).
+    debug plots read (`wrench_vectors`, of which the plots draw the link half), so the two cannot
+    drift apart -- the only difference is the rate: `eval_policy.py` samples once per policy call,
+    here every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e.
+    `(pi0_step, 6)`, one fixed shape across the dataset) is `stack_step_wrench`, shared with the
+    critic's online view of the same modality (`envs/utils/obs_modalities.py`).
     """
     return {f"observation.wrench.{key}": samples
             for key, samples in stack_step_wrench(step_wrench, num_steps).items()}

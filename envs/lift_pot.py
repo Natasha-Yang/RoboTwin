@@ -87,8 +87,8 @@ class lift_pot(Base_Task):
         d_right_dist = right_dist - self.last_right_dist
         d_pot_dir = pot_dir - self.last_pot_dir
         reward += np.clip(self.POT_HEIGHT_WEIGHT * d_pot_pose, -0.05, 0.05)
-        reward += np.clip(-d_left_dist, -0.05, 0.05)
-        reward += np.clip(-d_right_dist, -0.05, 0.05)
+        # reward += np.clip(-max(d_left_dist, d_right_dist), -0.01, 0.01)
+        # reward += np.clip(-np.abs(d_left_dist - d_right_dist), -0.01, 0.01)
         reward += np.clip(d_pot_dir, -0.05, 0.05)
 
         self.last_pot_pose = pot_pose.p[2]

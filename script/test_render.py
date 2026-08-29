@@ -49,9 +49,10 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
-        except:
+        except Exception as exc:
             print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+            print(f"Render setup failed: {exc}")
+            raise
 
     def setup_scene(self, **kwargs):
         """
@@ -63,14 +64,20 @@ class Sapien_TEST(gym.Env):
         from sapien.render import set_global_config
 
         set_global_config(max_num_materials=50000, max_num_textures=50000)
-        self.renderer = sapien.SapienRenderer()
+        # Use the SLURM-visible GPU explicitly. On shared cluster nodes,
+        # probing every Vulkan device can select or touch another job's GPU.
+        try:
+            self.renderer = sapien.SapienRenderer(device=sapien.Device("cuda:0"))
+        except Exception:
+            self.renderer = sapien.SapienRenderer()
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # OptiX is available on the cluster GPUs; OIDN is not installed there.
+        sapien.render.set_ray_tracing_denoiser("optix")
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

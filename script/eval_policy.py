@@ -4,7 +4,9 @@ If the policy exposes a ``model.online_critic`` (pi05 builds one only when
 ``guidance_scale != 0``), the rollout additionally collects a chunk-level transition after
 every control step and runs TD updates on that critic, which steers the frozen pi0.5 flow
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
-progress is logged to W&B. Setting ``train_critic_online: false`` keeps the guidance but leaves
+progress is logged to W&B. Under ``save_critic`` it is written to the result directory after
+every episode, so an interrupted run leaves a checkpoint the next one can resume from via
+``critic_ckpt``. Setting ``train_critic_online: false`` keeps the guidance but leaves
 the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
 no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
@@ -131,6 +133,18 @@ def as_bool(value, default):
     if text in ("false", "no", "off", "0", ""):
         return False
     raise ValueError(f"expected a boolean, got {value!r}")
+
+
+def as_bool_or_none(value):
+    """`as_bool` without the raise -- None when the value is not a boolean at all.
+
+    For a key that is a switch *or* something else, `resume` being the only one: `true` continues
+    the newest run, a path continues that one (see `find_resumable_run`).
+    """
+    try:
+        return as_bool(value, False)
+    except ValueError:
+        return None
 
 
 def control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward=True):
@@ -477,12 +491,20 @@ def append_episode_row(csv_path, row):
 def save_critic_atomically(online_critic, path):
     """Checkpoint the critic via a temp file, so an interrupted save cannot shred the old one.
 
-    `resume_state.json` is written after this returns and points at the result, so a torn
-    pickle here would otherwise be a checkpoint the next run is told to trust.
+    `OnlineValueCritic.save` pickles straight into its destination, which is fine for a single
+    write at the end of a run. This is called after *every* episode instead, so overwriting in
+    place at that rate would mean a kill mid-write destroys the last good checkpoint along with
+    the new one. Pickle into a sibling temp file and rename it into position instead: the rename
+    is atomic on POSIX, so the destination is always either the previous complete checkpoint or
+    this one. `resume_state.json` is written after this returns and points at the result, so a
+    torn pickle here would otherwise be a checkpoint the next run is told to trust.
     """
     tmp = path.with_name(path.name + ".tmp")
-    online_critic.save(tmp)
-    tmp.replace(path)
+    try:
+        online_critic.save(tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace; cleans up after a failed one
 
 
 def numpy_random_state():
@@ -531,8 +553,21 @@ def load_resume_state(save_dir):
     return state
 
 
-def find_resumable_run(run_root):
-    """The most recent run directory under `run_root` carrying resume state, if any."""
+def find_resumable_run(run_root, resume=True):
+    """The run directory to continue, or None to start a fresh one.
+
+    `resume` is normally just a switch, and picks the most recent interrupted run under
+    `run_root`. It may instead name one specific run directory, which is what you want when the
+    newest-first rule would pick the wrong one: another eval writing into the same root updates
+    its state file every episode, so it stays "most recent" no matter which run you meant.
+    """
+    if isinstance(resume, str) and as_bool_or_none(resume) is None:
+        run_dir = Path(resume).expanduser()
+        if not (run_dir / RESUME_STATE).exists():
+            raise FileNotFoundError(f"resume: {run_dir} has no {RESUME_STATE}")
+        return run_dir
+    if not as_bool(resume, False):
+        return None
     run_root = Path(run_root)
     if not run_root.is_dir():
         return None
@@ -606,10 +641,11 @@ def main(usr_args):
 
     # `resume: true` continues the newest interrupted run for this task/policy/config/checkpoint
     # in place rather than opening a fresh timestamped directory -- the episodes, the critic and
-    # the seed sequence all live in there and only mean anything together. With no such run (or
+    # the seed sequence all live in there and only mean anything together. `resume: <run dir>`
+    # continues that one instead, for when "newest" is ambiguous. With neither (or
     # `resume: false`) this is an ordinary new run.
     run_root = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}")
-    resume_dir = find_resumable_run(run_root) if usr_args.get("resume", False) else None
+    resume_dir = find_resumable_run(run_root, usr_args.get("resume", False))
     save_dir = resume_dir if resume_dir is not None else run_root / current_time
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)
@@ -747,15 +783,16 @@ def main(usr_args):
     # finished, which is what makes an interrupted run salvageable.
     episode_file_path = save_dir / EPISODE_CSV
 
-    # Persist the online-trained critic alongside the eval results. A frozen one has nothing to
-    # persist -- it is a byte-for-byte copy of `critic_ckpt`, which the snapshotted config
-    # already names -- so the file is skipped rather than written misleadingly.
+    # The online-trained critic is already persisted alongside the eval results: `eval_policy`
+    # checkpoints it after every episode, and reaching here means the last episode completed, so
+    # the file on disk is this run's final state. Re-pickling it would write identical bytes --
+    # only report where it is. A frozen critic has nothing to persist in the first place; it is a
+    # byte-for-byte copy of `critic_ckpt`, which the snapshotted config already names.
     online_critic = getattr(model, "online_critic", None)
     if online_critic is not None and usr_args.get("save_critic", False):
         if _trains_online_critic(model):
-            critic_path = save_dir / CRITIC_CKPT
-            online_critic.save(critic_path)
-            print(f"saved online critic to {critic_path}")
+            print(f"saved online critic to {save_dir / CRITIC_CKPT} "
+                  f"({online_critic.num_updates} updates)")
         else:
             print("train_critic_online is off -- not saving the critic (unchanged from "
                   f"{usr_args.get('critic_ckpt')})")
@@ -816,6 +853,13 @@ def eval_policy(task_name,
     # no TD update runs. Unlike the critic object this is known up front -- it is a
     # construction-time property of the policy, not something built on the first observation.
     train_critic = _trains_online_critic(model)
+    # Checkpoint the critic after every episode rather than once at the end, so a run killed
+    # part-way (SLURM time limit, node failure) still leaves the latest critic on disk and the
+    # next run can pick it up via `critic_ckpt`. Only a *learning* critic is worth writing: a
+    # frozen one is a byte-for-byte copy of the checkpoint it was loaded from, which the
+    # snapshotted config already names.
+    save_critic = train_critic and bool(args.get("save_critic", False))
+    critic_ckpt_announced = False
     train_freq = int(args.get("train_freq", 1))
     # The reward every consumer below sees -- the critic's `commit()`, the Q recorder and the
     # per-episode totals in the csv. With the shaping off it is sparse: 1.0 on success, 0.0
@@ -879,7 +923,6 @@ def eval_policy(task_name,
     # Where each finished episode is committed (see the notes above `append_episode_row`).
     csv_path = save_dir / EPISODE_CSV
     critic_path = save_dir / CRITIC_CKPT
-    save_critic = bool(args.get("save_critic", True))
 
     if resume_state is not None:
         # Pick the loop back up exactly where it stopped. `now_seed` is the load-bearing one:
@@ -1140,8 +1183,16 @@ def eval_policy(task_name,
             "success_rate_ma": success_rate_ma,
             "reward_ma": reward_ma,
         })
-        if save_critic and online_critic is not None and train_critic:
+        # `save_critic` already folds in `train_critic`: a frozen critic is a byte-for-byte copy
+        # of the checkpoint it was loaded from, so there is nothing to write. Announced only the
+        # first time -- it happens every episode, and the `[critic]` line above already reports
+        # the update count that identifies which state was written.
+        if save_critic and online_critic is not None:
             save_critic_atomically(online_critic, critic_path)
+            if not critic_ckpt_announced:
+                print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
+                      f"{critic_path} (set `critic_ckpt` to it to resume this run)")
+                critic_ckpt_announced = True
         write_resume_state(save_dir, {
             "episodes": succ_seed,
             "successes": TASK_ENV.suc,

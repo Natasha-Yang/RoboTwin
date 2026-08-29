@@ -29,8 +29,13 @@
 #                              nothing to guide or rank: leave args 7 and 11 at 0 and 1.
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
-export PATH="/home/natasha/miniconda3/envs/cuda128/bin:$PATH" # CUDA 12.8 for curobo on RTX 5090
-export QMFM_ROOT="${QMFM_ROOT:-/home/natasha/QMFM}" # QMFM repo (ReplayBuffer is imported from here)
+# Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
+# `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
+export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
+# Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
+# wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
+# `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
+export WANDB_MODE="${WANDB_MODE:-offline}"
 
 policy_name=pi05
 task_name=${1}
@@ -40,7 +45,8 @@ model_name=${4}
 seed=${5}
 gpu_id=${6}
 
-# Optional 7th..12th args override deploy_policy.yml. Omit them to take the yml's values;
+# Optional 7th..12th args override deploy_policy.yml, and anything past the 12th is passed
+# through verbatim. Omit them to take the yml's values;
 # pass `0` as guidance_scale and `1` as best_of_n to force the plain pi0.5 baseline.
 overrides=()
 [ -n "${7}" ] && overrides+=(--guidance_scale "${7}")          # target QMFM steering_coeff
@@ -49,6 +55,10 @@ overrides=()
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
 [ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
+# Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
+# positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
+# without editing the yml (and so without steering a concurrent eval into that run's directory).
+[ "$#" -gt 12 ] && overrides+=("${@:13}")
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"

@@ -30,6 +30,12 @@ test_num: 300
 # rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP
 # features), so a resumed critic refills it from empty before TD updates restart.
 # `false` always starts a fresh run and leaves any interrupted one untouched.
+#
+# `resume: "<run dir>"` continues that specific run instead of the newest. Use it when another
+# eval is writing into the same task/policy/config/ckpt directory -- it rewrites its own
+# resume_state.json every episode, so it stays the "newest" one however long ago yours stopped.
+# (A run that predates crash recovery has no resume_state.json at all; script/
+# resume_state_from_log.py rebuilds one from that run's SLURM log.)
 resume:
 
 # ===== Online QMFM Value critic =====
