@@ -2,7 +2,9 @@
 # ---------------------------------------------------------------------------
 # pi0.5 fine-tuning GPU job (Alliance Canada / SLURM).
 #
-# Submit:  sbatch cluster/finetune_pi05.sh <episodes_per_task> [config] [model_name] [train.py args...]
+# Submit:  sbatch cluster/finetune_pi05.sh <episodes_per_task|none> [config] [model_name] [train.py args...]
+#   <episodes_per_task> is an INTEGER (or "none" for every episode) -- NOT the config
+#   name; the config is the second argument.
 #   e.g.   sbatch cluster/finetune_pi05.sh 10
 #          sbatch cluster/finetune_pi05.sh 25 pi05_base_aloha_lora_50 my_run
 #
@@ -66,4 +68,15 @@ nvidia-smi -L || true
 
 cd "$ROBOTWIN_ROOT/policy/pi05"
 # GPU 0 within the job's SLURM-scoped CUDA_VISIBLE_DEVICES.
-bash finetune.sh "$CONFIG" "$MODEL" 0 --episodes-per-task="$N" ${EXTRA[@]+"${EXTRA[@]}"}
+# N=none/- means "train on every episode": pass no --episodes-per-task at all.
+# Needed for a dataset that already holds exactly the intended episodes per task --
+# re-deriving the subset there is not a no-op, because select_episodes_per_task infers
+# task boundaries from instruction matching and mis-splits adjacent similar tasks
+# (e.g. pick_diverse_bottles/pick_dual_bottles), silently dropping a couple of episodes
+# and disagreeing with norm stats computed over the whole dataset.
+case "$N" in
+    none|None|NONE|-) EPS_ARG=() ;;
+    *)                EPS_ARG=( --episodes-per-task="$N" ) ;;
+esac
+
+bash finetune.sh "$CONFIG" "$MODEL" 0 ${EPS_ARG[@]+"${EPS_ARG[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}

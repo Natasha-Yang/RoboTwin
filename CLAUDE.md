@@ -253,6 +253,8 @@ harmless there since it only supplies codec sonames nothing else uses.)
 | `cluster/robotwin_gpu.sh` | Generic single-GPU (L40S) job. `sbatch cluster/robotwin_gpu.sh <cmd...>`; no args → render smoke-test. This is also how you launch an eval or a rollout collection (§6, §7). |
 | `cluster/finetune_pi05.sh` | π0.5 fine-tuning job. Runs in the `policy/pi05` uv venv (JAX), **not** the SAPIEN conda env — no Vulkan needed. |
 | `submit_all_data.sh` | Fan out data collection over many SLURM jobs (batches). |
+| `cluster/build_lerobot_dataset.sh` | Build a LeRobot dataset from collected demos, all tasks at once (§4). Two stages, `BUILD_STAGE=a|b|all`. |
+| `cluster/compute_norm_stats.sh` | π0.5 normalization stats for a train config (§5.1). Must run once before `finetune.sh`. |
 | `cluster/convert_molmoact_checkpoint.sh` | Convert a native MolmoAct checkpoint into the HF layout (§5.2). |
 | `cluster/wandb_sync.sh` | Push offline W&B runs from a login node. |
 
@@ -385,24 +387,75 @@ Two consequences worth knowing:
 > pipeline with a different driver.
 
 Converts collected demonstrations (`data/<task>/<config>/*.hdf5`) into a LeRobot
-dataset that π0.5 / π0 fine-tuning consumes. Run from inside `policy/pi05`:
+dataset that π0.5 / π0 fine-tuning consumes, in two stages:
+
+- **(a)** `scripts/process_data.py` repacks each task's demo HDF5 into the intermediate
+  aloha format under `policy/pi05/processed_data/<task>-<config>-<num>/`. Only
+  `joint_action` and the three RGB cameras survive — **depth, point cloud and wrench are
+  dropped**, so a `demo_clean_multimodal` dataset is schema-identical to a `demo_clean`
+  one and differs only in which demos it holds.
+- **(b)** `examples/aloha_real/convert_aloha_data_to_lerobot_robotwin.py` turns that into
+  a LeRobot v2.1 dataset at `$HF_HOME/lerobot/<repo_id>`. Frames are stored as PNG
+  **images**, not video (`total_videos: 0`), which is what makes this the expensive half.
+
+### 4.1 All tasks at once (recommended)
+
+```bash
+sbatch cluster/build_lerobot_dataset.sh <task_config> <episodes_per_task> <repo_id>
+#   e.g. sbatch cluster/build_lerobot_dataset.sh demo_clean_multimodal 10 \
+#                 NatashaYang/robotwin_demo_clean_multimodal_50x10_lerobot
+```
+
+It discovers every task under `data/*/<task_config>/`, runs stage (a) `BUILD_NPROC`-wide
+(default 8), **gates** on all tasks being complete, then runs stage (b) over the lot.
+Stage (a) skips tasks that already have all their episodes, so a killed job is resumed by
+resubmitting; stage (b) has no resume and always rebuilds from scratch.
+
+**Do not run this on a login node.** Stage (a) buffers a whole episode of decoded 640×480
+frames per worker — ~2 GB on the longest tasks — and 8 of those trip the per-user memory
+cap. The kill is a bare SIGKILL: empty logs, no traceback, no message.
+
+Because stage (b) is long and non-resumable while stage (a) is short and resumable, split
+them across bands rather than asking for 12h of everything:
+
+```bash
+A=$(sbatch --parsable --time=2:00:00 --export=ALL,BUILD_STAGE=a \
+      cluster/build_lerobot_dataset.sh demo_clean_multimodal 10 <repo_id>)   # -> b1, backfills in ~1 min
+sbatch --dependency=afterok:$A --export=ALL,BUILD_STAGE=b \
+      cluster/build_lerobot_dataset.sh demo_clean_multimodal 10 <repo_id>    # -> b2 (12h band)
+```
+
+Measured on 50 tasks × 10 episodes of `demo_clean_multimodal` (111,931 frames after the
+one-frame-per-episode trim): stage (a) ~2 min and 8 GB, stage (b) ~3 h and ~20 GB
+(~176 KB/frame, ~65 ms/frame). Scale from those before picking a time limit — a stage (b)
+timeout loses the whole conversion.
+
+### 4.2 One task at a time
 
 ```bash
 cd policy/pi05
-
-# (a) repack collected HDF5 into the intermediate aloha format
-#     -> processed_data/<task>-<setting>-<num>/
 bash process_data_pi05.sh <task_name> <task_config> <expert_data_num>
-#   e.g. bash process_data_pi05.sh beat_block_hammer demo_randomized 50
-
-# (b) convert that into a LeRobot dataset (written to $HF_LEROBOT_HOME/<repo_id>)
 bash generate.sh <processed_data_dir> <repo_id>
-#   e.g. bash generate.sh processed_data/beat_block_hammer-demo_randomized-50 \
-#                          NatashaYang/robotwin_lerobot_dataset
 ```
 
-`generate.sh` calls `examples/aloha_real/convert_aloha_data_to_lerobot_robotwin.py`.
-The `<repo_id>` you pick here is what you reference in the training config (§5.1).
+Two caveats on this path. `generate.sh` calls **`uv run`**, and uv is not installed here
+(§8) — use `.venv/bin/python <script>` instead. And it passes `--push-to-hub`, which
+cannot work from a compute node; training reads the dataset straight out of
+`$HF_HOME/lerobot`, so **no push is needed** to fine-tune. Push from a login node only if
+you want the dataset on the Hub.
+
+The converter walks `raw_dir` **recursively** for `*.hdf5` (and reads each one's
+`instructions.json` from its own directory), which is how one call folds 50 tasks into a
+single dataset — but it also means pointing it at a shared `processed_data/` sweeps up
+every task config living there. `build_lerobot_dataset.sh` stages a per-config tree of
+symlinks to avoid that. Note `os.walk` does not follow symlinked *directories*, so the
+staging tree is real directories containing symlinked files.
+
+It also `shutil.rmtree`s `$HF_HOME/lerobot/<repo_id>` before starting: **reusing a repo_id
+destroys the existing dataset.** `NatashaYang/robotwin_demo_clean_50_lerobot` (2500
+episodes, 126 GB) is the one already on disk here.
+
+The `<repo_id>` you pick is what you reference in the training config (§5.1).
 
 
 ---
@@ -473,16 +526,27 @@ your data, set that config's `repo_id` to the LeRobot dataset from §4.1
 `NatashaYang/robotwin_lerobot_dataset`), and adjust `num_train_steps`, `batch_size`,
 LoRA vs full, `weight_loader` base checkpoint, etc.
 
-Then, from `policy/pi05`:
+Then:
 
 ```bash
-# (a) compute normalization stats for the config
-uv run scripts/compute_norm_stats.py <train_config_name>
+# (a) normalization stats for the config -- submit from the REPO ROOT.
+#     Required once per config before any training run, and again whenever the
+#     dataset or the episode subset changes.  ~1h for 50 tasks x 10 episodes.
+sbatch cluster/compute_norm_stats.sh <train_config_name>
 
-# (b) fine-tune  ->  checkpoints/<train_config_name>/<model_name>/<step>/
-bash finetune.sh <train_config_name> <model_name> <gpu_id>
-#   e.g. bash finetune.sh pi05_base_aloha_lora robotwin_run0 0
+# (b) fine-tune  ->  policy/pi05/checkpoints/<train_config_name>/<model_name>/<step>/
+sbatch cluster/finetune_pi05.sh <episodes_per_task> <train_config_name> <model_name>
+#   or interactively, from policy/pi05:
+#   bash finetune.sh <train_config_name> <model_name> <gpu_id>
 ```
+
+> **`compute_norm_stats.py` takes its config as a keyword, not a positional.**
+> `scripts/compute_norm_stats.py <name>` prints a tyro "the following arguments are
+> required: --config-name" block and **exits 2** -- after ~1 min of imports, so under
+> `sbatch` it looks like a real crash rather than a usage error. The correct form is
+> `--config-name <name>`, which is what `cluster/compute_norm_stats.sh` runs.
+> Pass `--episodes-per-task` only if `train.py` is given the same value: the stats
+> must describe the episodes actually trained on.
 
 `finetune.sh` runs `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py
 <config> --exp-name=<model_name> --overwrite`. Wrap it in a GPU SLURM job (adapt
@@ -1367,7 +1431,7 @@ bash process_data_pi05.sh beat_block_hammer demo_randomized 50
 bash generate.sh processed_data/beat_block_hammer-demo_randomized-50 <repo_id>
 
 # --- finetune pi0.5 ---
-uv run scripts/compute_norm_stats.py pi05_base_aloha_lora_clean_50x25
+sbatch cluster/compute_norm_stats.sh pi05_base_aloha_lora_clean_50x25
 sbatch cluster/finetune_pi05.sh 25                   # or: bash finetune.sh <cfg> <name> 0
 
 # --- eval / inference (needs the render-capable GPU job) ---
