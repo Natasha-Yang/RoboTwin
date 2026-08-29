@@ -32,8 +32,9 @@ def critic_obs_modalities(TASK_ENV, model, observation):
     dataset-collection runs skip this entirely rather than copying depth maps for nobody.
 
     The contact-wrench trace is the one thing here that is not part of the observation: it is
-    logged per primitive step by the env and drained here, which means what a control step sees
-    is the trace of the *previous* chunk -- the steps between the last observation and this one.
+    logged per *physics* step by the env and drained here, which means what a control step sees
+    is the trace of the *previous* chunk -- every sim step between the last observation and this
+    one, stacked to the fixed `wrench_trace_len` width the critic's obs shape was built with.
     That is the only wrench a policy could ever condition on (the current chunk has not been
     executed yet), and rollout collection drains it at the same point, so `observation.wrench.*`
     in a dataset is the same array against the same row's state and action.
@@ -42,7 +43,7 @@ def critic_obs_modalities(TASK_ENV, model, observation):
         return None
     # Draining here is also what keeps the log bounded during eval. Rollout collection has its
     # own drain at its own observation, and never runs a critic, so the two never compete.
-    return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.pi0_step)
+    return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.wrench_trace_len)
 
 
 # Keys of the `critic_config_path` file that are the critic's own hyperparameters, forwarded
@@ -162,7 +163,8 @@ def get_model(usr_args):
                collect_critic_obs=usr_args.get("collect_critic_obs", False),
                collect_siglip=usr_args.get("collect_siglip", True),
                demo_proposals=demo_proposals, demo_retrieval=demo_retrieval,
-               task_name=usr_args.get("task_name"))
+               task_name=usr_args.get("task_name"),
+               wrench_trace_len=usr_args.get("wrench_trace_len", 1024))
 
 
 def eval(TASK_ENV, model, observation):

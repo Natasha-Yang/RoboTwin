@@ -71,13 +71,14 @@ def wrench_columns(step_wrench, num_steps):
     columns come to under 3 KB/row, so carrying both is cheaper than deciding later.
 
     `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
-    `{key: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
+    `{key: (6,)}` sample per `scene.step()`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
     about that key's arm TCP. It comes from the same `envs/utils/wrench.py` the eval driver's
     debug plots read (`wrench_vectors`, of which the plots draw the link half), so the two cannot
-    drift apart -- the only difference is the rate: `eval_policy.py` samples once per policy call,
-    here every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e.
-    `(pi0_step, 6)`, one fixed shape across the dataset) is `stack_step_wrench`, shared with the
-    critic's online view of the same modality (`envs/utils/obs_modalities.py`).
+    drift apart -- the only difference is the rate: `eval_policy.py`'s debug recorder samples once
+    per policy call, here every physics step in between is kept (34-196 per control step,
+    measured), which is the same rate the demo HDF5 records. Stacking and NaN padding to `(num_steps, 6)` (i.e.
+    `(wrench_trace_len, 6)`, one fixed shape across the dataset) is `stack_step_wrench`, shared
+    with the critic's online view of the same modality (`envs/utils/obs_modalities.py`).
     """
     return {f"observation.wrench.{key}": samples
             for key, samples in stack_step_wrench(step_wrench, num_steps).items()}
@@ -223,11 +224,16 @@ def collect_rollouts(usr_args, start=None):
 
     args, TASK_ENV = build_env_args(usr_args)
     args["eval_mode"] = True
-    # `data_type.wrench` has the env log the end-effector contact wrench after every primitive
-    # step, so each row carries the whole (pi0_step, 6) trace of the chunk it executed (see
-    # wrench_columns). It is a task-config switch like the other data types, but it has to be
-    # passed explicitly because contacts are a scene query rather than part of the observation.
+    # `data_type.wrench` has the env log the end-effector contact wrench after every *physics*
+    # step, so each row carries the whole (wrench_trace_len, 6) trace of the chunk it executed
+    # (see wrench_columns). It is a task-config switch like the other data types, but it has to
+    # be passed explicitly because contacts are a scene query rather than part of the
+    # observation. `wrench_trace_len` is the column's fixed width AND the cap on the env's log;
+    # it must match the `wrench_trace_len` of any eval that trains a critic on these columns,
+    # since a critic's obs shape is fixed at build time.
     args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
+    wrench_trace_len = int(usr_args.get("wrench_trace_len", 1024))
+    args["wrench_trace_len"] = wrench_trace_len
     clear_cache_freq = args["clear_cache_freq"]
     # Point clouds are only a fixed-shape column when the sim downsamples them to a set number
     # of points (see extra_obs_columns).
@@ -342,7 +348,7 @@ def collect_rollouts(usr_args, start=None):
             # turned on -- depth, segmentation, point cloud, third-person view, end-effector
             # poses (those are empty for the plain configs).
             record.update(extra_obs_columns(observation, step_wrench=step_wrench,
-                                            num_steps=pi0_step, fixed_pcd=fixed_pcd))
+                                            num_steps=wrench_trace_len, fixed_pcd=fixed_pcd))
 
             # Model-space copies of the same step, for critics that score the policy's own
             # normalized action chunk (as `Pi0.sample_actions` does when steering). The columns

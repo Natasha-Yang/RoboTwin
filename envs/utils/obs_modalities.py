@@ -47,7 +47,10 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     task config with fewer of them simply yields fewer keys and the caller decides what to do
     about a modality its critic wanted. The wrench is the exception, as it is a scene query
     rather than part of the observation: pass the samples `_base_task.pop_step_wrench` collected
-    over the last chunk as `step_wrench`, and the chunk length (`pi0_step`) as `num_steps`.
+    over the last chunk as `step_wrench`, and the fixed trace length (`wrench_trace_len`) as
+    `num_steps`. That is not `pi0_step` -- the env samples every physics step, and one control
+    step runs a whole TOPP trajectory of them -- and it fixes the critic's obs shape, so it has
+    to match whatever a warm-start checkpoint or an offline rollout dataset was made with.
 
     Arrays are handed over raw, in their natural dtype -- rgb as uint8, depth in millimetres,
     point clouds in world metres plus 0-255 rgb, wrench in N / N*m -- and carry NaN where a

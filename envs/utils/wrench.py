@@ -203,16 +203,24 @@ def stack_step_wrench(step_wrench, num_steps):
     """Stack the per-step samples logged since the last drain into ``{key: (num_steps, 6)}``.
 
     ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected: one ``wrench_vectors``
-    dict per primitive step, so the result holds a trace per end-effector link *and* one per
+    dict per **physics** step, so the result holds a trace per end-effector link *and* one per
     arm. Keys are passed through untouched — this fixes the length, not the layout, and is
-    blind to which family a key belongs to. ``num_steps`` is however many steps a drain covers
-    — ``pi0_step`` on the rollout paths (one drain per action chunk), the task config's
-    ``save_freq`` on the demo-collection path (one drain per saved frame). Padded to it with
-    **NaN**, so the result has one fixed shape whether or not that span ran to completion — an
-    episode's first drain has nothing behind it and carries a single sample of the current
-    contact state, and a chunk cut short by success or ``step_lim`` yields fewer than
-    ``num_steps``. NaN rather than zero, because zero is a meaningful reading (the arm touching
-    nothing); consumers that cannot take NaN should map it to zero explicitly.
+    blind to which family a key belongs to.
+
+    ``num_steps`` is the fixed trace length a drain is stacked to: ``wrench_trace_len`` on the
+    rollout paths (one drain per action chunk, so one control step's worth of `take_action`
+    physics steps times ``pi0_step``), the task config's ``save_freq`` on the demo-collection
+    path (one drain per saved frame, and one physics step per loop iteration there, so exactly
+    ``save_freq``). Padded to it with **NaN**, so the result has one fixed shape whether or not
+    that span ran to completion — an episode's first drain has nothing behind it and carries a
+    single sample of the current contact state, and a chunk cut short by success or
+    ``step_lim`` yields fewer. NaN rather than zero, because zero is a meaningful reading (the
+    arm touching nothing); consumers that cannot take NaN should map it to zero explicitly.
+
+    An overlong drain keeps its **last** ``num_steps`` samples, not its first: those are the
+    ones nearest in time to the observation the trace is about to be paired with. In practice
+    the deque behind ``pop_step_wrench`` has already applied the same rule, so this only bites
+    a caller that stacks to less than ``wrench_trace_len``.
 
     Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
     all zero".
@@ -221,7 +229,7 @@ def stack_step_wrench(step_wrench, num_steps):
         return {}
     stacked = {}
     for key in step_wrench[0]:
-        samples = np.asarray([sample[key] for sample in step_wrench], dtype=np.float32)[:num_steps]
+        samples = np.asarray([sample[key] for sample in step_wrench], dtype=np.float32)[-num_steps:]
         padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
         padded[:len(samples)] = samples
         stacked[key] = padded
