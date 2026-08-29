@@ -54,7 +54,7 @@ def test_actor_noise_is_what_the_sampler_denoises(tiny):
 
     actions, aux = sample(
         jax.random.key(0), obs,
-        noise_apply=lambda params, observations, key: params,
+        noise_apply=lambda params, observations, key: (params, hold_noise(params, config.action_horizon)),
         actor_params=chosen,
         return_critic_obs=True,
     )
@@ -73,7 +73,8 @@ def test_actor_sees_the_observation_the_critic_scores(tiny):
 
     def noise_apply(params, observations, key):
         seen.update({name: value.shape for name, value in observations.items()})
-        return jnp.zeros((1, 1, config.action_dim))
+        latent = jnp.zeros((1, 1, config.action_dim))
+        return latent, hold_noise(latent, config.action_horizon)
 
     _, aux = sample(
         jax.random.key(0), obs,

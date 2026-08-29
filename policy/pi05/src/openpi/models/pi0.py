@@ -447,9 +447,10 @@ class Pi0(_model.BaseModel):
         is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
         traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
         static arg. Returns ``(actions, {"critic_obs_siglip", "critic_obs_state",
-        "critic_action"})`` for online replay-buffer collection, where ``critic_obs_siglip`` is
-        itself a ``{modality: patch map}`` dict, one entry per camera view. This path takes
-        precedence over ``return_features``.
+        "critic_action", "sample_noise"})`` for online replay-buffer collection, where
+        ``critic_obs_siglip`` is itself a ``{modality: patch map}`` dict, one entry per camera
+        view, and ``sample_noise`` is the ``(b, action_horizon, action_dim)`` latent the
+        returned chunk was denoised from. This path takes precedence over ``return_features``.
 
         ``best_of_n > 1`` draws that many candidate chunks from independent noise and returns
         the one the critic scores highest (``mean_k Q``, the same aggregation the guidance
@@ -495,11 +496,14 @@ class Pi0(_model.BaseModel):
 
         ``return_critic_obs`` returns that same aux dict from the **unguided** sampler, so
         rollout-dataset collection records critic training data (model-space state and action
-        chunk, plus the SigLIP patch maps) in exactly the space the guided path scores. Both the
-        returned ``critic_action`` (the full-horizon chunk, still *normalized*) and
-        ``critic_obs_state`` are narrowed to ``critic_action_dim`` embodiment dims -- i.e.
-        ``(action_horizon, 14)`` and ``(14,)`` for aloha, versus the unnormalized chunk
-        ``Policy.infer``'s output transform produces.
+        chunk, the SigLIP patch maps, and the noise the chunk came from) in exactly the space
+        the guided path scores. Both the returned ``critic_action`` (the full-horizon chunk,
+        still *normalized*) and ``critic_obs_state`` are narrowed to ``critic_action_dim``
+        embodiment dims -- i.e. ``(action_horizon, 14)`` and ``(14,)`` for aloha, versus the
+        unnormalized chunk ``Policy.infer``'s output transform produces. ``sample_noise`` is
+        **not** narrowed (see ``critic_aux``): every one of the padded ``action_dim`` noise dims
+        feeds ``action_in_proj`` and shapes the embodiment dims that come out, so dropping the
+        tail would leave a seed that no longer reproduces the chunk.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -604,13 +608,16 @@ class Pi0(_model.BaseModel):
             """The normalized `(b, action_horizon, critic_ad)` chunk the critic is scored on."""
             return actions[..., :critic_ad]
 
-        def critic_aux(critic_obs, x_0):
+        def critic_aux(critic_obs, x_0, seed=None):
             """What the caller gets back: the model-produced modalities plus the scored chunk.
 
             Only the model's own modalities are echoed back -- the caller passed
             `critic_obs_extra` in, so it already has the rest (and they are numpy on the host,
             not worth a round trip). The SigLIP maps come back as a `{modality: array}` dict so
             the replay buffer and the dataset collector can key them by view.
+
+            `seed` overrides which noise chunk is reported as `sample_noise` -- best-of-N passes
+            the winning candidate's, so the seed describes the chunk actually being returned.
             """
             return {
                 "critic_obs_siglip": {
@@ -618,10 +625,25 @@ class Pi0(_model.BaseModel):
                 },
                 "critic_obs_state": critic_obs["state"],
                 "critic_action": critic_action_view(x_0),
-                # The latent the chunk was denoised from, when something chose it rather than
-                # drawing it. That is the action of DSRL's MDP, so it is what its replay buffer
-                # has to store -- and the caller cannot recover it, since the choice was made in
-                # here.
+                # The `(b, action_horizon, action_dim)` chunk the flow was actually integrated
+                # from: the sampler's own Gaussian draw, unless the caller supplied one or an
+                # actor chose it. Everything else here is a function of the observation and
+                # could be recomputed from a stored frame; this is the draw that made the chunk
+                # *this* sample rather than another, and once the sampler has returned only
+                # `invert_actions` recovers it -- `num_steps * num_inner_steps` action-expert
+                # passes, and only for the unguided sampler. Rollout collection records it as the
+                # dataset's `action.noise`, which is the action of a noise-space agent's MDP
+                # (DSRL, sec 5c). Kept at the model's padded `action_dim` rather than narrowed to
+                # `critic_action_dim` like the chunk above: the trailing dims of an *action*
+                # normalize to constant zero, but every dim of a *noise* goes through
+                # `action_in_proj` and shapes the embodiment dims that come out, so a narrowed
+                # seed would no longer reproduce its chunk.
+                "sample_noise": noise if seed is None else seed,
+                # The same latent in the *actor's* own parameterization, when one chose it --
+                # `noise_horizon` rows, or the factors of a low-rank product, which `expand_noise`
+                # turned into the `sample_noise` above. That, not the expansion, is the action of
+                # DSRL's MDP and what its replay buffer stores; the caller cannot recover it,
+                # since the choice was made in here.
                 **({} if noise_chunk is None else {"critic_noise": noise_chunk}),
             }
 
@@ -687,7 +709,14 @@ class Pi0(_model.BaseModel):
                 if n == 1:
                     return x_0, critic_aux(critic_obs, x_0)
                 best, picked = pick_best(x_0)
-                return best, {**critic_aux(critic_obs, best), **picked}
+                # The winner's own seed, grouped and gathered exactly as the candidates were, so
+                # `sample_noise` still denoises into the chunk that came back rather than into
+                # some discarded candidate's.
+                seeds = noise.reshape(batch_size, n, *noise.shape[1:])
+                seed = jnp.take_along_axis(
+                    seeds, picked["critic_best_index"][:, None, None, None], axis=1
+                )[:, 0]
+                return best, {**critic_aux(critic_obs, best, seed=seed), **picked}
 
         def step(carry):
             x_t, time = carry

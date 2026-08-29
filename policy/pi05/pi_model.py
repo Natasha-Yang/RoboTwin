@@ -306,7 +306,8 @@ class PI0:
                 siglip = (f"with SigLIP patch features: {', '.join(self.collect_siglip)}"
                           if self.collect_siglip else "no SigLIP")
                 print(f"[pi_model] recording model-space critic observations for dataset "
-                      f"collection (action chunk={chunk}, {siglip})")
+                      f"collection (action chunk={chunk}, sampler noise="
+                      f"{horizon}x{self.model_config.action_dim}, {siglip})")
             return
 
         if self.demo_retriever is not None:
@@ -382,6 +383,7 @@ class PI0:
                          f"{list(self.online_critic.proposal_keys[name])}, query from all of "
                          f"{list(self.online_critic.obs_keys)}"
                          if name in attends else f"pools {candidates} (max+mean over the set)"))
+        self._attach_demo_cotrain()
         # The candidates' own observations, one `(top_k, *shape)` array per key modality of
         # every proposal set the critic cross-attends. Unlike everything else here these are not
         # a modality the run offers -- the critic decides which of them it needs and how wide
@@ -449,6 +451,60 @@ class PI0:
         print(f"[pi_model] critic observation: "
               + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
               + (f" (available but unused: {', '.join(unused)})" if unused else ""))
+
+    def _demo_source(self, repo_id):
+        """A `DemoRetriever` over `repo_id`, reusing the run's own if it is the same dataset.
+
+        Retrieval (§5b) and demo co-training both need the same three things -- the LeRobot
+        reader, the policy's input transform and its image tower -- so a run doing both encodes
+        through one object. They are separable, though: co-training on demonstrations is useful
+        with no proposal modality anywhere in the critic, and the two can even name different
+        datasets (the offline config's `dataset.repo_id` against `demo_retrieval.repo_id`), in
+        which case a second reader is opened for it.
+        """
+        if self.demo_retriever is not None and self.demo_retriever.repo_id == repo_id:
+            return self.demo_retriever
+        # Only the keys that affect *encoding*. The bank knobs (num_demos, top_k, bank_size,
+        # frame_stride, the inversion) belong to retrieval and would only constrain a retriever
+        # that is never going to build a bank.
+        cfg = {
+            key: value
+            for key, value in self._demo_retrieval_config.items()
+            if key in ("root", "encode_batch_size", "seed") and value is not None
+        }
+        return DemoRetriever(
+            self.policy._model, self.policy._input_transform, repo_id=repo_id, invert=False, **cfg
+        )
+
+    def _attach_demo_cotrain(self):
+        """Load the critic's offline half from the demonstrations, if that is what it asked for.
+
+        `offline_mix` normally points at a rollout dataset, whose rows the critic can load on its
+        own. Pointing it at the **supervised fine-tuning set** instead (`dataset.kind: demo` in
+        the offline config) makes the rows the policy's own encoding of demonstration frames --
+        the SigLIP maps are this tower's, the state and action chunk this transform's -- so the
+        critic cannot build them and defers to here, where the policy exists.
+
+        Filtering to the task under evaluation happens inside: an SFT dataset covers every task
+        the policy was fine-tuned on at once, and a demonstration of another task is a different
+        MDP wearing the same observation shapes.
+        """
+        pending = getattr(self.online_critic, "pending_demo_cotrain", None)
+        if not pending:
+            return
+        if not (pending["task"] or self.task_name):
+            raise ValueError(
+                "demo co-training needs `task_name` to pick demonstrations of the right task; "
+                "the eval driver did not pass one and the offline config's `dataset.task` is "
+                "unset."
+            )
+        task = pending["task"] or self.task_name
+        source = self._demo_source(pending["repo_id"])
+        print(f"[pi_model] encoding demonstrations of {task!r} from {pending['repo_id']} as "
+              f"critic observations {list(pending['modalities'])}, one row per "
+              f"{pending['horizon']}-step chunk"
+              + ("" if source is self.demo_retriever else " (own reader)"))
+        self.online_critic.attach_demo_cotrain(source, run_task=self.task_name)
 
     def _wire_qmfm_sampler(self, cc, chunk):
         """Point the sampler at the Value critic: gradient guidance and/or best-of-N."""
@@ -797,12 +853,20 @@ class PI0:
         (``siglip.head``, ``siglip.left_wrist``, ...) as the flat ``(256, 1152)`` patch sequence
         that pass wrote (the encoders reshape to the 16x16 grid themselves) and in fp16,
         matching the online replay buffer's ``stash``.
+
+        ``sample_noise`` (``noise`` here) is the flow-matching latent the action expert denoised
+        that chunk from: ``(action_horizon, action_dim)``, i.e. the model's **padded** 32 dims
+        rather than the embodiment's 14, since all of them feed ``action_in_proj``. It rides
+        along with the rest unconditionally -- at 6.4 KB/row it is ~0.6% of a row against the
+        576 KB a single SigLIP view costs, and unlike the maps it is a *draw* rather than a
+        function of the observation, so a second pass over the dataset could not add it later.
         """
         if not self.collect_critic_obs or "critic_action" not in out:
             return
         self.last_critic_obs = {
             "state": np.asarray(out["critic_obs_state"], dtype=np.float32),
             "action": np.asarray(out["critic_action"], dtype=np.float32),
+            "noise": np.asarray(out["sample_noise"], dtype=np.float32),
         }
         maps = out.get("critic_obs_siglip") or {}
         self.last_critic_obs["siglip"] = {
