@@ -108,13 +108,22 @@ class Base_Task(gym.Env):
         # (`envs/utils/wrench.py::stack_step_wrench`). A policy drains once per inference, so
         # this is that policy's steps-per-call (`pi0_step`); the expert-demo path stacks to
         # `save_freq` instead and ignores it. The log is a bounded deque rather than a list so
-        # that it can never grow past that even when nothing drains it -- a baseline eval has
-        # no critic, and `critic_obs_modalities` returns early without draining, so an
+        # that it can never grow without bound even when nothing drains it -- a baseline eval
+        # has no critic, and `critic_obs_modalities` returns early without draining, so an
         # unbounded list would accumulate every step of an entire episode. Overflow drops the
         # OLDEST rows, keeping the ones nearest in time to the observation the trace is about
-        # to be paired with.
+        # to be paired with. The bound itself is `_wrench_log_len`, just below.
         self.wrench_trace_len = int(kwags.get("wrench_trace_len", 10))
-        self.step_wrench = deque(maxlen=self.wrench_trace_len)
+        # The deque's own bound is NOT `wrench_trace_len`: that is the length a *rollout* drain
+        # stacks to, while the expert-demo path drains every `save_freq` physics steps and
+        # stacks to `save_freq` instead. Capping the shared log at the rollout figure would let
+        # the demo path's older rows fall off the left end before `_take_picture` ever read
+        # them -- at the default 10 against a `save_freq` of 15, a third of every frame's trace
+        # would silently go missing (and the survivors would land at index 0, so a row would no
+        # longer mean the physics step it used to). So the log holds whichever drain is longer;
+        # `stack_step_wrench` trims the rollout side back down at the output, where it belongs.
+        self._wrench_log_len = max(self.wrench_trace_len, int(kwags.get("save_freq") or 0))
+        self.step_wrench = deque(maxlen=self._wrench_log_len)
         # The debug recorder's own copy of the very same samples, drained independently by
         # `pop_debug_step_wrench`. It cannot share the log above: it reads at the same cadence
         # but *before* the control step (`visualize_debug_obs` runs ahead of the policy call),
@@ -124,7 +133,7 @@ class Base_Task(gym.Env):
         # burst. One contact query still feeds both. Off unless a recorder asks for it, since
         # it is pure debug memory.
         self.record_debug_wrench = kwags.get("record_debug_wrench", False)
-        self.debug_step_wrench = deque(maxlen=self.wrench_trace_len)
+        self.debug_step_wrench = deque(maxlen=self._wrench_log_len)
         # The primitive step in progress: the running sum of its per-physics-step wrenches and
         # how many there were, which `_close_step_wrench` divides into one committed row. Only
         # `take_action` accumulates -- in the expert loops one physics step already is one
@@ -1651,9 +1660,10 @@ class Base_Task(gym.Env):
         than an outcome.
 
         A chunk of `pi0_step` primitive steps therefore yields exactly `pi0_step` rows, which
-        is what `wrench_trace_len` is set to: the log is a `maxlen` deque, so a drain that
-        somehow ran long has already dropped its oldest rows by the time it gets here, and
-        `stack_step_wrench` only has to pad a short one.
+        is what `wrench_trace_len` is set to: the log is a `maxlen` deque (`_wrench_log_len`,
+        which is that or `save_freq`, whichever drain is longer), so a runaway drain has
+        already dropped its oldest rows by the time it gets here, and `stack_step_wrench`
+        trims a merely-long one and pads a short one.
 
         Demo collection drains it in the same place for the same reason: `_take_picture` pops
         it while building the frame, so a saved frame carries the trace of the `save_freq`
@@ -1669,7 +1679,7 @@ class Base_Task(gym.Env):
         if self.record_step_wrench and not self.step_wrench:
             return [wrench_vectors(self)]
         samples = list(self.step_wrench)
-        self.step_wrench = deque(maxlen=self.wrench_trace_len)
+        self.step_wrench = deque(maxlen=self._wrench_log_len)
         return samples
 
     def pop_debug_step_wrench(self):
@@ -1682,7 +1692,7 @@ class Base_Task(gym.Env):
         to fall back to a single instantaneous sample rather than draw nothing.
         """
         samples = list(self.debug_step_wrench)
-        self.debug_step_wrench = deque(maxlen=self.wrench_trace_len)
+        self.debug_step_wrench = deque(maxlen=self._wrench_log_len)
         return samples
 
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee

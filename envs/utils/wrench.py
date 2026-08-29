@@ -220,9 +220,10 @@ def stack_step_wrench(step_wrench, num_steps):
     arm touching nothing); consumers that cannot take NaN should map it to zero explicitly.
 
     An overlong drain keeps its **last** ``num_steps`` rows, not its first: those are the ones
-    nearest in time to the observation the trace is about to be paired with. In practice the
-    deque behind ``pop_step_wrench`` has already applied the same rule, so this only bites a
-    caller that stacks to less than ``wrench_trace_len``.
+    nearest in time to the observation the trace is about to be paired with. The deque behind
+    ``pop_step_wrench`` is sized to the longer of the two drain lengths a run can use
+    (``_wrench_log_len``), so it is here rather than there that a rollout drain is cut back to
+    ``wrench_trace_len`` under a task config whose ``save_freq`` is the larger of the two.
 
     Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
     all zero".
