@@ -1,9 +1,12 @@
 """End-effector contact wrench, read off the physics scene.
 
-Shared by the eval driver's debug plots (`script/eval_policy.py`, one sample per policy call),
-by rollout-dataset collection (`script/collect_dataset.py`, one sample per primitive step) and
-by expert-demo collection (`script/collect_data.py`, likewise per primitive step, stacked into
-the HDF5's `wrench/<link>` groups), so all three record the exact same quantity.
+Shared by the eval driver's debug plots (`envs/utils/debug_vis.py`), by rollout-dataset
+collection (`script/collect_dataset.py`) and by expert-demo collection
+(`script/collect_data.py`, stacked into the HDF5's `wrench/<link>` groups), so all three record
+the exact same quantity: **one row per primitive step**, the average contact wrench over that
+step's physics steps. `_base_task._log_step_wrench` / `_close_step_wrench` own the averaging --
+in the expert loops a primitive step is a single `scene.step()` and the two coincide, while a
+policy rollout's `take_action` runs a whole TOPP trajectory per row.
 
 Everything that records it goes through `wrench_vectors`, which reports the same contact query
 at **two granularities at once**: one ``(6,)`` per end-effector **link**, and one per **arm**
@@ -200,27 +203,26 @@ def link_wrench_vector(task_env):
 
 
 def stack_step_wrench(step_wrench, num_steps):
-    """Stack the per-step samples logged since the last drain into ``{key: (num_steps, 6)}``.
+    """Stack the rows logged since the last drain into ``{key: (num_steps, 6)}``.
 
     ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected: one ``wrench_vectors``
-    dict per **physics** step, so the result holds a trace per end-effector link *and* one per
-    arm. Keys are passed through untouched — this fixes the length, not the layout, and is
+    dict per **primitive step**, so the result holds a trace per end-effector link *and* one
+    per arm. Keys are passed through untouched — this fixes the length, not the layout, and is
     blind to which family a key belongs to.
 
     ``num_steps`` is the fixed trace length a drain is stacked to: ``wrench_trace_len`` on the
-    rollout paths (one drain per action chunk, so one control step's worth of `take_action`
-    physics steps times ``pi0_step``), the task config's ``save_freq`` on the demo-collection
-    path (one drain per saved frame, and one physics step per loop iteration there, so exactly
-    ``save_freq``). Padded to it with **NaN**, so the result has one fixed shape whether or not
+    rollout paths, where a drain is one action chunk and so should be set to the policy's
+    ``pi0_step``; the task config's ``save_freq`` on the demo-collection path, one drain per
+    saved frame. Padded to it with **NaN**, so the result has one fixed shape whether or not
     that span ran to completion — an episode's first drain has nothing behind it and carries a
     single sample of the current contact state, and a chunk cut short by success or
     ``step_lim`` yields fewer. NaN rather than zero, because zero is a meaningful reading (the
     arm touching nothing); consumers that cannot take NaN should map it to zero explicitly.
 
-    An overlong drain keeps its **last** ``num_steps`` samples, not its first: those are the
-    ones nearest in time to the observation the trace is about to be paired with. In practice
-    the deque behind ``pop_step_wrench`` has already applied the same rule, so this only bites
-    a caller that stacks to less than ``wrench_trace_len``.
+    An overlong drain keeps its **last** ``num_steps`` rows, not its first: those are the ones
+    nearest in time to the observation the trace is about to be paired with. In practice the
+    deque behind ``pop_step_wrench`` has already applied the same rule, so this only bites a
+    caller that stacks to less than ``wrench_trace_len``.
 
     Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
     all zero".

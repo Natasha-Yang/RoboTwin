@@ -10,7 +10,8 @@ in the online (eval) and offline (rollout-dataset) paths:
     ``depth.head``      ``depth.left_wrist``   ``depth.right_wrist``   (H, W) float32, mm
     ``pointcloud``      (N, 6) float32, world-frame xyz + rgb
     ``wrench.<link>``   ``wrench.<arm>``       (num_steps, 6) float32, world-frame contact
-                                               wrench at both granularities, see below
+                                               wrench per primitive step, at both
+                                               granularities, see below
 
 The names are the rollout dataset's column names minus their ``observation.`` prefix (see
 `script/collect_dataset.py::extra_obs_columns`), which is what lets a critic trained offline on
@@ -46,11 +47,13 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     Driven off what the observation actually holds rather than off the `data_type` flags, so a
     task config with fewer of them simply yields fewer keys and the caller decides what to do
     about a modality its critic wanted. The wrench is the exception, as it is a scene query
-    rather than part of the observation: pass the samples `_base_task.pop_step_wrench` collected
+    rather than part of the observation: pass the rows `_base_task.pop_step_wrench` collected
     over the last chunk as `step_wrench`, and the fixed trace length (`wrench_trace_len`) as
-    `num_steps`. That is not `pi0_step` -- the env samples every physics step, and one control
-    step runs a whole TOPP trajectory of them -- and it fixes the critic's obs shape, so it has
-    to match whatever a warm-start checkpoint or an offline rollout dataset was made with.
+    `num_steps`. One row is one **primitive step** -- the average contact wrench over the whole
+    TOPP trajectory that step ran, not one reading per physics step -- so a chunk yields
+    `pi0_step` of them, which is what `wrench_trace_len` should be set to. It fixes the critic's
+    obs shape, so it has to match whatever a warm-start checkpoint or an offline rollout dataset
+    was made with.
 
     Arrays are handed over raw, in their natural dtype -- rgb as uint8, depth in millimetres,
     point clouds in world metres plus 0-255 rgb, wrench in N / N*m -- and carry NaN where a
@@ -74,7 +77,7 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
         mods["pointcloud"] = np.asarray(pointcloud, dtype=np.float32)
 
     # Both granularities, since the env logs both (`envs/utils/wrench.py::wrench_vectors`): one
-    # trace per end-effector link -- aloha's `wrench.fl_link7`, `wrench.fl_link8`,
+    # per-primitive-step trace per end-effector link -- aloha's `wrench.fl_link7`, `wrench.fl_link8`,
     # `wrench.fr_link7`, `wrench.fr_link8`, whose labels are the embodiment's URDF link names,
     # so which of them exist follows the robot -- and one per arm, `wrench.left` /
     # `wrench.right`, each the sum of that arm's links. A critic names whichever it wants;

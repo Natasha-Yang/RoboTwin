@@ -62,7 +62,7 @@ class PI0:
                  critic_config=None, critic_seed=0, noise_warmup_chunks=0,
                  collect_critic_obs=False, collect_siglip=True,
                  demo_proposals=(), demo_retrieval=None, task_name=None,
-                 wrench_trace_len=1024):
+                 wrench_trace_len=None):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
@@ -214,11 +214,12 @@ class PI0:
         self.img_size = (224, 224)
         self.observation_window = None
         self.pi0_step = pi0_step
-        # Rows of one `wrench.*` modality: the env samples the contact wrench every physics
-        # step, and a control step runs a whole TOPP trajectory of them, so this is not
-        # `pi0_step`. It fixes the critic's obs shape, so it has to match the value a warm-start
-        # checkpoint (or an offline rollout dataset) was made with.
-        self.wrench_trace_len = int(wrench_trace_len)
+        # Rows of one `wrench.*` modality. The env commits one row per primitive step -- the
+        # contact wrench averaged over the whole TOPP trajectory that step ran -- so a chunk
+        # drains exactly `pi0_step` of them, which is the default. It fixes the critic's obs
+        # shape, so it has to match the value a warm-start checkpoint (or an offline rollout
+        # dataset) was made with.
+        self.wrench_trace_len = int(wrench_trace_len or pi0_step)
 
         if self.proposal_modalities and not self.uses_online_critic:
             print(f"[pi_model] no critic this run -- ignoring data_type "
