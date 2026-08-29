@@ -59,21 +59,28 @@ import yaml
 
 
 def wrench_columns(step_wrench, num_steps):
-    """Per-link end-effector contact wrench, one sample per primitive step since the last row.
+    """End-effector contact wrench, one sample per primitive step since the last row.
+
+    One column per end-effector link the embodiment has (aloha:
+    `observation.wrench.{fl_link7,fl_link8,fr_link7,fr_link8}`) *and* one per arm
+    (`observation.wrench.{left,right}`, each the sum of that arm's links) -- the same pair of
+    granularities the online critic sees as `wrench.*` modalities, so a critic trained offline on
+    either lines up with the run it steers. The links keep a finger pushing against its opposite
+    visible -- two fingers squeezing the same object exert equal and opposite forces that cancel
+    in an arm-level sum; the arm totals are what a critic configured before the split reads. Six
+    columns come to under 3 KB/row, so carrying both is cheaper than deciding later.
 
     `step_wrench` is what `_base_task.pop_step_wrench` logged while the *previous* chunk ran: a
-    `{link_label: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world
-    frame. It comes from the same `envs/utils/wrench.py` helper the eval driver's debug plots
-    use -- the only difference is the rate: `eval_policy.py` samples once per policy call, here
-    every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e. `(pi0_step, 6)`, one
-    fixed shape across the dataset) is `stack_step_wrench`, shared with the critic's online view
-    of the same modality (`envs/utils/obs_modalities.py`).
+    `{key: (6,)}` sample per `take_action`, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque
+    about that key's arm TCP. It comes from the same `envs/utils/wrench.py` the eval driver's
+    debug plots read (`wrench_vectors`, of which the plots draw the link half), so the two cannot
+    drift apart -- the only difference is the rate: `eval_policy.py` samples once per policy call,
+    here every step in between is kept. Stacking and NaN padding to `(num_steps, 6)` (i.e.
+    `(pi0_step, 6)`, one fixed shape across the dataset) is `stack_step_wrench`, shared with the
+    critic's online view of the same modality (`envs/utils/obs_modalities.py`).
     """
-    # One column per gripper link (aloha: `observation.wrench.fl_link7`, `.fl_link8`,
-    # `.fr_link7`, `.fr_link8`) rather than one per arm, because two fingers squeezing the same
-    # object exert equal and opposite forces that cancel in an arm-level sum.
-    return {f"observation.wrench.{link}": samples
-            for link, samples in stack_step_wrench(step_wrench, num_steps).items()}
+    return {f"observation.wrench.{key}": samples
+            for key, samples in stack_step_wrench(step_wrench, num_steps).items()}
 
 
 def extra_obs_columns(observation, step_wrench=(), num_steps=0, fixed_pcd=True):
@@ -346,6 +353,13 @@ def collect_rollouts(usr_args, start=None):
             if critic_obs is not None:
                 record["observation.state.model"] = critic_obs["state"].tolist()
                 record["action.model"] = critic_obs["action"].tolist()
+                # The flow-matching latent the action expert denoised that chunk from. It is
+                # the action of a noise-space agent's MDP (DSRL), which is the one thing a
+                # rollout dataset could not previously supply: unlike every other column here
+                # it is a *draw*, not a function of the observation, so no later pass over the
+                # dataset can reconstruct it. Kept as an ndarray (Array2D, see build_features)
+                # and at the model's padded action_dim -- see PI0._stash_critic_obs.
+                record["action.noise"] = critic_obs["noise"]
                 # SigLIP patch features for each camera view the policy sees, straight from the
                 # sampler's own image tower -- what the critic conditions on, keyed by the same
                 # `siglip.<view>` names it uses online. Kept as numpy arrays (Array2D columns,
@@ -433,13 +447,18 @@ def build_features(record):
         "success": datasets.Value("bool"),
         "task": datasets.Value("string"),
     })
-    # Present only when the policy exposes them (pi05 with collect_critic_obs). Both are
-    # *normalized* and in embodiment dims, with the model's zero padding stripped back off:
-    # state is (critic_action_dim,) and the chunk is the full-horizon sample
+    # Present only when the policy exposes them (pi05 with collect_critic_obs). The state and
+    # the chunk are *normalized* and in embodiment dims, with the model's zero padding stripped
+    # back off: state is (critic_action_dim,) and the chunk is the full-horizon sample
     # (action_horizon, critic_action_dim) -- e.g. (14,) and (50, 14) for aloha agilex.
     if "action.model" in record:
         features["observation.state.model"] = datasets.Sequence(datasets.Value("float32"))
         features["action.model"] = datasets.Sequence(datasets.Sequence(datasets.Value("float32")))
+        # The sampler's own noise for that chunk, (action_horizon, action_dim) -- the *padded*
+        # 32 dims, not the 14 the two columns above are narrowed to. Array2D rather than a
+        # nested Sequence for the same reason the SigLIP columns are.
+        noise = np.asarray(record["action.noise"])
+        features["action.noise"] = datasets.Array2D(shape=noise.shape, dtype=str(noise.dtype))
     # Per-camera SigLIP patch features (collect_siglip): the same (256, 1152) columns
     # `multisensory_steering.create_dataset siglip` used to add in a second pass, produced here
     # by the sampler's own image tower. Array2D keeps them compact fixed-shape ndarray columns

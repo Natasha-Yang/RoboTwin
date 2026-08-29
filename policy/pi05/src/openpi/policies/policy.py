@@ -67,11 +67,13 @@ class Policy(BasePolicy):
             # JAX model setup. `return_features` is static so toggling it triggers a recompile.
             # `guidance_scale` intentionally remains traced so online schedules can change it
             # per call without compiling a new sampler for every scalar value. `best_of_n` is
-            # static -- it sets the sampler's batch, so it cannot be anything else.
+            # static -- it sets the sampler's batch, so it cannot be anything else. The two
+            # network hooks follow the same split: the apply *function* is static and its
+            # params are traced, so online training moves them without a recompile.
             self._sample_actions = nnx_utils.module_jit(
                 model.sample_actions,
-                static_argnames=("return_features", "critic_apply", "return_critic_obs",
-                                 "critic_action_dim", "best_of_n"),
+                static_argnames=("return_features", "critic_apply", "noise_apply",
+                                 "return_critic_obs", "critic_action_dim", "best_of_n"),
             )
             self._rng = rng or jax.random.key(0)
 

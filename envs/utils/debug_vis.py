@@ -505,3 +505,175 @@ class QValueRecorder:
             plt.close(fig)
 
         write_gif(out_dir / f"q_episode{episode_idx}.gif", gif_frames)
+
+
+# One colour per retrieval rank, so the top-1 match reads the same in the trace plot and in the
+# GIF's panel borders.
+RETRIEVAL_RANK_COLORS = ("tab:green", "tab:orange", "tab:red", "tab:purple", "tab:brown")
+
+
+class DemoRetrievalRecorder:
+    """Per-episode log of what demo retrieval matched -> a phase plot, a GIF and the raw series.
+
+    Only built when the policy is producing `action_proposals` / `noise_proposals` (see
+    `policy/pi05/src/openpi/policies/demo_retrieval.py`): each control step contributes the
+    top-K demonstration frames its observation was matched to, the averaged relative L2 distance
+    to each, and a thumbnail of each so a human can see what "nearest" actually returned.
+
+    The question this is here to answer is whether pooled-SigLIP retrieval is finding
+    *corresponding* frames or merely nearby ones. Two outputs, for the two halves of that:
+
+    * ``retrieval_episode<N>.png`` -- the retrieved demo frame index against the rollout's own
+      step. A retrieval that tracks task phase draws a roughly monotone line rising with the
+      rollout; a flat line means every step matched the same demo frame (the embedding is not
+      separating the states), and a scattered one means it is not tracking phase at all. The
+      distance of each rank is drawn underneath, which is what says whether a match is close or
+      merely the least bad of a bad set -- note this is a **distance** (relative L2, averaged
+      over signals), so lower is better and the panel reads the opposite way round from a
+      similarity.
+    * ``retrieval_episode<N>.gif`` -- the rollout's head camera beside the top-K demo head
+      frames it matched, captioned with each one's distance. This is the only output that can
+      show *why* a match is wrong.
+
+    Sampled at the same point as the wrench: the retrieval happens before the chunk is drawn, so
+    it belongs to the observation it was queried with, and is logged against that step.
+    """
+
+    def __init__(self, debug_save_dir, frame_log):
+        self.debug_save_dir = Path(debug_save_dir)
+        self.frame_log = frame_log
+        # How many of the ranks drawn were actually handed to the critic as proposals; the rest
+        # are shown for context. Learned from the first sample.
+        self.num_proposals = 1
+        self.bank_frames = 0
+        self._reset()
+
+    def episode_dir(self, episode_idx):
+        return self.debug_save_dir / f"episode{episode_idx}"
+
+    def _reset(self):
+        self.steps = []
+        self.indices = []
+        self.distances = []
+        self.demo_episode = []
+        self.demo_frame = []
+        self.thumbnails = {}  # step -> (k, h, w, 3), only for the steps the GIF will animate
+
+    def record(self, model, observation, step_idx):
+        """Log what the policy's retrieval matched this control step. No-op without one.
+
+        `model.last_demo_retrieval` is written by the policy itself (pi05:
+        `PI0._refresh_demo_proposals`, gated on `record_demo_retrieval`), so this is a plain
+        read -- it never runs the retrieval. Consumed as it is read, so a control step that did
+        not retrieve cannot re-log the previous step's match.
+        """
+        info = getattr(model, "last_demo_retrieval", None)
+        if info is None:
+            return
+        model.last_demo_retrieval = None
+        self.frame_log.record(observation, step_idx)
+        self.steps.append(step_idx)
+        self.indices.append(np.asarray(info["indices"], dtype=np.int32))
+        self.distances.append(np.asarray(info["distances"], dtype=np.float32))
+        self.demo_episode.append(np.asarray(info["episode"], dtype=np.int32))
+        self.demo_frame.append(np.asarray(info["frame"], dtype=np.int32))
+        self.bank_frames = int(info.get("bank_frames", self.bank_frames))
+        self.num_proposals = int(info.get("num_proposals", self.num_proposals))
+        if info.get("thumbnails") is not None:
+            self.thumbnails[step_idx] = np.asarray(info["thumbnails"], dtype=np.uint8)
+
+    def flush(self, episode_idx):
+        """Render this episode's outputs and start a fresh episode. No-op with no samples."""
+        if not self.steps:
+            self._reset()
+            return
+        out_dir = self.episode_dir(episode_idx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        steps = np.asarray(self.steps)
+        indices = np.stack(self.indices)  # (samples, k)
+        distances = np.stack(self.distances)
+        demo_episode = np.stack(self.demo_episode)
+        demo_frame = np.stack(self.demo_frame)
+        try:
+            self._save_plot(out_dir, episode_idx, steps, indices, distances, demo_frame)
+            self._save_gif(out_dir, episode_idx, steps, distances, demo_episode, demo_frame)
+            np.savez_compressed(
+                out_dir / f"retrieval_episode{episode_idx}.npz",
+                step=steps,
+                bank_index=indices,
+                distance=distances,
+                demo_episode=demo_episode,
+                demo_frame=demo_frame,
+                bank_frames=self.bank_frames,
+            )
+            print(f"\033[93m[debug] demo retrieval log written to {out_dir}/retrieval_*\033[0m")
+        except Exception as e:
+            print(f"[debug] demo retrieval output failed: {e}")
+        self._reset()
+
+    def _save_plot(self, out_dir, episode_idx, steps, indices, distances, demo_frame):
+        """Retrieved demo frame vs rollout step (top), and match distance (bottom, lower=better)."""
+        plt = agg_pyplot()
+        fig, (ax_idx, ax_sim) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        for rank in range(indices.shape[1]):
+            color = RETRIEVAL_RANK_COLORS[rank % len(RETRIEVAL_RANK_COLORS)]
+            # Ranks past `num_proposals` are context only -- drawn thinner, since the critic
+            # never saw them.
+            given = rank < self.num_proposals
+            ax_idx.plot(steps, demo_frame[:, rank], ".-", color=color, ms=3,
+                        lw=1.4 if given else 0.7, alpha=1.0 if given else 0.6,
+                        label=f"rank {rank + 1}" + (" (to critic)" if given else ""))
+            ax_sim.plot(steps, distances[:, rank], "-", color=color,
+                        lw=1.4 if given else 0.7, alpha=1.0 if given else 0.6)
+        # The diagonal a perfectly phase-aligned retrieval would follow, if the rollout ran the
+        # demo's length. Not a target -- a rollout that stalls or recovers *should* leave it --
+        # but it makes "tracking phase" versus "stuck" readable at a glance.
+        if len(steps) > 1 and demo_frame.size:
+            span = float(demo_frame[demo_frame >= 0].max() or 1)
+            ax_idx.plot(steps, np.linspace(0, span, len(steps)), "--", color="0.6", lw=1,
+                        label="uniform phase")
+        ax_idx.set_ylabel("retrieved demo frame")
+        ax_idx.set_title(f"episode {episode_idx}: demo retrieval (top-{indices.shape[1]} of "
+                         f"{self.bank_frames} bank frames; {self.num_proposals} given to critic)")
+        ax_idx.legend(fontsize=7, ncol=2)
+        ax_idx.grid(alpha=0.3)
+        ax_sim.set_ylabel("relative L2 distance\n||q-b||/||q||  (lower = nearer)")
+        ax_sim.set_xlabel("rollout step")
+        ax_sim.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"retrieval_episode{episode_idx}.png", dpi=120)
+        plt.close(fig)
+
+    def _save_gif(self, out_dir, episode_idx, steps, distances, demo_episode, demo_frame):
+        """The rollout frame beside the demo frames it matched, one panel per rank."""
+        if not self.thumbnails:
+            return
+        plt = agg_pyplot()
+        images = []
+        for i in gif_frame_indices(len(steps)):
+            step = int(steps[i])
+            rollout = self.frame_log.frame(step)
+            thumbs = self.thumbnails.get(step)
+            if rollout is None or thumbs is None:
+                continue
+            k = len(thumbs)
+            fig, axes = plt.subplots(1, k + 1, figsize=(3.0 * (k + 1), 3.0))
+            axes = np.atleast_1d(axes)
+            axes[0].imshow(rollout)
+            axes[0].set_title(f"rollout  step {step}", fontsize=9)
+            for rank in range(k):
+                ax = axes[rank + 1]
+                ax.imshow(thumbs[rank])
+                ax.set_title(
+                    f"#{rank + 1}{'*' if rank < self.num_proposals else ''}  "
+                    f"ep{int(demo_episode[i, rank])} f{int(demo_frame[i, rank])}\n"
+                    f"d {distances[i, rank]:.3f}",
+                    fontsize=9,
+                    color=RETRIEVAL_RANK_COLORS[rank % len(RETRIEVAL_RANK_COLORS)],
+                )
+            for ax in axes:
+                ax.axis("off")
+            fig.tight_layout()
+            images.append(figure_to_image(fig))
+            plt.close(fig)
+        write_gif(out_dir / f"retrieval_episode{episode_idx}.gif", images)

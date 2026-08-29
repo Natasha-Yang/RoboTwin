@@ -359,8 +359,9 @@ query rather than an observation. With `data_type.wrench: true`:
 | HDF5 path | Shape | Contents |
 |---|---|---|
 | `wrench/<link>` | `(num_frames, save_freq, 6)` float32 | one group member per end-effector link — aloha gives `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8` |
+| `wrench/<arm>` | `(num_frames, save_freq, 6)` float32 | `left` and `right`, each the sum of that arm's links |
 
-Per **link**, not summed per arm (§6.2). Each row is the trace of the `save_freq` primitive
+Both granularities, from the one contact query (§6.1). Each row is the trace of the `save_freq` primitive
 steps that led up to that frame, one `[Fx, Fy, Fz, Tx, Ty, Tz]` sample per step, world frame,
 torque about that arm's TCP. `_base_task._log_step_wrench` samples after every `scene.step()` of
 `take_dense_action` / `together_move_to_pose`, and `_take_picture` drains the log while building
@@ -609,7 +610,8 @@ Or directly on an `salloc`'d GPU node:
 ```bash
 cd policy/pi05
 bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
-             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n]
+             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n] \
+             [critic_config_path]
 # baseline (no critic guidance)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
 # online critic-guided
@@ -620,6 +622,9 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0 "" "" "" 8
 # both: every candidate steered, the best steered chunk executed
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256 "" "" 8
+# DSRL: the sampler is untouched and a SAC actor picks the noise it denoises from (§5c)
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 \
+             "" "" "" "" "" /home/natasha/multisensory-steering/cfgs/dsrl.yaml
 ```
 
 - `eval.sh` activates `policy/pi05/.venv` and calls `script/eval_policy.py` with
@@ -645,7 +650,7 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   is then never called at all, so its own delta state never advances). Unlike the guidance knobs
   this applies to the plain baseline too. `script/eval_policy.py::control_step_reward` is the one
   place it acts, so a guided run's TD targets and the printout agree by construction; the
-  equivalent for a collected dataset's `reward` column is §6a, which is always shaped.
+  equivalent for a collected dataset's `reward` column is §7a, which is always shaped.
 
 #### Crash recovery
 
@@ -741,6 +746,9 @@ under that same result dir:
 | Critic Q trace | `q_episode<N>.png` | guided runs only (see below) |
 | Rollout + Q GIF | `q_episode<N>.gif` | head camera on the left, the Q and reward traces with a step cursor on the right |
 | Raw series | `q_episode<N>.npz` | `step`, `q` `(num_samples, num_qs)`, `reward`, `guidance_scale`, `return_to_go`, plus the scalars `return_mean` / `return_std` / `gamma_h` |
+| Retrieval phase plot | `retrieval_episode<N>.png` | retrieval runs only (§5b): retrieved demo frame + match similarity vs rollout step |
+| Rollout + retrieved demos GIF | `retrieval_episode<N>.gif` | head camera on the left, the top-`debug_top_k` demo head frames it matched on the right |
+| Raw series | `retrieval_episode<N>.npz` | `step`, `bank_index`, `distance`, `demo_episode`, `demo_frame`, `bank_frames` |
 | Depth / segmentation tiles, point clouds | `obs_step<S>.png` / `pcd_step<S>.ply` | only for the modalities the task config's `data_type` enables |
 
 Both GIFs animate the same rollout, so `envs/utils/debug_vis.py::RolloutFrameLog` downscales
@@ -749,7 +757,7 @@ both recorders (`TCPWrenchRecorder`, `QValueRecorder`) and the plotting/GIF plum
 share; `eval_policy.py` keeps `visualize_debug_obs` and the code that constructs, feeds and
 flushes them.
 
-The wrench is computed by `envs/utils/wrench.py` (shared with the rollout-dataset collector, §6a).
+The wrench is computed by `envs/utils/wrench.py` (shared with the rollout-dataset collector, §7a).
 It is the **net contact wrench on the end-effector links** (wrist link + gripper
 fingers + any `fix_gripper_name` links), summed from `scene.get_contacts()` impulses divided
 by the sim timestep, with torque taken about the TCP origin. Both vectors are resolved in the
@@ -758,8 +766,31 @@ across steps as the gripper rotates. It is contact-only: an arm moving through f
 zero — this is not a joint-torque estimate. One sample is taken per policy call (so
 `pi0_step` sim frames apart), paired with that call's head-camera frame.
 
-Note `analysis/plot_wrench_hist.py` plots the same histograms straight off a collected
-rollout dataset, for when you want the distribution over a whole run rather than per episode.
+It is recorded at **two granularities at once**, from the one contact query
+(`wrench_vectors`): one `(6,)` per gripper **link**, and one per **arm** that is exactly the sum
+of that arm's links. The links are what keep a finger squeezing against its opposite — equal and
+opposite forces that cancel in the arm total — visible; the arm totals are the coarser
+two-signal version. `_base_task._log_step_wrench` logs both once per primitive step and
+everything downstream just names the keys it wants, so the demo HDF5's `wrench/<key>` groups
+(§3.4), the rollout dataset (§7a) and a critic (§5a) all carry or can name either family. The
+link labels are the embodiment's URDF link names, so **which** `wrench.<link>` keys exist
+follows the robot: aloha agilex gives four (`fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`),
+plus `left` and `right`. `ee_link_labels` is the link → arm grouping; `compute_tcp_wrench` /
+`tcp_wrench_vector` are the arm half on their own, `link_wrench_vector` the link half.
+
+The debug plots draw the **link** half only — an arm total overlaid on its own links is just
+their sum drawn twice. `analysis/plot_wrench_hist.py` plots the same histograms straight off a
+collected rollout dataset, for when you want the distribution over a whole run rather than per
+episode, and takes `--family links|arms|all` for the same reason.
+
+> Changed on 2026-08-28. Datasets collected before it carry only `observation.wrench.{left,right}`.
+> Those keep working unchanged: the arm columns and the `wrench.left` / `wrench.right` modalities
+> mean exactly what they did, so an existing critic checkpoint still warm-starts as long as its
+> `encoder_modalities` names them (it is an architecture key — a checkpoint trained on the arm
+> totals cannot be pointed at the link modalities without retraining, and vice versa). What
+> changed for such a checkpoint is the **encoder**: `wrench.*` now defaults to a 2-D `map_cnn`
+> over the trace's (T, 6) time × component grid rather than a temporal `conv1d`, so an older one
+> has to pin `encoder: conv1d` in its modality mapping to keep loading.
 
 ### 6.2 Critic gradient guidance (`guidance_scale` is the on/off switch)
 
@@ -779,19 +810,6 @@ rollout dataset, for when you want the distribution over a whole run rather than
 > Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
-Everything that records the wrench keeps it **per link** (`link_wrench_vector`, one `(6,)`
-per gripper finger) rather than per arm, so a finger squeezing against its opposite — equal and
-opposite forces that cancel in the arm total — is still visible. That is the debug plots, the
-demo HDF5's `wrench/<link>` groups (§3.4), the rollout dataset's `observation.wrench.<link>`
-columns (§7a) and the critic's `wrench.<link>` modality alike. `compute_tcp_wrench` /
-`tcp_wrench_vector` are that same decomposition summed per arm; nothing on the recording path
-calls them any more, they are kept as the arm-level summary for analysis.
-
-> **Breaking change (2026-08-26).** The per-arm `wrench.left` / `wrench.right` modality and the
-> `observation.wrench.{left,right}` dataset columns are gone, replaced by one per link. A critic
-> checkpoint trained on the old names will not load against the new `encoder_modalities`, and a
-> rollout dataset collected before this date has the old two columns — retrain, or sum the link
-> columns back into two if you need the old shape.
 
 The **Q outputs need a critic**, so they appear only when `debug: true` meets a nonzero
 `guidance_scale` or a `best_of_n > 1` (§5a); a baseline run prints `critic Q logging OFF` and
@@ -817,8 +835,10 @@ anyway. The `.npz` keeps `q` **raw** (as the guidance sees it) plus the constant
 ### 5a. Critic-conditioned sampling (`guidance_scale` and `best_of_n`)
 
 There is **one** eval script and **one** config. Two independent keys in `deploy_policy.yml`
-decide whether a critic acts on `Pi0.sample_actions`, and **either one** on its own builds the
-critic (and, by default, TD-trains it online):
+decide whether a QMFM critic acts on `Pi0.sample_actions`, and **either one** on its own builds
+the critic (and, by default, TD-trains it online). (A third way is to name the *other* critic
+family — `critic_type: dsrl`, §5c — which steers by choosing the sampler's noise and is
+mutually exclusive with both keys below.)
 
 | Key | Off | On |
 |---|---|---|
@@ -957,7 +977,10 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.<link>` | per-step contact wrench, one modality per gripper link (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`), logged by the env | `(pi0_step, 6)` each |
+| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-step contact wrench per end-effector link, logged by the env | `(pi0_step, 6)` each |
+| `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(pi0_step, 6)` each |
+| `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
+| `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
 
 The names are the §7a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -983,7 +1006,13 @@ Three things to keep in mind:
   critic trained offline on it needs no realignment. (Datasets collected before 2026-07-30 store
   the *following* chunk's trace instead — see §7a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§7a); a critic configured for `wrench.*` against a config
-  that has it off fails at startup.
+  that has it off — or naming a link this embodiment does not have — fails at startup.
+- **The proposal modalities are retrieved, not sensed.** `action_proposals` /
+  `noise_proposals` come from a bank of demonstrations rather than from the sim (§5b), so they
+  are the two `data_type` flags nothing in `get_obs` produces — `script/eval_policy.py` forwards
+  them to `deploy_policy.py::get_model` and `pi_model.py` fills them in per control step. They
+  are also the only modalities a rollout dataset does **not** carry, so a critic that uses them
+  cannot (yet) be pretrained offline.
 - **Modalities are an architecture key.** They go into the checkpoint, and a warm start rebuilds
   the same encoder stack; changing the list makes an existing critic checkpoint refuse to load
   (loudly, leaf by leaf). Offline pretraining takes the same names — `multisensory_steering`'s
@@ -991,6 +1020,385 @@ Three things to keep in mind:
   checkpoint only warm-starts a run whose list matches. Each modality is also stored twice per
   transition (obs and next_obs) — each `siglip.*` view is ~1.15 MB/transition (so all three come
   to ~3.5 MB), a depth camera ~0.6 MB, so `buffer_size` needs revisiting when adding one.
+
+### 5b. Demo retrieval (`action_proposals` / `noise_proposals`)
+
+Two more critic modalities, and the only ones that do not come from this episode: the actions a
+**successful demonstration** took from a state that looks like the one the robot is in now, and
+the noise seeds that would make the sampler reproduce them here.
+
+```yaml
+# task_config/<config>.yml — the switches, both default false
+data_type:
+  action_proposals: true    # the retrieved demo chunks
+  noise_proposals: true     # the seeds that map to them (pays for the flow inversion)
+```
+```yaml
+# policy/pi05/deploy_policy.yml — where they come from
+demo_retrieval:
+  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  num_demos: 1        # demonstrations drawn per eval episode
+  top_k: 1            # neighbours retrieved per control step
+  bank_size: 512      # the bank is a jit argument, so it is padded to a fixed size
+  num_steps: 10       # MUST equal the sampler's denoising steps
+  num_inner_steps: 10
+  signals: null       # what the distance ranks by; null = [siglip, state]
+```
+
+Once per **run** (on the first `PI0.set_language`): `num_demos` episodes of the task under
+evaluation are drawn at random from the demo dataset and every frame of them is encoded into a
+bank, which is then **fixed for the whole eval** — it is a critic input, so re-drawing it
+between episodes would evaluate a value learned against one set of demonstrations on a different
+set, and two episodes run from the same seed would not be comparable. One draw also makes the
+choice reproducible from `seed` alone and survives a resume, since the bank is rebuilt
+identically rather than restored. `DemoRetriever.select_bank` still draws explicitly for a
+caller that wants a new one. A bank row is a
+**pooled** SigLIP embedding per camera view (`Pi0.embed_observation_maps`, the image tower alone,
+averaged over patches and left at its natural magnitude — nothing here is unit-normalized), the
+normalized action chunk that was the policy's training target at that frame, the pose, and the
+frame's own uint8 model inputs. All of it goes through
+the policy's **own input transform**, so a bank row is in exactly the space the sampler works in
+(delta-encoded against the demo's own state, normalized, padded to `action_dim`, then narrowed
+back to the embodiment's 14 for the critic).
+
+Per control **step** (`Pi0.propose_from_demos`): the live observation is embedded by the same
+tower — free, since the prefix pass runs it anyway — scored against every bank row, and the
+`top_k` **nearest** rows contribute their chunk as `action_proposals`. With
+`noise_proposals` on, those chunks are additionally run through `Pi0.invert_actions` **under the
+live observation**, giving the noise that would make *this* observation's sampler produce a
+demo-like chunk. The inversion shares the prefix the retrieval already computed.
+
+**What the critic does with the shortlist.** A critic whose proposal encoder is
+`attn_proposals` (`multisensory_steering`'s default) treats the `top_k` rows as a *candidate
+pool* rather than an answer: it **cross-attends** them, with the live observation as its query
+and the candidates' own observations as the keys, so which demonstration the value rests on is
+learned by the TD loss instead of fixed by the distance. A key is built by the critic's *own*
+encoders, which means a demo frame's un-pooled SigLIP **patch map** — 0.6 MB per view even at
+fp16. Those are **not** kept per bank row (that was ~0.9 GB of device memory at `bank_size: 512`
+over three cameras, resident for the whole run and growing with the bank):
+`DemoRetriever.critic_keys` re-runs the image tower on the `top_k` retrieved rows each control
+step, which is why the bank keeps their frames. The cost moves accordingly — one extra tower
+pass at batch `top_k` per control step, and a stored transition now carries its candidates'
+maps (~1.2 MB/transition per key view, obs and next_obs together) instead of a `(top_k,)` row
+index. `bank_size` is then free in device memory, and `top_k` / the critic's `key_modalities`
+are what the replay buffer's size keys off. A critic that pools the set
+(`encoder: action_proposals`) asks for none of this.
+
+**What "nearest" means.** Not a cosine but the **average of several independent relative L2
+distances**, one per signal, smallest wins (`signals`, `SIMILARITY_SIGNALS`):
+
+| signal | vector | terms |
+|---|---|---|
+| `siglip` | mean-pooled patch features per camera view | one per view in `views` (3 by default) |
+| `state` | the robot's pose in the model's **normalized** space, `(32,)` padded | 1 |
+
+Each term is `‖query − row‖ / ‖query‖` — the distance as a fraction of the magnitude of the
+*current observation's* own vector for that signal. That query-relative scaling is what makes
+terms of very different size averageable without normalizing the magnitude away: measured on
+this machine, raw distances run ~13 for `siglip.right_wrist` against ~1.6 for `state`, which
+would make the pose about 7% of a plain mean; divided by the query's magnitude (~24 and ~2.5
+respectively) every term lands at O(0.1–1). Nothing is unit-normalized, so unlike a cosine this
+is sensitive to magnitude — two poses pointing the same way but ten times apart in size are
+identical to a cosine and far apart here.
+
+So the default is a mean of **four** distances, and every term counts the same — `state` is a
+quarter of the score, not a tiebreaker. `signals: [siglip]` is vision only (`siglip` is
+required; nothing else identifies the scene). The pose is read from the transformed
+observation, i.e. the exact vector the sampler is conditioned on, and both sides go through the
+same transform, so a pose distance compares like with like; the zero padding past the
+embodiment's dims contributes nothing to it. The denominator is floored, so a query vector that
+is somehow zero reads as a plain unscaled distance rather than an infinity that swallows the
+average.
+
+There is no `wrench` signal, though it would be the natural third: **no demo dataset carries
+one.** `collect_data.py` computes the contact wrench live and never writes it to the HDF5, and
+neither `process_data.py` nor the LeRobot converter carries it downstream — so it exists only in
+rollout datasets (§7a) and in the live observation, never in a demonstration. Adding it would
+mean persisting the wrench through the demo pipeline and re-collecting.
+
+**What control mode a proposal is in.** pi0.5's native aloha mode, not absolute pose: the
+action is a **joint-space** target (6 arm joints + 1 gripper per arm), and
+`LeRobotAlohaDataConfig`'s `DeltaActions(make_bool_mask(6, -1, 6, -1))` makes the twelve
+arm-joint dims a **delta from the pose the chunk is conditioned on**, leaving the two gripper
+dims absolute widths. A bank row is therefore the demo's *motion away from the demo's own pose
+at that frame*, and `AbsoluteActions` adds the live state back on the way out — the same
+round trip the sampler's own chunk makes, so a proposal and the chunk the critic is scoring are
+the same kind of object term for term. There is no end-effector pose anywhere in this path.
+
+`DemoRetriever` does not take that on trust. It probes the chain at startup — push the same
+actions through under two different states, see which dims move — and reports the answer in the
+banner. If the chain delta-encodes nothing (`use_delta_joint_actions=False`, so the bank would
+hold another episode's absolute joint targets), it applies pi0.5's **own**
+`DeltaActions(NATIVE_DELTA_MASK)` before normalization instead, which is pinned by test to
+reproduce the delta chain's bank exactly rather than inventing a second control mode.
+
+One thing the delta does *not* absorb: its origin. A proposal is relative to the **demo's** pose
+at the retrieved frame, while the sampler's chunk is relative to the **rollout's current** pose.
+Measured over a `beat_block_hammer` rollout retrieved against another episode, the gap between
+those two origins is 0.038 rad mean per joint (‖gap‖₂ 0.24 rad mean, 1.25 max) against a mean
+chunk delta of 0.142 rad — about 27%. So a proposal says "make the motion the demo made", not
+"go where the demo went", and the two differ by roughly a quarter of the motion's own size. That
+is the intended reading (it is what keeps the proposal in the sampler's space), but it is the
+thing to revisit if proposals ever look systematically offset.
+
+Which demonstrations count as "the same task" is decided by RoboTwin **task**, not by
+instruction string: one task expands into hundreds of instructions and the LeRobot dataset's own
+`task_index` indexes instructions, so
+`openpi/training/episode_selection.py::assign_episode_tasks` (shared with `episodes_per_task`
+training subsets) maps each demo episode back to its task via the templates in
+`description/task_instruction/` plus episode-index contiguity. A demo whose instruction reads
+nothing like the eval episode's is still a valid demo of the same environment.
+
+The reader (`openpi/policies/demo_retrieval.py::LeRobotEpisodeReader`) parses the LeRobot layout
+directly rather than going through `lerobot`, because the installed lerobot refuses a dataset
+written in a newer codebase version than its own — both the v2.1 (one parquet per episode) and
+v3.0 (episodes share files) layouts on this machine are read.
+
+Cost. Measured on this machine (RTX 5090, `pi05_base_aloha_lora_clean_50x25` at step 15000,
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.4`, `num_steps=10`, `num_inner_steps=10`):
+
+| | per control step | peak GPU |
+|---|---|---|
+| baseline `sample_actions` | 81 ms | 6.50 GiB |
+| `+ action_proposals` | +25 ms | 6.54 GiB |
+| `+ noise_proposals`, `top_k=1` | 284 ms | 6.54 GiB |
+| `+ noise_proposals`, `top_k=4` | 453 ms | 6.54 GiB |
+| `+ noise_proposals`, `top_k=8` | 563 ms | 6.54 GiB |
+
+**Memory is not the constraint** — retrieval adds ~40 MiB on top of the policy, flat in both
+`top_k` and `bank_size` (the bank itself is ~10 MB, and the inversion reuses the prefix rather
+than widening it much). The 0.4 memory fraction gives JAX ~13 GiB of the card's 32 GB, so there
+is ~6.5 GiB of headroom left inside the pool for the critic and its replay buffer.
+
+**Time is.** `noise_proposals` is 3.5–7x the per-step policy cost, because the inversion is
+`num_steps × num_inner_steps` = 100 sequential action-expert passes. At a 170-control-step
+episode that is roughly +80 s per episode. `num_inner_steps` is the lever: the fixed point is
+already at ~1e-4 by 4 iterations (`pi0_invert_test.py::test_invert_actions_converges_with_more_inner_steps`),
+so `num_inner_steps: 4` cuts the inversion to about 110 ms if proposal-grade noise is good
+enough. `action_proposals` alone costs only the extra tower + prefix pass and is nearly free by
+comparison.
+
+**Does mean pooling actually retrieve corresponding frames?** Measured, not assumed. Query every
+frame of one `beat_block_hammer` demo against a bank built from a *different* demo of the same
+task, and check whether the retrieved frame's position tracks the query's:
+
+| pooling | rank corr (Spearman) | mean phase error |
+|---|---|---|
+| mean-pool (what this does) | +0.999 | 1.5% of the episode |
+| max-pool | +0.999 | 1.3% |
+| full 256x1152 patch map | +0.999 | 1.5% |
+
+(Those were measured under a cosine, before the switch to relative L2. Re-measured against the
+same pair of episodes, raw-L2 retrieval tracks phase identically — rho +0.9989 and 2.4% phase
+error against the cosine's +0.9989 and 2.6% — while agreeing with the cosine's top-1 pick on
+87% of frames, so it is a genuinely different metric that is just as good at finding
+corresponding frames.)
+
+All three tie, so pooling to 1152 dims costs nothing over keeping the whole patch map — which is
+the expensive alternative (256x the bytes per bank row). Two controls back this up: querying an
+episode against *itself* is exact (rho 1.000, error 0), and querying a **different task's**
+episode collapses (rho +0.25, error 0.50 over all three views) — so the embedding is carrying
+task content, not just a clock. Head-camera-only is the exception: it keeps rho +0.84 even on
+the wrong task, because the head view of an arm sweeping out and back looks similar whatever the
+task. That is an argument for leaving `views: null` (all three) rather than narrowing to the
+head.
+
+Two caveats the numbers do not cover. Neighbouring ranks are separated by very little (under a
+cosine, ~0.001 between rank 1 and rank 3 out of ~0.98), so the score is a *ranking* signal and a
+poor confidence measure — do not threshold on it. And retrieval is phase-dominant: matched frames reliably show the same stage of
+the task, but the object can be somewhere else in the scene, which is exactly what the GIF below
+exists to make visible.
+
+**Watching it during a rollout.** With `debug: true` in the task config, a retrieval run writes
+`retrieval_episode<N>.{png,gif,npz}` next to the wrench and Q outputs. The png plots the
+retrieved demo frame against the rollout step — a retrieval that is tracking task phase draws a
+roughly diagonal line, a flat one means every step matched the same demo frame, a scattered one
+means it is not tracking phase at all — with the per-rank similarity underneath. The gif puts
+the rollout's head camera beside the demo head frames it matched, captioned with episode, frame
+and distance, which is the only output that shows *why* a match is wrong. The distance panel
+reads the opposite way round from a similarity: lower is nearer. `debug_top_k` (default
+3) sets how many ranks are drawn and is independent of `top_k`: the similarity over the whole
+bank comes back anyway, so showing neighbours the critic was not given is free, and the ones it
+was are marked with a `*`.
+
+Building the bank is 5 s (1 demo) to 18 s (4 demos) at `frame_stride: 1`, paid once for the
+whole run rather than per episode. Encoded episodes are additionally cached by index, so an
+explicit re-draw landing on the same demonstration costs nothing; the cache tops out at a couple
+of MB per demo episode in host RAM.
+
+Nothing is built unless a critic exists **and** its `encoder_modalities` actually names one of
+the two: a run that turns the flags on without the critic side prints that it is turning
+retrieval back off rather than paying for output nobody reads.
+
+`Pi0.invert_actions` is the general method underneath (`pi0.py`, tested in
+`pi0_invert_test.py`): given a clean chunk it recovers the exact noise `sample_actions` would
+denoise into it, by solving each explicit-Euler step's implicit inverse with a fixed-point
+iteration. Exact, not DDIM-approximate — replaying the recovered noise reproduces the chunk to
+~4e-7 in float32. It inverts the plain sampler only, not the guided or best-of-N paths.
+
+### 5c. DSRL — steering by choosing the noise (`critic_type: dsrl`)
+
+The second critic family, and a different idea from §5a's. QMFM scores **action chunks** and
+pushes the denoising around with a value gradient. DSRL
+([Diffusion Steering RL](https://diffusion-steering.github.io/), local checkout `~/dsrl_pi0`,
+`$DSRL_ROOT`) leaves the frozen policy completely alone and moves the RL problem into the
+sampler's **latent noise**: the agent's action is the noise chunk `w` pi0.5 denoises from, the
+environment's action is whatever the frozen policy turns `w` into, and SAC runs on `(s, w)`.
+
+It is selected by pointing `critic_config_path` at the other config — the family is that file's
+own `critic_type`, and there is no scale to set:
+
+```yaml
+# policy/pi05/deploy_policy.yml
+critic_config_path: /home/natasha/multisensory-steering/cfgs/dsrl.yaml   # `critic_type: dsrl`
+```
+```bash
+# or per run, as eval.sh's 12th positional arg (args 7 and 11 must stay 0 / 1)
+bash eval.sh <task> <config> <train_config> <model> 0 0 "" "" "" "" "" \
+             /home/natasha/multisensory-steering/cfgs/dsrl.yaml
+```
+
+Naming the family **is** the switch. `guidance_scale != 0` or `best_of_n > 1` alongside it
+raises at startup: a Q over latents cannot score an action chunk, so there is nothing for either
+of them to guide or rank with. `--overrides critic_config_path ...` is resolved *before* the
+include is merged (`parse_args_and_config`), so swapping the file swaps the family and its
+defaults together rather than only the recorded path.
+
+**The noise space.** One row of it is `action_dim` wide — pi0.5's padded **32**, not the
+embodiment's 14. That is the one place a latent and an action differ in width: the trailing dims
+of an *action* are dead (they normalize to constant zero for aloha and §5a strips them), but the
+trailing dims of a *noise* are not — all 32 go through `action_in_proj` and shape the 14 that
+come out. `noise_horizon` (default **1**, dsrl_pi0's) is how many rows SAC actually chooses;
+`pi0.py::hold_noise` repeats the last one out to the sampler's 50 denoising rows. That is what
+keeps the policy 32-dimensional instead of 1600-dimensional, and it is why the critic config
+carries `noise_action_dim` separately from `state_dim`. The actor is tanh-squashed to
+`action_magnitude` (default 1.0), so the reachable latents are a strict subset of the standard
+normal pi0.5 was trained to denoise — ~32% of that mass sits outside [-1, 1].
+
+**Where the actor runs.** Inside `Pi0.sample_actions`, after the prefix pass, through the
+`noise_apply` / `actor_params` hooks — the same static-function / traced-params split
+`critic_apply` / `critic_params` use, so online updates need no recompile. Deliberately there
+rather than on the host: the actor then conditions on *exactly* what the QMFM critic conditions
+on, SigLIP maps included, which is the one thing that does not exist before the sampler has been
+called. The chunk it chose comes back in the aux dict as `critic_noise`, because nothing outside
+the sampler can recover it, and that is what `stash` stores as the transition's action. Tests:
+`policy/pi05/src/openpi/models/pi0_dsrl_test.py`.
+
+**What it observes** is the same registry as §5a's `encoder_modalities`, with the same names and
+the same startup error for one the run does not produce. Two families get dsrl_pi0's own
+treatment: `images.<cam>` through jaxrl2's pixel tower (the `/255` inside the encoder, no other
+normalization) and `state` straight into the head. When those two are *all* that is configured
+the networks become jaxrl2's own module objects — same parameter paths, same init keys, same
+random-crop and color-jitter augmentation — and the run is dsrl_pi0's. Naming anything else (a
+SigLIP map, depth, wrench) switches to `multisensory_steering`'s multimodal encoder stack and
+keeps the pixel tower for the camera views.
+
+Two costs are worth knowing before turning cameras on:
+
+- **The pixel bottleneck is large at RoboTwin's resolution.** jaxrl2's `encoder_type='small'`
+  tower is four 3x3 VALID convs at stride 2,1,1,1, so a 240x320 frame lands at 113x153x32 and
+  the `Dense(latent_dim)` after it is ~27M parameters *per network* (measured: 28.2M critic,
+  27.7M actor at one camera). jaxrl2 runs the same shape on LIBERO's 256x256 frames, so this is
+  faithful rather than a mistake — but `latent_dim` is the lever if it is too much.
+- **Raw frames are ~0.45 MB/transition each** (obs and next_obs, uint8), so all three cameras at
+  `buffer_size: 5000` is 6.9 GB of host RAM. `cfgs/dsrl.yaml` enables only `images.head`.
+
+**Warmup.** `noise_warmup_chunks` (default 0) spends that many control steps on the base
+policy's own Gaussian latent before the actor starts choosing, so the buffer opens with
+transitions from the distribution pi0.5 was trained to denoise rather than from an untrained
+tanh actor; dsrl_pi0 spends its whole first trajectory this way. It is a rollout-loop knob, not a
+critic hyperparameter, so it is read by `deploy_policy.py` and kept out of the critic checkpoint.
+The switchover costs one sampler recompile — passing a `noise=` argument at all is what changes.
+
+**What does not carry over from §5a:** `offline_mix` (it raises for `critic_type: dsrl` rather
+than mixing something else in — though the reason is now only half true: rollout datasets
+collected since 2026-08-28 do carry the sampler's latent as `action.noise` (§7a), so the
+transitions exist; what is missing is the loader-side support for reading them, and a latent
+recorded under a `hold`/`lowrank` parameterization would still have to be projected back into
+whatever family the agent acts in), the guidance ramp (nothing to ramp), and best-of-N. `train_online: false`,
+`freeze_encoder`, `critic_ckpt`, `restore_optimizer`, `save_critic`, the resume machinery,
+`use_step_reward` and the W&B/debug outputs all work exactly as they do for the QMFM critic —
+`script/eval_policy.py` keys off `model.online_critic` and never learns which family it got.
+The per-update W&B log now forwards whatever keys the update reported, so a DSRL run's
+`critic/actor_loss`, `critic/entropy`, `critic/temperature` and `critic/policy_std_mean` appear
+alongside the shared TD curves. `debug: true` still writes `q_episode<N>.*` — the Q plotted there
+is over the latent the actor chose, against the same realized return-to-go.
+
+### 5d. Co-training the critic on the fine-tuning demonstrations (`offline_mix`, `kind: demo`)
+
+`offline_mix` (`cfgs/qmfm.yaml`) draws `frac` of every TD batch from a fixed dataset instead of
+from the live replay buffer, which otherwise holds only what the policy being steered just did —
+small, correlated, and on a task the policy fails at, quite possibly containing no success at
+all. It normally points at a **rollout** dataset (§7). It can now point at the **supervised
+fine-tuning set** instead: the LeRobot dataset of expert demonstrations the policy was trained
+on, e.g. `NatashaYang/robotwin_demo_clean_50_lerobot`.
+
+```yaml
+# whatever `offline_mix.config` names (default cfgs/train_offline.yaml)
+dataset:
+  kind: demo                                        # `rollout` is the default
+  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  task: null                                        # null = the task being evaluated
+  reward_col: terminal_reward                       # the only one a demonstration can have
+```
+```yaml
+# or without editing that file, from cfgs/qmfm.yaml
+offline_mix:
+  enabled: true
+  set: ["dataset.kind=demo",
+        "dataset.repo_id=NatashaYang/robotwin_demo_clean_50_lerobot",
+        "dataset.reward_col=terminal_reward"]
+```
+
+**Two episodes of the same task, not the same instruction.** An SFT dataset covers every task
+the policy was fine-tuned on at once (2500 episodes over 50 tasks here), and a demonstration of
+another task is a different MDP wearing the same observation shapes, so the first thing that
+happens is the filter: `episode_selection.assign_episode_tasks` maps each episode back to its
+RoboTwin task through the instruction templates in `description/task_instruction/` — the same
+mapping §5b's bank uses, and not the dataset's own `task_index`, which indexes instructions.
+`dataset.task` pins a different task deliberately (does a related task's demonstrations
+transfer?); blank means the one under evaluation. `split` / `num_episodes` / `episode_seed` then
+choose among the matching episodes exactly as they do for a rollout dataset.
+
+**A demo dataset has none of the critic's columns**, and does not need them: every one of them is
+*derived from the frame by the policy*. So the rows are built at startup by the run's own pi0.5 —
+`DemoRetriever.cotrain_rows`, through the same image tower and the same input transform §5b's
+bank goes through — and `pi_model.py::_attach_demo_cotrain` hands them to the critic. Which is
+why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
+`pending_demo_cotrain` and refuses to build a batch until the policy has attached one.
+
+| | a demo row | how |
+|---|---|---|
+| `siglip.{head,left_wrist,right_wrist}` | ✔ `(16, 16, 1152)` fp16 | this run's own tower pass |
+| `state` | ✔ normalized, embodiment dims | this run's own input transform |
+| action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
+| `wrench.*`, `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
+| `images.<cam>` | ✘ | a demo frame is 480x640, the sim's is 240x320 — not the same array |
+
+A critic naming one of the ✘ modalities is refused **at startup**, listing them, rather than an
+hour into the rollouts (`offline_replay.check_demo_modalities`). Note that `cfgs/qmfm.yaml`'s
+default `encoder_modalities` lists the `wrench.*` modalities at whichever granularity, so
+turning this on means turning those off.
+
+Rows are the frames at `frame_index % horizon == 0` — the control steps the online critic takes,
+so a demo row and a live transition are the same distance apart in time and the same discount
+applies to both. Only those frames are decoded (`LeRobotEpisodeReader.read_episode(frames=...)`;
+states and actions still come back whole, since a chunk reaches 50 steps past its frame). At
+`pi0_step: 50` a ~220-frame demonstration is ~5 rows, so 50 episodes of a task cost ~250 rows,
+~0.4 GB resident over three SigLIP views.
+
+**Two things to weigh.** The reward: nothing recorded a `step_reward()` while a demonstration was
+collected — it is a delta against its own previous call and exists only while an episode runs —
+so a demo row's reward is the sparse success it earns by definition, 1.0 on its last control
+step. Against a run scoring itself with the shaped reward (`use_step_reward: true`, §6.1) the two
+halves of the batch are then **not the same reward function**; `use_step_reward: false` makes
+them agree exactly. And the demonstrations came from the expert motion planner, not from pi0.5,
+so their SARSA next-actions are further off-policy than a rollout dataset's — the offline half is
+a stabilizer and a source of what success looks like, not an estimate of *this* policy's value.
+Lower `frac` rather than changing how the batch is drawn.
+
+`train_offline.py` refuses a `kind: demo` config outright: it has no policy to encode a frame
+with, so demonstrations can be co-trained on from inside an eval run and not fitted offline.
 
 ### 6.3 MolmoAct
 
@@ -1051,7 +1459,8 @@ bash collect_dataset.sh <task_name> <task_config> <train_config_name> <model_nam
     expose) a dataset that has been pushed before. To change an existing repo, use
     `HfApi().update_repo_settings(repo_id, repo_type="dataset", private=...)`.
   - `checkpoint_id: 15000`, `pi0_step: 10`, `instruction_type: unseen`.
-  - `collect_critic_obs: true` — also record the policy's **model-space** view of each step.
+  - `collect_critic_obs: true` — also record the policy's **model-space** view of each step,
+    including `action.noise`, the flow-matching latent each chunk was denoised from.
   - `collect_siglip: true` — within that, also record the SigLIP patch features of **every**
     camera the policy sees (`siglip.head`, `siglip.left_wrist`, `siglip.right_wrist`). Set
     `false` to keep the dataset small, or list the views you want (`[head, left_wrist]`).
@@ -1087,14 +1496,17 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action` | raw robot, unnormalized by the output transform | `(50, 14)` |
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
+| `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.<link>` | world-frame contact wrench per gripper link, one row per executed step | `(pi0_step, 6)` each |
+| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per executed step | `(pi0_step, 6)` each |
+| `observation.wrench.<arm>` | the same, summed over that arm's links | `(pi0_step, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
 different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
 have not. Neither carries the model's internal zero padding to `action_dim=32` — it is stripped
-before the tensors leave the sampler, so `state_dim` is `14`, not `32`. Only `pi0_step` of the
+before the tensors leave the sampler, so `state_dim` is `14`, not `32`. `action.noise` is the
+one exception, and deliberately so (see below). Only `pi0_step` of the
 50 chunk steps are actually executed before the next inference call; the whole chunk is recorded
 because that is what the sampler scores.
 
@@ -1113,6 +1525,31 @@ critic intended to steer inside the sampler (§6.2) **must** be trained on these
 `state_col: observation.state.model` / `action_col: action.model`. The raw columns remain for
 behavior cloning and for critics that score executed robot actions.
 
+`action.noise` is the third thing that call returns (`sample_noise`): the noise chunk the action
+expert integrated from to produce this row's `action.model`. It is the action of a **noise-space**
+agent's MDP (§5c) rather than of the robot's, so it is what an offline `Q(s, w)` would be trained
+on — `action_col: action.noise` — and it is meaningless to a QMFM critic, which scores chunks.
+Three things make it unlike every other column:
+
+- **It is `(50, 32)`, not `(50, 14)`.** The padded width is not padding here. The trailing dims of
+  an *action* normalize to constant zero for aloha and are stripped, but all 32 dims of a *noise*
+  go through `action_in_proj` and shape the 14 that come out, so a narrowed seed no longer
+  reproduces its chunk.
+- **It is a draw, not a function of the observation.** Everything else in the row could be
+  recomputed from a stored frame by a later pass; the seed is what made this chunk *this* sample
+  rather than another one, and once the sampler has returned, only `Pi0.invert_actions` (§5b) can
+  recover it — 100 action-expert passes a row, and only for the unguided sampler. That is why it
+  has no switch of its own: it rides along with `collect_critic_obs` at 6.4 KB/row, against the
+  576 KB a single SigLIP view costs.
+- **Rows collected under a critic are not seeds of what ran.** Collection runs the plain sampler,
+  so the column is exactly the Gaussian the chunk came from. A guided (§5a) sampler moves the
+  chunk off that seed's own trajectory, and best-of-N reports the winning candidate's — neither
+  applies to `collect_dataset.py`, which never builds a critic, but both matter if the aux dict is
+  read anywhere else.
+
+`policy/pi05/src/openpi/models/pi0_sample_noise_test.py` pins the property the column rests on:
+feeding `sample_noise` back in as `noise=` reproduces the chunk it came with.
+
 The `siglip.*` columns are the visual thing the critic conditions on, and are written **during
 collection** (`collect_siglip`) from `critic_obs_siglip` — the exact patch maps
 `Pi0.sample_actions` feeds the critic, computed by the same `PaliGemma.img` tower on the same
@@ -1125,14 +1562,19 @@ siglip.right_wrist]` at them and skip that pass entirely. At ~576 KB/row **each*
 dominate dataset size: `collect_siglip` takes a list of views (`[head]`) as well as
 `true`/`false`, and dropping the wrists is the cheapest way to shrink a run.
 
-`observation.wrench.<link>` — one column per gripper link (aloha: `fl_link7`, `fl_link8`,
-`fr_link7`, `fr_link8`) — is the **same quantity** §6.1's debug GIF plots draw: net contact
-wrench on that link, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame, torque about that arm's TCP
-(the same reference point for all of an arm's links, so they stay comparable with each other and
-with their sum). Computed by the shared `envs/utils/wrench.py::link_wrench_vector`, so the eval,
-demo-collection and rollout-collection paths cannot drift apart. The rate differs: `eval_policy.py` samples once per policy
-call, while collection samples after **every** primitive step, so a row carries a whole
-`(pi0_step, 6)` trace rather than a single vector.
+`observation.wrench.*` is the **same quantity** §6.1's debug GIF plots draw — net contact
+wrench, `[Fx, Fy, Fz, Tx, Ty, Tz]` in the world frame with torque about that arm's TCP (the same
+reference point for all of an arm's links, so they stay comparable with each other and with
+their sum) — computed by the shared `envs/utils/wrench.py::wrench_vectors`, so the eval,
+demo-collection and rollout-collection paths cannot drift apart. There is one column per
+end-effector link (aloha agilex: `observation.wrench.{fl_link7,fl_link8,fr_link7,fr_link8}`)
+**and** one per arm (`observation.wrench.{left,right}`, each the sum of that arm's links), so a
+critic can be trained offline on whichever granularity it observes online; at 480 B/row apiece
+the six together are under 3 KB/row, cheaper than choosing. The rate differs from the debug
+plots': `eval_policy.py` samples once per policy call for those, while the dataset (and the
+critic's own view) samples after **every** primitive step, so a row carries a whole
+`(pi0_step, 6)` trace rather than a single vector. Datasets collected before 2026-08-28 have
+only the two arm columns.
 
 Which trace matters: it is the one the **previous** chunk produced — the steps between the
 previous row's observation and this one. The env logs a sample after each `take_action`
@@ -1162,11 +1604,12 @@ episode runs. Train on it with `reward_col: reward` in `multisensory_steering`'s
 `success` and ignores the shaping). Datasets collected before 2026-08-07 have no such column.
 
 `envs/utils/wrench.py::stack_step_wrench` does the stacking, shared with the critic's online
-view of the same modality. A trace can be short — an episode's first row has no previous chunk
+view of the same modality and blind to which family a key belongs to. A trace can be short — an episode's first row has no previous chunk
 and carries a single sample of the contact state at that instant, and a chunk cut off by success
 or `step_lim` contributes only the steps it ran — so the tail is padded with **NaN**, not zeros,
-since zero is a meaningful reading (the arm touching nothing). At 480 B/row they are the
-cheapest column here.
+since zero is a meaningful reading (the arm touching nothing). At 480 B/row apiece they are
+still the cheapest columns here — six of them for aloha come to under 3 KB/row, against the
+576 KB a single SigLIP view costs.
 
 `wrench` is a `data_type` like the others, but it is the one the env cannot pick up from the
 flag itself: contacts are a scene query, not part of `get_obs`. So each driver reads

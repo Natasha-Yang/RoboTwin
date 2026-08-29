@@ -5,9 +5,12 @@ by rollout-dataset collection (`script/collect_dataset.py`, one sample per primi
 by expert-demo collection (`script/collect_data.py`, likewise per primitive step, stacked into
 the HDF5's `wrench/<link>` groups), so all three record the exact same quantity.
 
-Everything that records it keeps it **per end-effector link** (`link_wrench_vector`), not
-summed per arm: two fingers squeezing the same object push against each other, and those equal
-and opposite forces cancel in the arm total.
+Everything that records it goes through `wrench_vectors`, which reports the same contact query
+at **two granularities at once**: one ``(6,)`` per end-effector **link**, and one per **arm**
+that is exactly the sum of that arm's links. The links are what keep a finger squeezing against
+its opposite visible — equal and opposite forces that cancel in the arm total — while the arm
+total is the coarser two-signal version. `link_wrench_vector` / `tcp_wrench_vector` are the two
+halves on their own.
 """
 
 from collections import Counter
@@ -123,10 +126,9 @@ def compute_tcp_wrench(task_env):
     with torque about that arm's TCP. Summing is valid because every link of an arm already
     shares that reference point.
 
-    Nothing on the recording path calls this any more — every consumer (the demo HDF5, the
-    rollout dataset, the critic's `wrench.*` modality, the debug plots) keeps the wrench per
-    link, because a finger squeezing against its opposite produces equal and opposite forces
-    that cancel in this sum. Kept as the arm-level summary for analysis that wants it.
+    `wrench_vectors` computes exactly this alongside the per-link half, from the one contact
+    query, so the recording path does not call this directly — but the arm totals it produces
+    are these. Kept as the arm-level summary on its own, for a caller that wants nothing else.
     """
     return {arm: (np.sum([f for f, _ in per_link.values()] or [np.zeros(3)], axis=0),
                   np.sum([t for _, t in per_link.values()] or [np.zeros(3)], axis=0))
@@ -136,8 +138,10 @@ def compute_tcp_wrench(task_env):
 def tcp_wrench_vector(task_env):
     """`compute_tcp_wrench` flattened to one ``(6,)`` vector per arm, in WRENCH_COMPONENTS order.
 
-    Returns ``{"left": (6,), "right": (6,)}``. The recording path uses `link_wrench_vector`
-    instead; see `compute_tcp_wrench` on why.
+    Returns ``{"left": (6,), "right": (6,)}`` in N and N*m — the whole-arm total, i.e. the
+    ``wrench.left`` / ``wrench.right`` half of what `wrench_vectors` records. Kept as its own
+    entry point for a caller that wants only the arm totals; `ee_link_labels` gives the link →
+    arm grouping they are summed over.
     """
     return {
         arm: np.concatenate([force, torque])
@@ -145,15 +149,48 @@ def tcp_wrench_vector(task_env):
     }
 
 
+def wrench_vectors(task_env):
+    """Both layouts of the same reading, from one contact query: per link **and** per arm.
+
+    Returns ``{link_label: (6,), arm_tag: (6,)}`` — every end-effector link (aloha agilex:
+    ``fl_link7``, ``fl_link8``, ``fr_link7``, ``fr_link8``) plus ``left`` and ``right``, each a
+    ``[Fx, Fy, Fz, Tx, Ty, Tz]`` in the world frame with torque about that arm's TCP. An arm's
+    entry is exactly the sum of its links', so the two families are one decomposition at two
+    granularities and never disagree.
+
+    This is what `_base_task._log_step_wrench` records, which is why a rollout dataset carries
+    both column families and a critic can name either (`wrench.fl_link7` or `wrench.left`) or
+    both. The links keep a finger pushing against its opposite visible — those forces cancel in
+    the arm total — while the arm total is the coarser signal a critic trained before the split
+    was configured for. Neither costs a second `scene.get_contacts()`: the arms are summed from
+    the links this call already computed.
+
+    An arm tag can never collide with a link label: `ee_link_labels` either passes the URDF name
+    through (``fl_link7``) or prefixes it with the arm tag (``left_link7``), so nothing is named
+    plain ``left``.
+    """
+    out = {}
+    for arm, per_link in compute_link_wrench(task_env).items():
+        force = np.zeros(3)
+        torque = np.zeros(3)
+        for label, (link_force, link_torque) in per_link.items():
+            out[label] = np.concatenate([link_force, link_torque])
+            force = force + link_force
+            torque = torque + link_torque
+        out[arm] = np.concatenate([force, torque])
+    return out
+
+
 def link_wrench_vector(task_env):
     """`compute_link_wrench` flattened to one ``(6,)`` vector per link, in WRENCH_COMPONENTS order.
 
     Returns ``{link_label: (6,)}`` over both arms, left arm's links first (aloha: ``fl_link7``,
-    ``fl_link8``, ``fr_link7``, ``fr_link8``). This is the layout every recorded wrench uses —
-    the demo HDF5's ``wrench/<link>`` groups, the rollout dataset's
-    ``observation.wrench.<link>`` columns, the critic's ``wrench.<link>`` modality, and the
-    debug plots and their ``.npz`` — so a gripper's two fingers can be read apart instead of
-    only their sum.
+    ``fl_link8``, ``fr_link7``, ``fr_link8``) — the links alone, which is what the debug wrench
+    plots and their ``.npz`` draw (an arm total overlaid on its own links would just be their
+    sum drawn twice). The recording path uses `wrench_vectors` instead, which adds the two arm
+    totals to this, so the demo HDF5's ``wrench/<link>`` groups, the rollout dataset's
+    ``observation.wrench.*`` columns and the critic's ``wrench.*`` modality carry both
+    granularities and each consumer names the one it wants.
     """
     return {
         label: np.concatenate([force, torque])
@@ -163,20 +200,19 @@ def link_wrench_vector(task_env):
 
 
 def stack_step_wrench(step_wrench, num_steps):
-    """Stack the per-step samples logged since the last drain into ``{link_label: (num_steps, 6)}``.
+    """Stack the per-step samples logged since the last drain into ``{key: (num_steps, 6)}``.
 
-    ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected: one ``link_wrench_vector``
-    dict per primitive step. ``num_steps`` is however many steps a drain covers — ``pi0_step``
-    on the rollout paths (one drain per action chunk), the task config's ``save_freq`` on the
-    demo-collection path (one drain per saved frame). Padded to it with **NaN**, so the result
-    has one fixed shape whether or not that span ran to completion — an episode's first drain
-    has nothing behind it and carries a single sample of the current contact state, and a chunk
-    cut short by success or ``step_lim`` yields fewer than ``num_steps``. NaN rather than zero,
-    because zero is a meaningful reading (the arm touching nothing); consumers that cannot take
-    NaN should map it to zero explicitly.
-
-    Keyed by whatever the samples are keyed by, so it follows `link_wrench_vector`'s labels
-    without knowing them.
+    ``step_wrench`` is what ``_base_task.pop_step_wrench`` collected: one ``wrench_vectors``
+    dict per primitive step, so the result holds a trace per end-effector link *and* one per
+    arm. Keys are passed through untouched — this fixes the length, not the layout, and is
+    blind to which family a key belongs to. ``num_steps`` is however many steps a drain covers
+    — ``pi0_step`` on the rollout paths (one drain per action chunk), the task config's
+    ``save_freq`` on the demo-collection path (one drain per saved frame). Padded to it with
+    **NaN**, so the result has one fixed shape whether or not that span ran to completion — an
+    episode's first drain has nothing behind it and carries a single sample of the current
+    contact state, and a chunk cut short by success or ``step_lim`` yields fewer than
+    ``num_steps``. NaN rather than zero, because zero is a meaningful reading (the arm touching
+    nothing); consumers that cannot take NaN should map it to zero explicitly.
 
     Returns ``{}`` for an empty log, so callers can tell "no samples" from "samples that were
     all zero".
@@ -184,9 +220,9 @@ def stack_step_wrench(step_wrench, num_steps):
     if not step_wrench:
         return {}
     stacked = {}
-    for link in step_wrench[0]:
-        samples = np.asarray([sample[link] for sample in step_wrench], dtype=np.float32)[:num_steps]
+    for key in step_wrench[0]:
+        samples = np.asarray([sample[key] for sample in step_wrench], dtype=np.float32)[:num_steps]
         padded = np.full((num_steps, len(WRENCH_COMPONENTS)), np.nan, dtype=np.float32)
         padded[:len(samples)] = samples
-        stacked[link] = padded
+        stacked[key] = padded
     return stacked

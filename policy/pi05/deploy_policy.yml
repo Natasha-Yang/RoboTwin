@@ -14,7 +14,7 @@ checkpoint_id: 15000
 pi0_step: 10
 
 # Number of successful eval episodes to run.
-test_num: 100
+test_num: 300
 
 # ===== Crash recovery =====
 # Every finished episode is committed to the run directory as it completes: its row is appended
@@ -76,7 +76,7 @@ resume:
 # Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
 # denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
 best_of_n: 1
-guidance_scale: 0.1
+guidance_scale: 0.05
 guidance_ramp_updates: 500
 # The reward the run scores itself with -- what `commit()` feeds the online critic, what the
 # W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
@@ -86,6 +86,71 @@ guidance_ramp_updates: 500
 # Unlike the keys above this also applies to the unguided baseline. eval.sh's 10th positional
 # arg overrides it.
 use_step_reward: false
+# ===== Demo retrieval (action_proposals / noise_proposals) =====
+# Which demonstrations the two proposal modalities are retrieved from, and how. Whether they are
+# produced at all is the *task config's* `data_type.action_proposals` / `data_type.noise_proposals`
+# (both default false) -- this block only says where they come from, and is ignored when neither
+# flag is set or when no critic is running to consume them.
+#
+# Once per run (on the first episode): `num_demos` episodes of the task under evaluation are
+# drawn at random from `repo_id` (matched by RoboTwin *task*, not by instruction string -- one
+# task expands into hundreds of instructions), and every frame of them is encoded into a bank.
+# That bank is then FIXED for the whole run -- it is a critic input, so re-drawing it partway
+# through would move what the critic is conditioned on. Per control step:
+# the `top_k` bank frames most cosine-similar to the current observation (mean over `views` of
+# the pooled SigLIP embeddings) contribute their demo action chunk as `action_proposals`, and --
+# when that flag is on -- the noise that would make *this* observation's sampler produce that
+# chunk as `noise_proposals` (Pi0.invert_actions).
+#
+# Cost: `noise_proposals` runs the flow inversion, num_steps x num_inner_steps action-expert
+# passes at batch top_k per control step, which is the most expensive thing in the step.
+# `action_proposals` alone costs only the retrieval (one extra image tower + prefix pass).
+demo_retrieval:
+  # The LeRobot dataset the demonstrations come from -- normally the one the policy was
+  # fine-tuned on, so a retrieved chunk is something the policy could plausibly produce.
+  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  # Where that dataset lives; null = $HF_LEROBOT_HOME/<repo_id>.
+  root: null
+  # Demonstrations drawn for the run (once, not per episode), and neighbours retrieved per
+  # control step. `top_k` is a *candidate pool* for a critic whose proposal encoder is
+  # `attn_proposals` (the default): the distance picks which rows are on offer -- inverting a
+  # chunk costs an action-expert pass, which is why the pool is not the whole bank -- and the
+  # critic cross-attends them to decide what the value actually rests on. A critic that pools
+  # the set instead gets exactly these `top_k` and no say in it.
+  num_demos: 1
+  top_k: 3
+  # Camera views the similarity is averaged over; null = all three the policy sees.
+  views: null
+  # What the similarity ranks by. Each entry contributes one independent cosine and they are
+  # averaged with EQUAL weight, so adding one dilutes the others: `siglip` expands to one term
+  # per camera view (three by default) and `state` adds a fourth on the robot's pose in the
+  # model's normalized space. null = both; `[siglip]` is vision only. `siglip` is required.
+  # (Contact wrench would be the natural third signal but no demo dataset carries it -- the
+  # RoboTwin collection pipeline computes it live and never persists it.)
+  signals: null
+  # The bank is a jit argument, so it is padded to a fixed size (padding can never be
+  # retrieved). Raise it if `num_demos` x episode length overflows and frames get subsampled.
+  # This is also the run's biggest memory item: every row keeps its SigLIP patch map per view
+  # so a cross-attending critic can encode a demo frame the way it encodes a live one, which is
+  # ~0.6 MB per view per row at fp16 -- 1.8 GB here, at 1000 rows over three cameras. Lower it
+  # (or `views`) if that is too much; `frame_stride` shrinks it for free when the demos are
+  # longer than the bank anyway.
+  bank_size: 1000
+  # Keep every Nth demo frame. >1 shrinks the bank and the per-episode encoding cost.
+  frame_stride: 1
+  # Inversion settings for `noise_proposals`. `num_steps` MUST match the sampler's denoising
+  # step count, or the noise inverts a different map than the one it will be fed to.
+  num_steps: 10
+  num_inner_steps: 1
+  # Demo frames encoded per image-tower call while building a bank.
+  encode_batch_size: 16
+  # How many matches the debug visualization draws per control step, independent of `top_k`
+  # (the similarity over the whole bank comes back anyway, so deeper ranks are free). Only used
+  # when the task config sets `debug: true`; see debug_vis/episode<N>/retrieval_*.
+  debug_top_k: 3
+  # Which demonstrations get drawn; null = the run's `seed`.
+  seed: null
+
 # Warm-start the critic from an offline-trained checkpoint (null = train from scratch online).
 critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/2026-08-10 16:39:50/online_value_critic.pkl"
 # Everything below only takes effect when a critic is running, i.e. guidance_scale != 0 or
