@@ -659,20 +659,45 @@ fingers + any `fix_gripper_name` links), summed from `scene.get_contacts()` impu
 by the sim timestep, with torque taken about the TCP origin. Both vectors are resolved in the
 **world** frame (N and N·m) — only the moment arm is TCP-relative, so a trace stays comparable
 across steps as the gripper rotates. It is contact-only: an arm moving through free space reads exactly
-zero — this is not a joint-torque estimate. One sample is taken per policy call (so
-`pi0_step` sim frames apart), paired with that call's head-camera frame.
+zero — this is not a joint-torque estimate. The debug recorder is the one consumer that still
+takes **one sample per policy call**, paired with that call's head-camera frame; everything that
+*records* the wrench samples every physics step (below).
 
 It is recorded at **two granularities at once**, from the one contact query
 (`wrench_vectors`): one `(6,)` per gripper **link**, and one per **arm** that is exactly the sum
 of that arm's links. The links are what keep a finger squeezing against its opposite — equal and
 opposite forces that cancel in the arm total — visible; the arm totals are the coarser
-two-signal version. `_base_task._log_step_wrench` logs both once per primitive step and
+two-signal version. `_base_task._log_step_wrench` logs both after **every `scene.step()`** and
 everything downstream just names the keys it wants, so the demo HDF5's `wrench/<key>` groups
 (§3.4), the rollout dataset (§7a) and a critic (§5a) all carry or can name either family. The
 link labels are the embodiment's URDF link names, so **which** `wrench.<link>` keys exist
 follows the robot: aloha agilex gives four (`fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`),
 plus `left` and `right`. `ee_link_labels` is the link → arm grouping; `compute_tcp_wrench` /
 `tcp_wrench_vector` are the arm half on their own, `link_wrench_vector` the link half.
+
+**The rate is one sample per physics step** — 1/250 s of simulated time — in all three control
+loops that run a recorded trajectory, so a demo HDF5, a rollout dataset and the critic's live
+view hold the same kind of trace. In the expert loops (`take_dense_action`,
+`together_move_to_pose`) one loop iteration *is* one `scene.step()`, so a saved frame carries
+exactly `save_freq` samples. A single `take_action` instead runs a whole TOPP-interpolated
+trajectory: measured on this machine at **34–196** physics steps depending on the size of the
+joint delta (median 94 for a 0.02 rad chunk step, 45 at 0.005, 146 at 0.05), so a `pi0_step: 10`
+chunk drains ~950 samples rather than 10.
+
+That variable-length burst is stacked to a **fixed** `wrench_trace_len` (`deploy_policy.yml` /
+`collect_dataset.yml`, default **1024**), NaN-padded when short. It has to be fixed — the
+critic's obs shape and the dataset's `Array2D` column width are both settled before the first
+sample arrives — and it is an architecture key in all but name: a critic warm-started from
+`critic_ckpt`, and any rollout dataset it was pretrained on, must have been made with the same
+value. `_base_task` holds the log in a `maxlen` deque of that size, so an overlong drain has
+already dropped its **oldest** samples (the ones furthest from the observation the trace is
+paired with), and a run that never drains — a baseline eval has no critic, and
+`critic_obs_modalities` returns before draining — cannot grow it without bound.
+
+Cost is one contact query per physics step: `wrench_vectors` measured at **223 µs** here at 35
+contacts, so ~21 ms per control step, about a quarter again on top of the ~81 ms
+`sample_actions` itself takes. (Almost all of that is the Python loop over contact points —
+`scene.get_contacts()` alone is 6 µs.) Turn `data_type.wrench` off if that is not worth it.
 
 The debug plots draw the **link** half only — an arm total overlaid on its own links is just
 their sum drawn twice. `analysis/plot_wrench_hist.py` plots the same histograms straight off a
@@ -873,8 +898,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
-| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-step contact wrench per end-effector link, logged by the env | `(pi0_step, 6)` each |
-| `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(pi0_step, 6)` each |
+| `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-physics-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
+| `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
 | `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
 
@@ -1394,8 +1419,8 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
-| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per executed step | `(pi0_step, 6)` each |
-| `observation.wrench.<arm>` | the same, summed over that arm's links | `(pi0_step, 6)` each |
+| `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per physics step | `(wrench_trace_len, 6)` each |
+| `observation.wrench.<arm>` | the same, summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
 Each raw column and its `.model` counterpart have the same width and hold the same quantity in
@@ -1465,12 +1490,14 @@ their sum) — computed by the shared `envs/utils/wrench.py::wrench_vectors`, so
 demo-collection and rollout-collection paths cannot drift apart. There is one column per
 end-effector link (aloha agilex: `observation.wrench.{fl_link7,fl_link8,fr_link7,fr_link8}`)
 **and** one per arm (`observation.wrench.{left,right}`, each the sum of that arm's links), so a
-critic can be trained offline on whichever granularity it observes online; at 480 B/row apiece
-the six together are under 3 KB/row, cheaper than choosing. The rate differs from the debug
-plots': `eval_policy.py` samples once per policy call for those, while the dataset (and the
-critic's own view) samples after **every** primitive step, so a row carries a whole
-`(pi0_step, 6)` trace rather than a single vector. Datasets collected before 2026-08-28 have
-only the two arm columns.
+critic can be trained offline on whichever granularity it observes online. The rate differs from
+the debug plots': `eval_policy.py` samples once per policy call for those, while the dataset (and
+the critic's own view) samples after **every physics step**, so a row carries a whole
+`(wrench_trace_len, 6)` trace rather than a single vector — ~950 real samples at `pi0_step: 10`,
+NaN-padded out to 1024. That is 24 KB/row per column at the default, so the six together are
+~147 KB/row: no longer the free columns they were at one sample per control step, but still a
+fraction of the 576 KB a single SigLIP view costs. Datasets collected before 2026-08-28 have
+only the two arm columns, at one sample per control step.
 
 Which trace matters: it is the one the **previous** chunk produced — the steps between the
 previous row's observation and this one. The env logs a sample after each `take_action`
@@ -1503,9 +1530,9 @@ episode runs. Train on it with `reward_col: reward` in `multisensory_steering`'s
 view of the same modality and blind to which family a key belongs to. A trace can be short — an episode's first row has no previous chunk
 and carries a single sample of the contact state at that instant, and a chunk cut off by success
 or `step_lim` contributes only the steps it ran — so the tail is padded with **NaN**, not zeros,
-since zero is a meaningful reading (the arm touching nothing). At 480 B/row apiece they are
-still the cheapest columns here — six of them for aloha come to under 3 KB/row, against the
-576 KB a single SigLIP view costs.
+since zero is a meaningful reading (the arm touching nothing). `wrench_trace_len` is what fixes
+the width; the same value must be set on the eval side for a critic pretrained on these columns
+to load against them.
 
 `wrench` is a `data_type` like the others, but it is the one the env cannot pick up from the
 flag itself: contacts are a scene query, not part of `get_obs`. So each driver reads

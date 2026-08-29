@@ -17,12 +17,31 @@ model_name: null
 checkpoint_id: 15000
 pi0_step: 10
 
+# ===== Contact-wrench trace length =====
+# Rows of every `wrench.*` modality / `observation.wrench.*` column. With `data_type.wrench: true`
+# the env samples the end-effector contact wrench after **every physics step**, the same rate the
+# expert-demo HDF5 records at -- and one control step runs a whole TOPP-interpolated trajectory,
+# measured at 34-196 physics steps here (median 94 for a 0.02 rad joint delta), so a `pi0_step: 10`
+# chunk drains roughly 950 samples. This is what that variable-length burst is stacked to: shorter
+# drains are NaN-padded, longer ones keep their most recent samples.
+#
+# It is an architecture key in all but name. The critic's obs shape is fixed when it is built, so
+# a checkpoint warm-started from `critic_ckpt`, and any rollout dataset it was pretrained on, has
+# to have been made with this same value. It also caps the env's in-memory log, so raising it
+# costs host RAM in the replay buffer (~24 KB per configured wrench modality per transition at
+# 1024, stored twice) and nothing else.
+wrench_trace_len: 1024
+
 # Dataset collection parameters
 num_episodes: 100          # number of successful expert-checked rollouts to collect
 expert_check: true        # only roll out on seeds where the expert can solve the task
 output_dir: ./rollout_datasets   # where the HuggingFace dataset is saved (save_to_disk)
 hub_repo_id: NatashaYang/robotwin_clean_ep25_lift_pot_rollouts_dataset
 push_to_hub: true        # push the built dataset to the HuggingFace Hub
+# Create the hub repo private (the default when this key is absent). Only applies to repos this
+# push *creates* -- an existing repo keeps the visibility it already has, so flipping this does
+# not retroactively hide (or expose) a dataset that has been pushed before.
+hub_private: true
 
 # Episodes are flushed one shard at a time to `<output_dir>/.../<ckpt>_shards`, so RAM holds a
 # single episode and an interrupted run keeps what it already collected. With resume: true a
@@ -36,6 +55,13 @@ resume: true
 # with the model's zero padding stripped). Critics meant to steer inside `Pi0.sample_actions`
 # must be trained on these, not on the raw `observation.state` / `action` columns -- point the
 # offline trainer's state_col / action_col at them.
+#
+# `action.noise` rides along with them: the flow-matching latent the action expert denoised each
+# chunk from, (action_horizon, action_dim) at the model's *padded* width (50, 32). That is the
+# action of a noise-space agent's MDP (critic_type: dsrl), so it is what an offline Q(s, w)
+# trains on -- `action_col: action.noise`. It has no switch of its own: at 6.4 KB/row it is a
+# rounding error next to the SigLIP maps, and being a draw rather than a function of the
+# observation it is the one column no later pass over the dataset could add.
 collect_critic_obs: true
 
 # Within that, also record the SigLIP patch features the sampler's own image tower produces --

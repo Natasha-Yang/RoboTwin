@@ -732,6 +732,11 @@ def main(usr_args):
     args["save_critic"] = usr_args.get("save_critic", False)
     # Off leaves the sparse terminal reward, which is what the critic is then trained on.
     args["use_step_reward"] = usr_args["use_step_reward"]
+    # Fixed length of the `wrench.*` trace a control step sees, and the cap on the env's log
+    # (`_base_task._init_task_env_`). It is an architecture key in all but name: the critic's
+    # obs shape is fixed when it is built, so a checkpoint warm-started here -- or pretrained
+    # on a rollout dataset -- has to have been made with the same value.
+    args["wrench_trace_len"] = int(usr_args.get("wrench_trace_len", 1024))
 
     # Demo-retrieval proposals are `data_type`s like the rest (see the task config), but the
     # policy produces them rather than the sim, so they cannot reach the model on the

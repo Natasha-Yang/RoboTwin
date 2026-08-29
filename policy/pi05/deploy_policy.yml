@@ -13,6 +13,21 @@ model_name: null
 checkpoint_id: 15000
 pi0_step: 10
 
+# ===== Contact-wrench trace length =====
+# Rows of every `wrench.*` modality / `observation.wrench.*` column. With `data_type.wrench: true`
+# the env samples the end-effector contact wrench after **every physics step**, the same rate the
+# expert-demo HDF5 records at -- and one control step runs a whole TOPP-interpolated trajectory,
+# measured at 34-196 physics steps here (median 94 for a 0.02 rad joint delta), so a `pi0_step: 10`
+# chunk drains roughly 950 samples. This is what that variable-length burst is stacked to: shorter
+# drains are NaN-padded, longer ones keep their most recent samples.
+#
+# It is an architecture key in all but name. The critic's obs shape is fixed when it is built, so
+# a checkpoint warm-started from `critic_ckpt`, and any rollout dataset it was pretrained on, has
+# to have been made with this same value. It also caps the env's in-memory log, so raising it
+# costs host RAM in the replay buffer (~24 KB per configured wrench modality per transition at
+# 1024, stored twice) and nothing else.
+wrench_trace_len: 1024
+
 # Number of successful eval episodes to run.
 test_num: 300
 

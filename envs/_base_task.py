@@ -10,7 +10,7 @@ import toppra as ta
 import json
 import gc
 import transforms3d as t3d
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import torch, random
 
 from .utils import *
@@ -98,12 +98,20 @@ class Base_Task(gym.Env):
 
         self.now_obs = {}
         self.take_action_cnt = 0
-        # Per-primitive-step end-effector contact wrench (see `_log_step_wrench`). Off by
-        # default: it queries every contact in the scene once per `take_action`. The drivers
-        # set it from the task config's `data_type.wrench`, which cannot reach it the way the
-        # other data types do -- contacts are a scene query, not part of `get_obs`.
+        # Per-sim-step end-effector contact wrench (see `_log_step_wrench`). Off by default:
+        # it queries every contact in the scene after every `scene.step()`. The drivers set it
+        # from the task config's `data_type.wrench`, which cannot reach it the way the other
+        # data types do -- contacts are a scene query, not part of `get_obs`.
         self.record_step_wrench = kwags.get("record_step_wrench", False)
-        self.step_wrench = []
+        # How many samples one drain keeps, i.e. the fixed trace length every consumer stacks
+        # to (`envs/utils/wrench.py::stack_step_wrench`). The log is a bounded deque rather than
+        # a list so that it can never grow past that even when nothing drains it -- a baseline
+        # eval has no critic, and `critic_obs_modalities` returns early without draining, so an
+        # unbounded list would accumulate every sim step of an entire episode. Overflow drops
+        # the OLDEST samples, keeping the ones nearest in time to the observation the trace is
+        # about to be paired with.
+        self.wrench_trace_len = int(kwags.get("wrench_trace_len", 1024))
+        self.step_wrench = deque(maxlen=self.wrench_trace_len)
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
         self.save_freq = kwags.get("save_freq")
@@ -1540,7 +1548,7 @@ class Base_Task(gym.Env):
     def _log_step_wrench(self):
         """Record the end-effector contact wrench left by the physics step that just finished.
 
-        One `{key: (6,)}` sample per primitive control step, in the world frame
+        One `{key: (6,)}` sample per **physics step**, in the world frame
         (`envs/utils/wrench.py::wrench_vectors`). Both granularities are logged from the one
         contact query: a key per **end-effector link** (aloha: `fl_link7`, `fl_link8`,
         `fr_link7`, `fr_link8`), so a finger pushing against its opposite — equal and opposite
@@ -1549,10 +1557,21 @@ class Base_Task(gym.Env):
         Everything downstream names the keys it wants, so a rollout dataset carries both column
         families and a critic can condition on either or both.
 
-        Called from every control loop that steps the scene on a recorded trajectory:
-        `take_action` (policy rollouts) and, when a demo is being written, `take_dense_action`
-        and `together_move_to_pose` (the scripted expert). Enabled by `record_step_wrench`; a
-        step that returns without stepping the scene logs nothing.
+        Called after every `scene.step()` of every control loop that runs a recorded
+        trajectory: `take_action` (policy rollouts) and, when a demo is being written,
+        `take_dense_action` and `together_move_to_pose` (the scripted expert). The three
+        therefore sample at the same rate -- one reading per 1/250 s of simulated time -- which
+        is what lets a demo HDF5, a rollout dataset and the critic's live view hold the same
+        kind of trace. In the expert loops one loop iteration *is* one `scene.step()`; a single
+        `take_action` runs a whole TOPP-interpolated trajectory, measured at 34-196 steps here
+        depending on the size of the joint delta (median 94 for a 0.02 rad chunk step), so a
+        control step contributes a burst of samples rather than one.
+
+        Enabled by `record_step_wrench`; a step that returns without stepping the scene logs
+        nothing. Costs one `wrench_vectors` contact query per physics step -- 223 us measured
+        on this machine at 35 contacts, so ~21 ms per control step, about a quarter again on
+        top of the ~81 ms `sample_actions` itself takes. Turn `data_type.wrench` off if that is
+        not worth it.
         """
         if not self.record_step_wrench:
             return
@@ -1564,13 +1583,19 @@ class Base_Task(gym.Env):
         Drained once per policy inference, *before* the chunk runs — by
         `script/collect_dataset.py` and by `policy/pi05/deploy_policy.py::critic_obs_modalities`
         alike — so what comes back is the trace of the chunk *before* this one: the wrench at
-        every primitive step executed since the last observation (at most `pi0_step` of them,
-        fewer when that chunk ended early). That is the only wrench that exists before the
-        current chunk has run, which is what lets it be an observation rather than an outcome.
+        every **physics** step executed since the last observation. That is the only wrench that
+        exists before the current chunk has run, which is what lets it be an observation rather
+        than an outcome.
+
+        A chunk of `pi0_step` control steps contributes `pi0_step` bursts of ~34-196 samples
+        each, so a drain runs to the high hundreds or low thousands rather than to `pi0_step`.
+        `wrench_trace_len` is what bounds it: the log is a `maxlen` deque, so an overlong drain
+        has already dropped its oldest samples by the time it gets here, and `stack_step_wrench`
+        only has to pad a short one.
 
         Demo collection drains it in the same place for the same reason: `_take_picture` pops
         it while building the frame, so a saved frame carries the trace of the `save_freq`
-        steps that led up to it.
+        physics steps that led up to it (one per loop iteration there, so exactly `save_freq`).
 
         With recording on, an empty log yields one sample taken now rather than nothing at all:
         no steps have run since the last pop at the start of an episode, and a consumer that
@@ -1579,7 +1604,8 @@ class Base_Task(gym.Env):
         """
         if self.record_step_wrench and not self.step_wrench:
             return [wrench_vectors(self)]
-        samples, self.step_wrench = self.step_wrench, []
+        samples = list(self.step_wrench)
+        self.step_wrench = deque(maxlen=self.wrench_trace_len)
         return samples
 
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
@@ -1758,17 +1784,16 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
+            self._log_step_wrench()
             self._update_render()
-                
+
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
-                self._log_step_wrench()
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
-        self._log_step_wrench()
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()
