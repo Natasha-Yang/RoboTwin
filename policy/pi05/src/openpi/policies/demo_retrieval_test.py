@@ -29,6 +29,11 @@ _PROPOSE_STATIC = ("top_k", "views", "invert", "num_steps", "num_inner_steps", "
 # a v2.x lerobot install refuses to open the v3.0 one at all.
 V21_REPO = "NatashaYang/robotwin_demo_clean_50_lerobot"
 V30_REPO = "NatashaYang/robotwin_lerobot_dataset"
+# A multimodal demo dataset: the same demonstrations with the sim's other recorded modalities
+# kept, of which the contact wrench is the one a critic can also observe online. Its
+# `observation.wrench.*` columns hold one averaged row per frame
+# (`script/demo_wrench_per_control_step.py`), which is what the traces are windowed out of.
+MULTIMODAL_REPO = "NatashaYang/robotwin_demo_clean_multimodal_50x10_lerobot"
 
 
 def _have(repo_id: str) -> bool:
@@ -36,6 +41,9 @@ def _have(repo_id: str) -> bool:
 
 
 requires_v21 = pytest.mark.skipif(not _have(V21_REPO), reason=f"{V21_REPO} not downloaded")
+requires_multimodal = pytest.mark.skipif(
+    not _have(MULTIMODAL_REPO), reason=f"{MULTIMODAL_REPO} not downloaded"
+)
 
 
 def _tiny_aloha_model(action_horizon: int = 8):
@@ -658,7 +666,143 @@ def test_cotrain_rows_can_be_narrowed_to_the_modalities_a_critic_reads():
 
 @requires_v21
 def test_cotrain_rows_reject_a_modality_no_demonstration_carries():
+    """An rgb-only demo dataset has no wrench, so asking for one is an error, not a zero column."""
     config, model = _tiny_aloha_model()
     retriever = _retriever(config, model)
+    assert retriever.reader.wrench_columns == ()
+    assert retriever.cotrain_modalities == retriever.COTRAIN_MODALITIES
     with pytest.raises(KeyError, match="wrench.left"):
         retriever.cotrain_rows([0], horizon=50, modalities=("state", "wrench.left"))
+
+
+# ---------------------------------------------------------------------------------------------
+# The contact wrench: stored one row per frame, observed as the previous chunk's trace
+# ---------------------------------------------------------------------------------------------
+
+
+def test_wrench_traces_are_the_rows_the_previous_chunk_left():
+    """The window ends *at* the frame, is NaN-padded when short, and starts as one sample.
+
+    A demo frame is one primitive step and its row is the contact wrench over the physics steps
+    leading up to it, so the trace a control step at frame `t` observes is rows
+    `t - trace_len + 1 ... t` -- exactly the span `pop_step_wrench` drains online, and the same
+    NaN-tail padding `stack_step_wrench` produces for a span that did not run to length.
+    """
+    values = np.arange(6 * 6, dtype=np.float32).reshape(6, 6)
+
+    traces = demo_retrieval.wrench_traces({"left": values}, [0, 1, 4], trace_len=3)["wrench.left"]
+
+    assert traces.shape == (3, 3, 6)
+    # Frame 0: nothing behind it, one sample of the contact state at that instant.
+    np.testing.assert_array_equal(traces[0, 0], values[0])
+    assert np.isnan(traces[0, 1:]).all()
+    # Frame 1: two rows, chronological, tail padded.
+    np.testing.assert_array_equal(traces[1, :2], values[0:2])
+    assert np.isnan(traces[1, 2]).all()
+    # Frame 4: the full window, ending at the frame itself.
+    np.testing.assert_array_equal(traces[2], values[2:5])
+
+
+def test_legacy_physics_step_traces_are_averaged_on_the_way_in():
+    """A dataset written before the per-frame collapse reaches the critic as the same thing.
+
+    The stored trace is NaN-padded, so the average has to skip the padding rather than count it
+    as zero -- zero is a reading (the arm touching nothing), which is the whole reason the
+    padding is NaN.
+    """
+    import pyarrow as pa
+
+    frame0 = [[1.0] * 6, [3.0] * 6, [float("nan")] * 6]  # two samples, one pad
+    frame1 = [[2.0] * 6, [4.0] * 6, [6.0] * 6]
+    column = pa.array([frame0, frame1], type=pa.list_(pa.list_(pa.float32())))
+
+    rows = demo_retrieval._per_frame_wrench(column, np.array([0, 1]), "observation.wrench.left")
+
+    assert rows.shape == (2, 6)
+    np.testing.assert_allclose(rows[0], np.full(6, 2.0))  # (1 + 3) / 2, not (1 + 3 + 0) / 3
+    np.testing.assert_allclose(rows[1], np.full(6, 4.0))
+
+
+@requires_multimodal
+def test_reader_reads_one_wrench_row_per_frame():
+    reader = demo_retrieval.LeRobotEpisodeReader(MULTIMODAL_REPO)
+    assert reader.wrench_columns, f"{MULTIMODAL_REPO} should carry observation.wrench.*"
+    # Whichever granularities the collection run recorded: one column per end-effector link,
+    # and -- for a dataset collected since the split -- one per arm as well.
+    assert {"fl_link7", "fl_link8", "fr_link7", "fr_link8"} <= set(reader.wrench_keys)
+
+    length = reader.episode_length(2)
+    episode = reader.read_episode(2, frames=[0, 1])
+
+    assert set(episode["wrench"]) == set(reader.wrench_keys)
+    for key, values in episode["wrench"].items():
+        # Whole, like the states: a kept frame's trace is made of the rows *before* it.
+        assert values.shape == (length, 6), key
+        assert values.dtype == np.float32
+    # An arm is the sum of its links, and averaging each of them per frame is linear, so that
+    # still holds after the collapse. Only checkable on a dataset that has the arm columns.
+    if "left" in episode["wrench"]:
+        np.testing.assert_allclose(
+            episode["wrench"]["left"],
+            sum(episode["wrench"][k] for k in reader.wrench_keys if k.startswith("fl_")),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+
+@requires_multimodal
+def test_cotrain_rows_carry_the_reconstructed_wrench():
+    """A demo row's `wrench.*` is the (horizon, 6) trace, windowed out of the dataset's rows."""
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model, repo_id=MULTIMODAL_REPO)
+    key = retriever.reader.wrench_keys[0]
+    modality = f"wrench.{key}"
+    assert modality in retriever.cotrain_modalities
+    episodes = retriever.episodes_for_task("beat_block_hammer")[:1]
+    horizon = 20
+
+    rows = retriever.cotrain_rows(
+        episodes, horizon=horizon, modalities=("state", modality), state_dim=14
+    )
+
+    n = len(rows["frame_index"])
+    traces = rows["obs"][modality]
+    assert traces.shape == (n, horizon, 6)
+    assert traces.dtype == np.float32
+    # Row 1 is frame `horizon`, so its trace is the whole window ending there.
+    per_frame = retriever.reader.read_episode(episodes[0], frames=[0])["wrench"][key]
+    np.testing.assert_allclose(traces[1], per_frame[1 : horizon + 1], rtol=1e-6, atol=1e-6)
+    # The first row of an episode has nothing behind it: one sample, then NaN.
+    np.testing.assert_allclose(traces[0, 0], per_frame[0], rtol=1e-6, atol=1e-6)
+    assert np.isnan(traces[0, 1:]).all()
+
+
+@requires_multimodal
+def test_bank_rows_serve_their_wrench_as_a_cross_attention_key():
+    """A retrieved row's own contact trace is a key, at the run's `wrench_trace_len`."""
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model, repo_id=MULTIMODAL_REPO, wrench_trace_len=4)
+    modality = f"wrench.{retriever.reader.wrench_keys[0]}"
+    bank = retriever.select_bank("beat_block_hammer")
+
+    assert set(bank.wrench) == {f"wrench.{key}" for key in retriever.reader.wrench_keys}
+    assert bank.wrench[modality].shape == (bank.num_frames, 4, 6)
+
+    keys = retriever.critic_keys([0, 2], ("state", modality), state_dim=14)
+    assert keys[modality].shape == (2, 4, 6)
+    np.testing.assert_array_equal(keys[modality], bank.wrench[modality][[0, 2]])
+
+    with pytest.raises(KeyError, match="depth.head"):
+        retriever.critic_keys([0], ("depth.head",))
+
+
+@requires_multimodal
+def test_a_bank_built_without_a_trace_length_offers_no_wrench():
+    """`wrench_trace_len` is the critic's own architecture key, so nothing invents one."""
+    config, model = _tiny_aloha_model()
+    retriever = _retriever(config, model, repo_id=MULTIMODAL_REPO)
+    bank = retriever.select_bank("beat_block_hammer")
+
+    assert bank.wrench == {}
+    with pytest.raises(KeyError, match="wrench_trace_len"):
+        retriever.critic_keys([0], (f"wrench.{retriever.reader.wrench_keys[0]}",))

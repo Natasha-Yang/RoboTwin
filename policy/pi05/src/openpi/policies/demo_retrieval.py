@@ -75,6 +75,7 @@ import logging
 import os
 import pathlib
 import random
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -95,10 +96,25 @@ DEMO_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 # The signals retrieval compares on. `siglip` expands to one term per camera view, `state` is one
 # term; each is an independent relative L2 distance and they are averaged with equal weight, so
-# adding one dilutes the others. (Contact wrench would be the natural third, but no demo dataset carries it:
-# `collect_data.py` computes it live and never writes it to the HDF5, and neither
-# `process_data.py` nor the LeRobot converter carries it downstream.)
+# adding one dilutes the others. (A multimodal demo dataset now carries a contact wrench too --
+# see WRENCH_COLUMN_PREFIX -- but it is not a similarity signal: a trace is NaN-padded where the
+# episode has nothing behind it, and an L2 over NaN is NaN. It reaches the critic as a modality,
+# not as part of the metric.)
 SIMILARITY_SIGNALS = ("siglip", "state")
+
+# The contact-wrench columns of a demo dataset, and the modality names they become. One column
+# per end-effector link (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) plus one per arm
+# (`left`, `right`), each holding **one `(6,)` row per frame** -- the world-frame contact wrench
+# averaged over that frame's physics steps. A demo frame is one primitive step, so that row is
+# the same quantity a rollout dataset stores per primitive step and the env logs online, and the
+# `(wrench_trace_len, 6)` trace a critic observes is the window of them the previous chunk
+# covered (`wrench_traces`). Datasets written before `script/demo_wrench_per_control_step.py`
+# store the physics-step trace inside each frame instead, `(save_freq, 6)`; the reader averages
+# those on the way in so both layouts reach the critic as the same thing.
+WRENCH_COLUMN_PREFIX = "observation.wrench."
+WRENCH_MODALITY_PREFIX = "wrench."
+# Components per row, as `envs/utils/wrench.py::WRENCH_COMPONENTS` orders them.
+WRENCH_COMPONENTS = 6
 
 # Width the head-camera frame of every bank row is kept at when retrieval is being visualized
 # (`record_retrieval`). Deliberately smaller than the rollout's own `DEBUG_GIF_FRAME_WIDTH`:
@@ -170,8 +186,9 @@ class LeRobotEpisodeReader:
         v3.0  parquets shared by episodes  + `meta/episodes/**.parquet`
 
     Only what retrieval needs is read -- the instruction per episode, and one episode's states,
-    actions and camera frames at a time. Images are stored as encoded bytes in both layouts (the
-    RoboTwin converter writes `image`, not `video`, features) and are decoded on demand.
+    actions, camera frames and (where the dataset has them) contact-wrench rows at a time.
+    Images are stored as encoded bytes in both layouts (the RoboTwin converter writes `image`,
+    not `video`, features) and are decoded on demand.
     """
 
     def __init__(self, repo_id: str, root: str | os.PathLike | None = None):
@@ -196,6 +213,21 @@ class LeRobotEpisodeReader:
 
     def episode_length(self, episode_index: int) -> int:
         return int(self._episodes[episode_index]["length"])
+
+    @functools.cached_property
+    def wrench_columns(self) -> tuple[str, ...]:
+        """The dataset's `observation.wrench.*` columns, or `()` for one collected without them.
+
+        Read off `meta/info.json` rather than a parquet, so a caller can ask what a dataset
+        carries before opening an episode. Which keys exist follows the embodiment's URDF link
+        names plus the two arm totals, exactly as the demo HDF5 and a rollout dataset name them.
+        """
+        return tuple(sorted(n for n in self.info.get("features", {}) if n.startswith(WRENCH_COLUMN_PREFIX)))
+
+    @property
+    def wrench_keys(self) -> tuple[str, ...]:
+        """`wrench_columns` with the `observation.wrench.` prefix stripped: `fl_link7`, `left`, ..."""
+        return tuple(name[len(WRENCH_COLUMN_PREFIX) :] for name in self.wrench_columns)
 
     def _read_episode_meta(self) -> list[dict]:
         rows: dict[int, dict] = {}
@@ -225,24 +257,36 @@ class LeRobotEpisodeReader:
         return [rows[i] for i in range(len(rows))]
 
     def read_episode(self, episode_index: int, frames=None) -> dict:
-        """One episode's `{state, action, images, frames}`, states/actions as `(T, 14)` float32.
+        """One episode's `{state, action, images, wrench, frames}`, states/actions `(T, 14)` f32.
 
         `images` maps each camera to a `(len(frames), H, W, 3)` uint8 array in the layout the
         policy's input transform expects -- channel-first, as `AlohaInputs` reads it -- decoded
         here so the caller never sees the storage format.
 
+        `wrench` is `{key: (T, 6)}` for a dataset that has the columns and `{}` for one that
+        does not -- one row per frame, the contact wrench averaged over that frame. It is
+        returned whole for the same reason the states are: the trace a control step observes is
+        the *previous* chunk's, so a kept frame needs the rows before it (`wrench_traces`).
+
         `frames` selects which frames are *decoded*, as indices into the episode's own time
-        order; `None` is all of them. The states and actions are always returned whole, because
-        a frame's action chunk reaches `action_horizon` steps past it and would otherwise be cut
-        off -- they are two float32 columns, while decoding a frame is three JPEGs. So a caller
-        that only wants every horizon-th frame (`DemoRetriever.cotrain_rows`) pays for the
-        frames it keeps rather than for the episode. `frames` is returned alongside, since the
-        image arrays are indexed by *position in it*, not by frame index.
+        order; `None` is all of them. The states, actions and wrench are always returned whole,
+        because a frame's action chunk reaches `action_horizon` steps past it and would
+        otherwise be cut off -- they are float32 columns, while decoding a frame is three JPEGs.
+        So a caller that only wants every horizon-th frame (`DemoRetriever.cotrain_rows`) pays
+        for the frames it keeps rather than for the episode. `frames` is returned alongside,
+        since the image arrays are indexed by *position in it*, not by frame index.
         """
         import pyarrow.parquet as pq
 
         meta = self._episodes[episode_index]
-        columns = ["observation.state", "action", "frame_index", "episode_index", *_image_columns()]
+        columns = [
+            "observation.state",
+            "action",
+            "frame_index",
+            "episode_index",
+            *_image_columns(),
+            *self.wrench_columns,
+        ]
         if meta["locator"] is not None:  # v3.0: many episodes share one file
             chunk, file = meta["locator"]
             path = self.root / self.info["data_path"].format(chunk_index=chunk, file_index=file)
@@ -266,7 +310,17 @@ class LeRobotEpisodeReader:
             # AlohaInputs takes [channel, height, width] and transposes it back itself; the eval
             # path hands it images the same way round (see deploy_policy.encode_obs).
             images[camera] = np.transpose(decoded, (0, 3, 1, 2))
-        return {"state": state, "action": action, "images": images, "frames": keep}
+        wrench = {
+            column[len(WRENCH_COLUMN_PREFIX) :]: _per_frame_wrench(table[column], order, column)
+            for column in self.wrench_columns
+        }
+        return {
+            "state": state,
+            "action": action,
+            "images": images,
+            "wrench": wrench,
+            "frames": keep,
+        }
 
 
 _V3_LOCATOR = ("data/chunk_index", "data/file_index")
@@ -294,6 +348,60 @@ def _thumbnail(frame_chw: np.ndarray) -> np.ndarray:
         height = max(1, round(img.height * DEMO_THUMBNAIL_WIDTH / img.width))
         img = img.resize((DEMO_THUMBNAIL_WIDTH, height), Image.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
+
+
+def _per_frame_wrench(column, order, name: str) -> np.ndarray:
+    """One `(T, 6)` row per frame from a wrench column, whichever way it is stored.
+
+    A dataset written to the current convention already holds one averaged row per frame. One
+    written before `script/demo_wrench_per_control_step.py` holds that frame's own physics-step
+    trace, `(save_freq, 6)`, NaN-padded where the frame had fewer samples behind it -- averaged
+    here, nan-aware, so the two layouts are indistinguishable downstream. Zero is a meaningful
+    reading (touching nothing), which is why the padding is NaN and why the mean has to skip it
+    rather than count it.
+    """
+    values = np.asarray(column.to_pylist(), dtype=np.float32)[order]
+    if values.ndim == 3:  # legacy (frames, physics steps, 6)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN frame -> NaN, as it should
+            values = np.nanmean(values, axis=1)
+    if values.ndim != 2 or values.shape[-1] != WRENCH_COMPONENTS:
+        raise ValueError(
+            f"column {name!r} is {values.shape[1:]} per frame, not a {WRENCH_COMPONENTS}-component "
+            f"wrench (or a trace of them)."
+        )
+    return values.astype(np.float32)
+
+
+def wrench_traces(per_frame: dict, frames, trace_len: int) -> dict[str, np.ndarray]:
+    """Per-frame wrench rows -> the `(trace_len, 6)` trace each of `frames` observes.
+
+    The critic's `wrench.*` modality is the trace the **previous** chunk left: the primitive
+    steps between the last observation and this one, which is the only wrench that exists before
+    the current chunk has been executed (CLAUDE.md 6.2 / 7a). A demo frame is one primitive step
+    and its row covers the physics steps leading up to it, so the window for frame `t` is the
+    `trace_len` rows ending **at** `t` -- `t - trace_len + 1 ... t` -- which is exactly the span
+    a control step at `t` would have drained had a policy been driving.
+
+    Shorter windows are NaN-padded at the tail, matching `envs/utils/wrench.py::stack_step_wrench`:
+    frame 0 has nothing behind it and carries a single sample of the contact state at that
+    instant, the same as an episode's first drain online. NaN rather than zero, because zero is
+    a reading.
+
+    Returns `{f"wrench.{key}": (len(frames), trace_len, 6)}`, empty when the dataset has none.
+    """
+    frames = np.asarray(frames, dtype=np.int64).reshape(-1)
+    trace_len = int(trace_len)
+    if trace_len < 1:
+        raise ValueError(f"wrench trace length must be >= 1 primitive step, got {trace_len}.")
+    out = {}
+    for key, values in per_frame.items():
+        traces = np.full((len(frames), trace_len, WRENCH_COMPONENTS), np.nan, dtype=np.float32)
+        for i, t in enumerate(frames.tolist()):
+            window = values[max(0, t - trace_len + 1) : t + 1]
+            traces[i, : len(window)] = window
+        out[f"{WRENCH_MODALITY_PREFIX}{key}"] = traces
+    return out
 
 
 def _decode_image(cell) -> np.ndarray:
@@ -354,6 +462,11 @@ class DemoBank:
     # (see SIMILARITY_SIGNALS), stored at their natural magnitude -- the scaling is per query,
     # not per vector. Empty when retrieval is on `siglip` alone.
     extra: dict[str, np.ndarray]
+    # The rows' contact-wrench traces, `{"wrench.<key>": (num_frames, wrench_trace_len, 6)}`, for
+    # a demo dataset that carries the columns and a run that set `wrench_trace_len`; `{}`
+    # otherwise. Like `obs` these are unpadded and indexed on the host by rows a retrieval
+    # returned, and for the same reason: a padded row sits at +inf distance and is never one.
+    wrench: dict[str, np.ndarray]
     views: tuple[str, ...]
     task: str
     episodes: tuple[int, ...]
@@ -375,8 +488,14 @@ class DemoBank:
         """What a row keeps for the cross attention, and its cost, for the startup banner."""
         views = [view.split(".", 1)[1] for view in self.views]
         frames = sum(v.nbytes for v in self.obs.get("image", {}).values())
+        wrench = (
+            ""
+            if not self.wrench
+            else f" + {len(self.wrench)} wrench trace(s) "
+            f"{next(iter(self.wrench.values())).shape[1:]}"
+        )
         return (
-            f"model inputs ({', '.join(views)}) + {self.states.shape[-1]}-d pose per row, "
+            f"model inputs ({', '.join(views)}) + {self.states.shape[-1]}-d pose{wrench} per row, "
             f"{(frames + self.states.nbytes) / 1e9:.2f} GB; the SigLIP patch maps a critic key "
             f"is built from are re-encoded per control step for the retrieved rows only"
         )
@@ -406,6 +525,7 @@ class DemoRetriever:
         num_inner_steps: int = 10,
         num_substeps: int = 1,
         invert: bool = True,
+        wrench_trace_len: int | None = None,
         encode_batch_size: int = 16,
         debug_top_k: int = 3,
         seed: int = 0,
@@ -424,6 +544,12 @@ class DemoRetriever:
         self.num_inner_steps = int(num_inner_steps)
         self.num_substeps = int(num_substeps)
         self.invert = bool(invert)
+        # Rows of a `wrench.*` modality, i.e. how many primitive steps of contact history a
+        # frame is paired with. It is an architecture key on the critic side (its obs shape is
+        # settled before the first row arrives), so it is passed in from the run's own
+        # `wrench_trace_len` rather than guessed here; None means "no wrench in the bank", and
+        # `cotrain_rows` falls back to its `horizon`, which is what the key defaults to anyway.
+        self.wrench_trace_len = int(wrench_trace_len) if wrench_trace_len else None
         self.encode_batch_size = max(1, int(encode_batch_size))
         # How many matches the debug visualization shows. Independent of `top_k` -- the
         # distance over the whole bank comes back anyway, so showing more neighbours than the
@@ -500,6 +626,19 @@ class DemoRetriever:
         return np.flatnonzero(moved)
 
     @property
+    def wrench_modalities(self) -> tuple[str, ...]:
+        """The `wrench.<key>` modalities this demo dataset can produce, `()` if it has none."""
+        return tuple(f"{WRENCH_MODALITY_PREFIX}{key}" for key in self.reader.wrench_keys)
+
+    def _wrench_trace_len(self, fallback: int | None = None) -> int | None:
+        """The trace length to build with, or None when there is no wrench to build."""
+        if not self.reader.wrench_columns:
+            return None
+        if self.wrench_trace_len is not None:
+            return self.wrench_trace_len
+        return None if fallback is None else int(fallback)
+
+    @property
     def proposal_shape(self) -> tuple[int, int, int]:
         """The shape of one proposal modality, before it is narrowed to embodiment dims."""
         return (self.top_k, self.action_horizon, self.action_dim)
@@ -552,6 +691,7 @@ class DemoRetriever:
 
     def _build_bank(self, task_name: str, episodes: list[int]) -> DemoBank:
         embeddings, obs, actions, states, thumbs = [], [], [], [], []
+        wrench: list[dict] = []
         row_episode, row_frame = [], []
         for episode in episodes:
             encoded = self.encode_episode(episode)
@@ -559,6 +699,7 @@ class DemoRetriever:
             obs.append(encoded["obs"])
             actions.append(encoded["actions"])
             states.append(encoded["states"])
+            wrench.append(encoded["wrench"])
             if encoded["thumbnails"] is not None:
                 thumbs.append(encoded["thumbnails"])
             rows = len(encoded["embeddings"])
@@ -568,6 +709,7 @@ class DemoRetriever:
         obs = jax.tree.map(lambda *xs: np.concatenate(xs, axis=0), *obs)
         actions = np.concatenate(actions, axis=0)
         states = np.concatenate(states, axis=0)
+        wrench = {name: np.concatenate([w[name] for w in wrench]) for name in wrench[0]}
         # The distance's non-visual terms are a view on the same poses, not a second copy.
         extra = {"state": states} if "state" in self.signals else {}
         thumbs = np.concatenate(thumbs, axis=0) if thumbs else None
@@ -586,6 +728,7 @@ class DemoRetriever:
             )
             embeddings, actions = embeddings[keep], actions[keep]
             obs, states = jax.tree.map(lambda x: x[keep], obs), states[keep]
+            wrench = {name: values[keep] for name, values in wrench.items()}
             extra = {name: values[keep] for name, values in extra.items()}
             row_episode, row_frame = row_episode[keep], row_frame[keep]
             if thumbs is not None:
@@ -622,6 +765,7 @@ class DemoRetriever:
             obs=obs,
             states=states,
             extra=extra,
+            wrench=wrench,
             views=self.views,
             task=task_name,
             episodes=tuple(episodes),
@@ -671,12 +815,15 @@ class DemoRetriever:
             "obs": obs,
             "actions": transformed["actions"],
             "states": transformed["states"],
+            "wrench": transformed["wrench"],
             "thumbnails": transformed["thumbnails"],
         }
         self._encoded[episode] = encoded
         return encoded
 
-    def _transform_frames(self, episode: int, frames, *, thumbnails: bool = False) -> dict:
+    def _transform_frames(
+        self, episode: int, frames, *, thumbnails: bool = False, wrench_trace_len: int | None = None
+    ) -> dict:
         """Push `frames` of one demo episode through the policy's own input transform.
 
         The shared half of `encode_episode` and `cotrain_rows`: everything a demo frame becomes
@@ -687,7 +834,12 @@ class DemoRetriever:
         state, and the same normalization the policy was trained with, so nothing here can drift
         from what the policy sees.
 
-        Returns ``{"obs", "actions", "states", "thumbnails", "frames"}``.
+        The contact wrench is the one thing here the transform has nothing to say about -- it
+        is not part of an observation the policy sees -- so it is windowed straight from the
+        dataset's own per-frame rows (`wrench_traces`) at `wrench_trace_len` rows, defaulting to
+        the retriever's own. `{}` when the dataset has no wrench columns or no length is known.
+
+        Returns ``{"obs", "actions", "states", "wrench", "thumbnails", "frames"}``.
         """
         frames = np.asarray(frames, dtype=np.int64).reshape(-1)
         raw = self.reader.read_episode(episode, frames=frames)
@@ -728,10 +880,12 @@ class DemoRetriever:
                 # un-padded frame is the honest one to draw.
                 thumbs.append(_thumbnail(raw["images"]["cam_high"][i]))
 
+        trace_len = self._wrench_trace_len(wrench_trace_len)
         return {
             "obs": jax.tree.map(lambda *xs: np.stack(xs), *batch),
             "actions": np.stack(chunks),
             "states": np.stack(states),
+            "wrench": {} if trace_len is None else wrench_traces(raw["wrench"], frames, trace_len),
             "thumbnails": np.stack(thumbs) if thumbs else None,
             "frames": frames,
         }
@@ -926,18 +1080,32 @@ class DemoRetriever:
         batch ``len(rows)`` per control step -- the price of not keeping a bank-sized block of
         patch maps resident for the whole run. `state_dim` narrows the model-space pose to the
         embodiment's own dims, exactly as the sampler narrows the state it hands the critic.
+
+        A `wrench.<key>` is the exception: it needs no encoding at all. The row already carries
+        the `(wrench_trace_len, 6)` trace the demo frame observed, reconstructed from the
+        dataset's per-frame rows when the bank was built, so it is served straight out of
+        `DemoBank.wrench`.
         """
         if self.bank is None:
             raise RuntimeError("No demo bank yet; call ensure_bank(task_name) first.")
         # Every camera the policy sees, not just the `views` the *distance* ranks on: a row
         # keeps its whole model input, so a view can be a key without being part of the metric.
-        available = (*SIGLIP_VIEWS, "state")
+        # Plus whichever wrench columns this demo dataset carries, if a trace length is set.
+        available = (*SIGLIP_VIEWS, "state", *sorted(self.bank.wrench))
         wanted = available if modalities is None else tuple(modalities)
         if unknown := [name for name in wanted if name not in available]:
             raise KeyError(
                 f"a demo frame has no {unknown}: the bank carries a demonstration's camera "
-                f"views and pose, i.e. {list(available)}. Drop them from the critic's "
+                f"views, pose"
+                + (f" and {sorted(self.bank.wrench)}" if self.bank.wrench else "")
+                + f", i.e. {list(available)}. Drop them from the critic's "
                 f"`key_modalities` (the query side can still use them)."
+                + (
+                    ""
+                    if self.bank.wrench or not self.reader.wrench_columns
+                    else f" ({self.repo_id} does carry {list(self.wrench_modalities)}, but this "
+                    f"run built the bank with no `wrench_trace_len`.)"
+                )
             )
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
         if rows.size and (rows.min() < 0 or rows.max() >= self.bank.num_frames):
@@ -948,7 +1116,13 @@ class DemoRetriever:
                 f"{self.bank.num_frames} (padded to {len(self.bank.mask)})."
             )
         out = {}
-        if views := [name for name in wanted if name != "state"]:
+        # Only the camera views go through the tower: a pose and a wrench trace are already
+        # arrays on the bank row.
+        if views := [
+            name
+            for name in wanted
+            if name != "state" and not name.startswith(WRENCH_MODALITY_PREFIX)
+        ]:
             group = jax.tree.map(lambda x: jnp.asarray(x[rows]), self.bank.obs)
             maps = self._embed(_model.Observation.from_dict(group))
             if missing := [view for view in views if view not in maps]:
@@ -961,21 +1135,28 @@ class DemoRetriever:
             out["state"] = np.asarray(
                 states if state_dim is None else states[..., : int(state_dim)], dtype=np.float32
             )
+        for name in wanted:
+            if name.startswith(WRENCH_MODALITY_PREFIX):
+                out[name] = np.asarray(self.bank.wrench[name][rows], dtype=np.float32)
         return out
 
     # -----------------------------------------------------------------------------------------
     # Co-training on the demonstrations themselves
     # -----------------------------------------------------------------------------------------
 
-    #: What a demo frame can be to a critic. A demonstration is a camera frame and a pose, and
-    #: that is all -- there is no wrench, depth, point cloud or privileged task state anywhere in
-    #: the demo pipeline (`collect_data.py` computes the wrench live and never writes it to the
-    #: HDF5, and neither `process_data.py` nor the LeRobot converter carries anything else
-    #: downstream). The `images.<cam>` modality is missing for a different reason: a demo dataset
-    #: stores 480x640 frames while the sim hands the critic 240x320, so the two are not the same
-    #: array. Everything here is what the *policy* makes of the frame, which is exactly the space
-    #: the online transitions are in.
+    #: What a demo frame can be to a critic **whatever dataset it came from**: what the policy
+    #: makes of the frame, which is exactly the space the online transitions are in. A multimodal
+    #: demo dataset adds its `wrench.<key>` columns on top of these (`cotrain_modalities`) -- the
+    #: only recorded sensor that survives the demo pipeline. Depth, point clouds and privileged
+    #: task state do not, and `images.<cam>` is missing for a different reason again: a demo
+    #: dataset stores 480x640 (or, for the multimodal converter, its own) frames while the sim
+    #: hands the critic 240x320, so the two are not the same array.
     COTRAIN_MODALITIES = (*SIGLIP_VIEWS, "state")
+
+    @property
+    def cotrain_modalities(self) -> tuple[str, ...]:
+        """`COTRAIN_MODALITIES` plus whatever wrench columns this demo dataset actually has."""
+        return (*self.COTRAIN_MODALITIES, *self.wrench_modalities)
 
     def cotrain_rows(
         self,
@@ -1000,11 +1181,17 @@ class DemoRetriever:
         critic actually takes, so a demo row and a live transition are the same distance apart
         in time and the same discount applies to both. Only those frames are decoded.
 
+        A `wrench.<key>` row is not encoded but **reconstructed**: a multimodal demo dataset
+        stores one averaged `(6,)` per frame, and the trace a control step observes is the
+        `wrench_trace_len` (defaulting to `horizon`) of them the previous chunk covered, ending
+        at the row's own frame -- the same window, and the same NaN padding at an episode's
+        start, that `pop_step_wrench` produces online.
+
         Args:
             episodes: which demo episodes to encode (already filtered to one task by the caller,
                 see `episodes_for_task`).
             horizon: primitive sim steps per control step (`pi0_step`).
-            modalities: which of `COTRAIN_MODALITIES` to produce. A view not asked for costs
+            modalities: which of `cotrain_modalities` to produce. A view not asked for costs
                 nothing but the tower pass that produced it.
             state_dim: narrow the model-space pose and action chunk to the embodiment's own dims,
                 exactly as the sampler narrows what it hands the critic. None keeps the model's
@@ -1015,24 +1202,32 @@ class DemoRetriever:
             "episode_index": (N,), "frame_index": (N,)}``. A SigLIP map is the flat
             ``(256, 1152)`` patch sequence the tower emits, at fp16 -- the same form (and dtype)
             a rollout dataset's `siglip.<view>` column stores, so the consumer reshapes it to the
-            critic's grid the same way for both.
+            critic's grid the same way for both. A wrench is ``(N, wrench_trace_len, 6)``
+            float32 -- ``horizon`` rows when the retriever was given no length of its own -- the
+            same shape (and NaN padding) as the online modality and a rollout dataset's column.
         """
-        if unknown := [name for name in modalities if name not in self.COTRAIN_MODALITIES]:
+        if unknown := [name for name in modalities if name not in self.cotrain_modalities]:
             raise KeyError(
-                f"a demonstration has no {unknown}: a demo frame is a camera view and a pose, "
-                f"i.e. {list(self.COTRAIN_MODALITIES)}. Drop them from the critic's "
+                f"a demonstration from {self.repo_id} has no {unknown}: a demo frame is a camera "
+                f"view, a pose"
+                + (f" and {list(self.wrench_modalities)}" if self.wrench_modalities else "")
+                + f", i.e. {list(self.cotrain_modalities)}. Drop them from the critic's "
                 f"`encoder_modalities`, or co-train on a rollout dataset instead."
             )
-        views = tuple(name for name in modalities if name != "state")
+        views = tuple(
+            name for name in modalities if name != "state" and not name.startswith(WRENCH_MODALITY_PREFIX)
+        )
+        wanted_wrench = tuple(name for name in modalities if name.startswith(WRENCH_MODALITY_PREFIX))
         horizon = int(horizon)
         if horizon < 1:
             raise ValueError(f"horizon must be >= 1 primitive step, got {horizon}.")
 
         maps = {view: [] for view in views}
+        wrench = {name: [] for name in wanted_wrench}
         chunks, states, episode_index, frame_index = [], [], [], []
         for episode in episodes:
             frames = np.arange(0, self.reader.episode_length(episode), horizon)
-            transformed = self._transform_frames(episode, frames)
+            transformed = self._transform_frames(episode, frames, wrench_trace_len=horizon)
             for group in self._tower_batches(transformed["obs"]):
                 if missing := [view for view in views if view not in group]:
                     raise ValueError(f"the policy does not expose {missing} to the critic.")
@@ -1041,6 +1236,8 @@ class DemoRetriever:
                     # dtype a collected dataset's column has -- these go straight into a stored
                     # transition and the encoder casts on the way in anyway.
                     maps[view].append(np.asarray(group[view], dtype=np.float16))
+            for name in wanted_wrench:
+                wrench[name].append(transformed["wrench"][name])
             chunks.append(transformed["actions"])
             states.append(transformed["states"])
             episode_index.append(np.full(len(frames), episode, dtype=np.int64))
@@ -1050,6 +1247,7 @@ class DemoRetriever:
             raise ValueError("cotrain_rows was given no episodes to encode.")
         narrow = slice(None) if state_dim is None else slice(0, int(state_dim))
         obs = {view: np.concatenate(parts) for view, parts in maps.items()}
+        obs.update({name: np.concatenate(parts) for name, parts in wrench.items()})
         if "state" in modalities:
             obs["state"] = np.concatenate(states)[..., narrow].astype(np.float32)
         return {

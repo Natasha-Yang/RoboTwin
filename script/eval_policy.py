@@ -6,7 +6,8 @@ every control step and runs TD updates on that critic, which steers the frozen p
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
 progress is logged to W&B. Under ``save_critic`` it is written to the result directory after
 every episode, so an interrupted run leaves a checkpoint the next one can resume from via
-``critic_ckpt``. Setting ``train_critic_online: false`` keeps the guidance but leaves
+``critic_ckpt``; a second copy of the best episode's critic (highest ``success_rate_ma``) is
+kept alongside it. Setting ``train_critic_online: false`` keeps the guidance but leaves
 the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
 no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
@@ -17,6 +18,7 @@ import os
 import json
 import re
 import subprocess
+import shutil
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -467,6 +469,15 @@ def snapshot_config(src_path, values, dst_dir):
 # an interruption anywhere in the sequence rewinds to the last episode that finished all three.
 # The csv can legitimately be one row ahead of it, which `load_resume_state` trims.
 #
+# The critic is the one file that can also be *ahead* of the marker, because it is additionally
+# written every `critic_save_every_updates` TD updates -- an episode runs for up to `step_lim`
+# control steps, so waiting for the boundary can put hundreds of updates at risk. That is
+# deliberate and harmless: a resume replays the interrupted episode's seed against a critic that
+# already saw part of it, which duplicates a little training data but loses none of it. Only the
+# `critic_updates` field of the state file goes stale as a result, and nothing reads it back --
+# the ramp is measured from `critic_ramp_baseline` against the checkpoint's own counter, which
+# is correct precisely because those updates really did happen.
+#
 # What is *not* checkpointed is the replay buffer -- gigabytes, mostly SigLIP features (see
 # CLAUDE.md §5a) -- so a resumed critic keeps its weights and optimizer but refills its buffer
 # from empty, and runs no TD update until `start_training` transitions are back in it.
@@ -479,6 +490,14 @@ def snapshot_config(src_path, values, dst_dir):
 RESUME_STATE = "resume_state.json"
 EPISODE_CSV = "_episode_results.csv"
 CRITIC_CKPT = "online_value_critic.pkl"
+# The best critic seen so far, alongside the latest one. `CRITIC_CKPT` is the run's *state* --
+# what a resume must pick up, and by construction whatever the last episode happened to leave --
+# while online TD on a few thousand correlated transitions is not monotone, so the end of a run
+# is not reliably its best point. `CRITIC_CKPT_BEST` is the checkpoint at the highest
+# `success_rate_ma` any episode of this run reached, which is what you want to evaluate or ship.
+# Never resumed from: resuming from it would rewind the seed sequence and the optimizer to an
+# episode the csv says is already done.
+CRITIC_CKPT_BEST = "online_value_critic_best.pkl"
 EPISODE_COLUMNS = ["episode", "seed", "num_steps", "success", "reward", "success_rate_ma", "reward_ma"]
 
 
@@ -506,6 +525,23 @@ def save_critic_atomically(online_critic, path):
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)  # no-op after a successful replace; cleans up after a failed one
+
+
+def promote_best_critic(latest_path, best_path):
+    """Copy the just-written latest checkpoint over the best one, atomically.
+
+    A copy rather than a second `online_critic.save`: the pickle for this episode was written a
+    moment ago from the same object, so re-pickling would only burn the time again and risk the
+    two files disagreeing if anything about the critic moved in between. Same temp-file-then-
+    rename discipline as `save_critic_atomically`, for the same reason -- this runs after every
+    improving episode, so a kill mid-write must not shred the best checkpoint the run has.
+    """
+    tmp = best_path.with_name(best_path.name + ".tmp")
+    try:
+        shutil.copyfile(latest_path, tmp)
+        tmp.replace(best_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def numpy_random_state():
@@ -731,6 +767,9 @@ def main(usr_args):
     # Checkpointed after every episode, not just at the end, so a resume has a recent critic
     # to restore. Same flag that governs the final save below.
     args["save_critic"] = usr_args.get("save_critic", False)
+    # ... and again every N TD updates within an episode, so a long episode's training is not
+    # all riding on reaching the episode boundary. 0 disables the mid-episode writes.
+    args["critic_save_every_updates"] = usr_args.get("critic_save_every_updates", 200)
     # Off leaves the sparse terminal reward, which is what the critic is then trained on.
     args["use_step_reward"] = usr_args["use_step_reward"]
     # Fixed length of the `wrench.*` trace a control step sees, and the cap on the env's log
@@ -801,6 +840,17 @@ def main(usr_args):
         if _trains_online_critic(model):
             print(f"saved online critic to {save_dir / CRITIC_CKPT} "
                   f"({online_critic.num_updates} updates)")
+            # The other file: the critic as of the run's best episode, which is generally not
+            # its last. Read the bar back off the state file rather than threading it out of
+            # `eval_policy`, which is called once per checkpoint setting.
+            state_path = save_dir / RESUME_STATE  # read directly: `load_resume_state` also trims the csv
+            final_state = json.loads(state_path.read_text()) if state_path.exists() else {}
+            best_ma = final_state.get("best_success_rate_ma")
+            if (save_dir / CRITIC_CKPT_BEST).exists():
+                print(f"saved best online critic to {save_dir / CRITIC_CKPT_BEST}"
+                      + (f" (episode {final_state.get('best_success_rate_ma_episode')}, "
+                         f"success rate MA {best_ma:.3f})" if best_ma is not None
+                         else " (moving-average window never filled: same as the latest)"))
         else:
             print("train_critic_online is off -- not saving the critic (unchanged from "
                   f"{usr_args.get('critic_ckpt')})")
@@ -873,6 +923,19 @@ def eval_policy(task_name,
     # snapshotted config already names.
     save_critic = train_critic and bool(args.get("save_critic", False))
     critic_ckpt_announced = False
+    # The best critic of the run, tracked alongside the latest (see CRITIC_CKPT_BEST). `best_ma`
+    # is None until the moving-average window has actually filled: a partial window is a mean
+    # over one or two episodes, so a single early success reads as a success rate of 1.0 that no
+    # honest 20-episode average can ever beat, and the "best" checkpoint would be frozen at
+    # episode 1 forever. While it fills, the best file just tracks the latest, so a run killed
+    # during warmup still leaves both files valid.
+    best_ma = None
+    best_ma_episode = None
+    # Second, finer checkpoint cadence: write the latest critic every N TD updates as well as
+    # after every episode (0 turns it off). Only the *latest* file moves -- `success_rate_ma` is
+    # an episode-level number, so there is no bar to rank a mid-episode critic against.
+    save_every_updates = int(args.get("critic_save_every_updates", 200) or 0) if save_critic else 0
+    periodic_ckpt_announced = False
     train_freq = int(args.get("train_freq", 1))
     # The reward every consumer below sees -- the critic's `commit()`, the Q recorder and the
     # per-episode totals in the csv. With the shaping off it is sparse: 1.0 on success, 0.0
@@ -938,6 +1001,7 @@ def eval_policy(task_name,
     # Where each finished episode is committed (see the notes above `append_episode_row`).
     csv_path = save_dir / EPISODE_CSV
     critic_path = save_dir / CRITIC_CKPT
+    best_critic_path = save_dir / CRITIC_CKPT_BEST
 
     if resume_state is not None:
         # Pick the loop back up exactly where it stopped. `now_seed` is the load-bearing one:
@@ -951,6 +1015,16 @@ def eval_policy(task_name,
         TASK_ENV.test_num = resume_state["test_num"]
         chunk_count = resume_state["chunk_count"]
         set_numpy_random_state(resume_state["numpy_random_state"])
+        # The best-so-far bar, so a resumed run does not overwrite a better checkpoint from
+        # before the break with a worse one after it. Absent in state files written before
+        # 2026-08-29 (and in one reconstructed by `resume_state_from_log.py`, which has no
+        # critic to speak of), in which case the bar starts over -- the moving averages in the
+        # csv would give the right number, but the checkpoint that earned it is already gone.
+        best_ma = resume_state.get("best_success_rate_ma")
+        best_ma_episode = resume_state.get("best_success_rate_ma_episode")
+        if best_ma is not None:
+            print(f"\033[93m[resume] best critic so far: MA{ma_window} {best_ma:.3f} "
+                  f"at episode {best_ma_episode}\033[0m")
 
         # The csv is the record of the episodes themselves; reload it so the moving averages
         # continue over the interruption rather than restarting from an empty window.
@@ -1096,6 +1170,19 @@ def eval_policy(task_name,
                             TASK_ENV.test_num,
                             TASK_ENV.take_action_cnt,
                         )
+                        # Mid-episode checkpoint. The per-episode write below is the commit
+                        # point, but an episode is up to `step_lim` control steps and so can be
+                        # hundreds of TD updates long -- a kill inside one would otherwise
+                        # discard all of them. Counted on the critic's own lifetime
+                        # `num_updates` rather than on `chunk_count`, so the cadence is in
+                        # updates whatever `train_freq` is.
+                        updates = int(online_critic.num_updates)
+                        if save_every_updates and updates % save_every_updates == 0:
+                            save_critic_atomically(online_critic, critic_path)
+                            if not periodic_ckpt_announced:
+                                print(f"\033[96m[critic]\033[0m also checkpointing every "
+                                      f"{save_every_updates} updates to {critic_path}")
+                                periodic_ckpt_announced = True
 
             prev_success = success_now
             if success_now:
@@ -1204,9 +1291,21 @@ def eval_policy(task_name,
         # the update count that identifies which state was written.
         if save_critic and online_critic is not None:
             save_critic_atomically(online_critic, critic_path)
+            # ... and keep a second copy of the best episode's critic. Until the MA window is
+            # full there is no average worth ranking on, so the best file simply follows the
+            # latest; after that it only moves on a strict improvement, which leaves the
+            # earliest critic to reach a plateau as the one kept.
+            if len(success_window) < ma_window:
+                promote_best_critic(critic_path, best_critic_path)
+            elif best_ma is None or success_rate_ma >= best_ma:
+                promote_best_critic(critic_path, best_critic_path)
+                best_ma, best_ma_episode = success_rate_ma, TASK_ENV.test_num
+                print(f"\033[96m[critic]\033[0m new best: MA{ma_window} success rate "
+                      f"{best_ma:.3f} -> {best_critic_path.name}")
             if not critic_ckpt_announced:
                 print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
-                      f"{critic_path} (set `critic_ckpt` to it to resume this run)")
+                      f"{critic_path} (set `critic_ckpt` to it to resume this run); the best "
+                      f"episode's critic is kept alongside it as {best_critic_path.name}")
                 critic_ckpt_announced = True
         write_resume_state(save_dir, {
             "episodes": succ_seed,
@@ -1223,6 +1322,10 @@ def eval_policy(task_name,
             # from `critic_ckpt`. Restored on resume so the ramp continues rather than
             # restarting against the run's own checkpoint (see the resume block in `main`).
             "critic_ramp_baseline": int(getattr(model, "critic_ramp_baseline", 0)),
+            # The bar `online_value_critic_best.pkl` currently holds, so a resumed run keeps
+            # comparing against it rather than replacing it with its own first episode.
+            "best_success_rate_ma": best_ma,
+            "best_success_rate_ma_episode": best_ma_episode,
             "wandb_run_id": wandb_run.id if wandb_run is not None else None,
         })
 
