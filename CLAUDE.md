@@ -274,6 +274,43 @@ bash task_config/create_task_config.sh <my_config>   # copies _config_template.y
 # then edit task_config/<my_config>.yml
 ```
 
+**`env_seed` — one scene for a whole run.** Every episode is normally seeded by its own
+`seed`, and *everything* random is drawn from that one stream: not just where the objects
+land but what the room looks like. `env_seed` (top-level in the task config, next to
+`episode_num`) splits the two. With it set, the draws that decide **scene appearance** —
+wall and table texture, directional/point light colors and the crazy-light coin flip, table
+height, head-camera jitter — come from a generator seeded with `env_seed` instead, rebuilt
+identically at the start of every episode, while `load_actors` keeps drawing object poses
+from the episode's own `seed`. So a run holds the environment fixed and varies only the task
+objects, which is the comparison you usually want when the background is randomized.
+
+| | drawn from |
+|---|---|
+| wall / table texture, `clean_background_rate` flips | `env_seed` |
+| directional + point light colors, `crazy_random_light_rate` flip, and the per-frame crazy-light jitter | `env_seed` |
+| `random_table_height` → `table_z_bias` | `env_seed` |
+| `random_head_camera_dis` jitter | `env_seed` |
+| object poses (`load_actors`), cluttered-table objects | the episode `seed` |
+
+Clutter is deliberately on the episode stream: `get_cluttered_table` rejection-samples
+against `prohibited_area`, which moves with the task objects, so it could not be held fixed
+even in principle.
+
+`null` (the default everywhere) is the original behaviour to the byte — with no `env_seed`
+the generator *is* `np.random`, so the draw order and every value are unchanged. Setting it
+does shift the global stream, since the scene draws no longer consume it, so a given episode
+`seed` places objects differently than the same seed would without `env_seed`. That is
+inherent to splitting the streams; it means an `env_seed` run is not comparable episode-by-
+episode with a non-`env_seed` one, only within itself.
+
+It is plumbed as an ordinary task-config key (`args` → `_init_task_env_`), so
+`collect_data.py` picks it up with no extra flag. The two policy drivers can additionally
+override it per run — `env_seed` in `policy/pi05/deploy_policy.yml` and
+`policy/pi05/collect_dataset.yml`, or on the command line as
+`bash eval.sh <…6 positional args…> --env_seed 7` (eval.sh passes anything past its 12th
+positional arg through verbatim). The eval banner prints which is in force, and the run's
+`deploy_policy.yml` snapshot records the resolved value.
+
 ### 3.1 Single task (interactive / one GPU)
 
 ```bash

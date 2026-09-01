@@ -160,6 +160,20 @@ def build_env_args(usr_args):
     args["ckpt_setting"] = ckpt_setting
     args["policy_name"] = policy_name
 
+    # Same key as the eval driver's (see script/eval_policy.py and Base_Task._init_task_env_):
+    # with `env_seed` set, every episode of the collection run renders the same scene --
+    # background texture, light colors, table height, head-camera jitter -- while object poses
+    # keep varying with each episode's own seed. The task config supplies the default;
+    # collect_dataset.yml overrides it per run.
+    # `None` from either side means "unset", so the deploy/collect yml's own `env_seed: null`
+    # falls through to the task config rather than shadowing it.
+    env_seed = usr_args.get("env_seed")
+    if env_seed is None:
+        env_seed = args.get("env_seed")
+    if isinstance(env_seed, str):
+        env_seed = None if env_seed.strip().lower() in ("", "none", "null") else int(env_seed)
+    args["env_seed"] = None if env_seed is None else int(env_seed)
+
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
     with open(embodiment_config_path, "r", encoding="utf-8") as f:

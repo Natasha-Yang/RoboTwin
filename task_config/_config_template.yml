@@ -5,6 +5,13 @@ save_freq: 15
 embodiment:
 - aloha-agilex
 language_num: 100
+# Fixes the scene across every episode of a run. The wall/table texture, light colors, table
+# height and head-camera jitter below are then drawn from *this* seed rather than the episode's
+# own, so each episode renders the same environment while object poses keep varying with the
+# episode seed. `null` = the original behaviour, where the scene is redrawn per episode.
+# Cluttered-table objects follow the episode seed either way (they rejection-sample around the
+# task objects, which move). Eval can override per run: `--env_seed <n>`, see policy/pi05/eval.sh.
+env_seed: null
 domain_randomization:
   random_background: true
   cluttered_table: true

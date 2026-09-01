@@ -57,7 +57,9 @@ overrides=()
 [ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
 # Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
 # positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
-# without editing the yml (and so without steering a concurrent eval into that run's directory).
+# without editing the yml (and so without steering a concurrent eval into that run's directory),
+# and `--env_seed <n>`, which pins the scene (background, lights, table height, head-camera
+# jitter) to that seed for every episode of the run while object poses keep varying per episode.
 [ "$#" -gt 12 ] && overrides+=("${@:13}")
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}

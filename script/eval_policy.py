@@ -637,6 +637,22 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
 
+    # One scene for the whole run (see Base_Task._init_task_env_): with `env_seed` set, the
+    # background texture, light colors, table height and head-camera jitter come from it instead
+    # of the episode's own seed, so every episode looks the same while object poses keep varying.
+    # The task config supplies the default and deploy_policy.yml / `--env_seed <n>` overrides it
+    # per run. Resolved here, ahead of the config snapshot below, so the snapshot records the
+    # value actually used.
+    # `None` from either side means "unset", so the deploy/collect yml's own `env_seed: null`
+    # falls through to the task config rather than shadowing it.
+    env_seed = usr_args.get("env_seed")
+    if env_seed is None:
+        env_seed = args.get("env_seed")
+    if isinstance(env_seed, str):
+        env_seed = None if env_seed.strip().lower() in ("", "none", "null") else int(env_seed)
+    args["env_seed"] = None if env_seed is None else int(env_seed)
+    usr_args["env_seed"] = args["env_seed"]
+
     embodiment_type = args.get("embodiment")
     embodiment_config_path = Path(CONFIGS_PATH) / "_embodiment_config.yml"
 
@@ -745,6 +761,9 @@ def main(usr_args):
         print(" - Crazy Random Light Rate: " + str(args["domain_randomization"]["crazy_random_light_rate"]))
     print("\033[95mRandom Table Height:\033[0m " + str(args["domain_randomization"]["random_table_height"]))
     print("\033[95mRandom Head Camera Distance:\033[0m " + str(args["domain_randomization"]["random_head_camera_dis"]))
+    print("\033[95mEnv Seed:\033[0m " +
+          (f'{args["env_seed"]} (scene fixed for the whole run)' if args["env_seed"] is not None
+           else "None (scene redrawn per episode)"))
 
     print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))

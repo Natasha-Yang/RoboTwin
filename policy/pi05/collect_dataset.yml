@@ -9,6 +9,11 @@ task_name: null
 task_config: null
 ckpt_setting: null
 seed: null
+# Pins the scene for the whole collection run: background texture, light colors, table height
+# and head-camera jitter come from this seed rather than each episode's, so every episode is
+# recorded in the same environment while object poses keep varying. Overrides the task config's
+# own `env_seed`; null falls back to it (default null = scene redrawn per episode).
+env_seed: null
 instruction_type: unseen
 
 # Add Parameters You Need

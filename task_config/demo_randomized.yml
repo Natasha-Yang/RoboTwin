@@ -6,6 +6,9 @@ use_seed: false
 save_freq: 15
 embodiment: [aloha-agilex]
 language_num: 100
+# Same scene in every episode of the run (textures/lights/table height/camera jitter drawn from
+# this seed instead of the episode's); null = redraw per episode. See _config_template.yml.
+env_seed: null
 domain_randomization:
   random_background: true
   cluttered_table: true
