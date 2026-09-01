@@ -48,3 +48,6 @@ stack_bowls_three: 1200
 stack_bowls_two: 900
 stamp_seal: 400
 turn_switch: 400
+insert_peg_socket_loose: 500
+insert_peg_socket_med: 500
+insert_peg_socket_tight: 500

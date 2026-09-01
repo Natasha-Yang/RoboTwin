@@ -202,6 +202,24 @@ On the **login node**:
 bash script/_download_assets.sh   # downloads + unzips assets, then fixes paths
 ```
 
+**The peg-insertion socket is generated, not downloaded.** `assets/*` is gitignored, so the
+`121_peg-socket` mesh used by `insert_peg_socket_{loose,med,tight}` (§3.5) is produced by a
+checked-in script rather than shipped. Run it once per clone / cluster, on a login node or
+anywhere — it needs no GPU:
+
+```bash
+python script/gen_peg_socket_asset.py --verify
+```
+
+`--verify` loads each variant in a headless SAPIEN scene and asserts the geometry survived.
+That check is not optional paranoia: SAPIEN's actor builder swallows collision-shape cook
+failures in a bare `except RuntimeError: continue`, so a mesh that fails to cook yields an
+actor with **zero collision shapes and no error message** — the peg would pass straight
+through the socket and the task would report success. The task module also raises at import
+if the asset is missing, because `create_actor` merely prints a warning and returns `None`
+while the seed-search loop in `collect_data.py` is uncapped — a missing asset would
+otherwise spin forever instead of failing.
+
 ### 1.5 Activate for every session / job
 
 ```bash
@@ -372,12 +390,89 @@ last frame carries however many steps ran since the previous one.
 
 Two consequences worth knowing:
 
+- The HDF5 keeps the **trace**, one sample per physics step; the LeRobot conversion is where it
+  becomes one averaged `(6,)` per frame — a demo frame is one primitive step, so that is the row
+  a critic's `wrench.*` modality is windowed out of (§4, §5b). Nothing on this path averages, so
+  the raw trace stays recoverable from the HDF5.
 - Logging is gated on `save_data`, so it costs nothing during the seed-search phase, whose
   trajectories are thrown away. It does add a `scene.get_contacts()` scan to **every** physics
   step of the replay phase, which is not free on a CPU-bound collection run — turn
   `data_type.wrench` off if you don't want the columns.
 - A config with `save_freq: null` has no frame cadence to stack against, so the wrench is left
   out rather than stored ragged.
+
+### 3.5 The peg-insertion ladder (`insert_peg_socket_{loose,med,tight}`)
+
+Three registered tasks added by this fork, and the only **clearance fit** in the task set —
+every shipped RoboTwin task is a pick-and-place, hang, press or stack, where contact force is
+incidental. Here it is the signal, which is what makes it the task to point a `wrench.*`
+critic at (§5a, §6.1).
+
+One arm grasps a standing 40 x 40 x 120 mm peg (a `create_box` primitive, so its contact and
+functional points come for free) and inserts it into a static socket's chamfered square blind
+bore. The socket is the generated asset `121_peg-socket` (§1.4); the three tasks are thin
+subclasses of `envs/_peg_insertion_base.py` differing only in `socket_model_id`:
+
+| task | model_id | clearance/side | 45° lead-in | capture radius | expert yield |
+|---|---|---|---|---|---|
+| `insert_peg_socket_loose` | 0 | 6.0 mm | 14 mm | 19 mm | 10/14 |
+| `insert_peg_socket_med` | 1 | 3.0 mm | 6 mm | 8 mm | 11/14 |
+| `insert_peg_socket_tight` | 2 | 1.5 mm | 2 mm | 3 mm | 11/14 |
+
+**Both numbers have to scale, and the lead-in is the one that matters.** The first revision
+varied only the bore and held the chamfer mouth fixed: all three rungs then had the same
+~15 mm capture, a released peg self-centred on the chamfer regardless of bore, and the three
+tasks produced *byte-identical* expert results. Clearance alone only bites once the peg is
+already aligned. Capture radius — measured by releasing a peg 5 mm above the mouth at
+increasing lateral offset — is the error budget an imprecise agent actually has, and it is
+what the ladder varies (19 / 8 / 3 mm, a 6x spread). `tight` is additionally impossible to
+insert at 15° of yaw, where `loose` still tolerates 15 mm of offset.
+
+The expert is deliberately *not* the thing that separates: yields are within noise of each
+other, and the residual failures are grasp-phase plan failures on the same seeds for all
+three rungs. That is the point — every rung yields demos at a usable rate, and eval's
+expert-feasibility gate does not select seeds differently per rung, so a policy's success
+rate across the three is comparable.
+
+Two implementation details that are load-bearing, both in
+`envs/_peg_insertion_base.py::insert_peg`:
+
+- **The descent is built by hand, not with `place_actor`.** `place_actor` emits bare
+  `Action(arm, "move", ...)` with no `constraint_pose`, and the planner is a trajectory
+  optimizer that knows nothing about the peg or the socket, so it is free to bow and rotate
+  mid-path. The plan here passes `constraint_pose=[1,1,1,0,0,0]` (orientation held, position
+  free), the same mask `grasp_actor` uses for its own final approach.
+- **Two-stage approach.** A waypoint 15 mm above the mouth splits a 100 mm constrained
+  descent into 55 + 45 mm. Measured: this cut the expert's placement error from ~3 mm to
+  ~1.3 mm and took `tight` from 4/14 to 11/14. Without it the tight rungs are limited by
+  planner drift rather than by the tolerance being studied.
+
+`constrain="align"` is given the bore's **four** symmetry axes rather than the default single
+one. With `align_axis=None` the peg's +X is forced onto the socket's +X, which for a 4-fold
+symmetric peg is up to a 90° wrist swing for a geometric no-op — and near 180°
+`get_align_matrix` hits its `||v1 x v2|| < 1e-6` branch and silently returns identity, i.e.
+no correction at all.
+
+`step_reward()` is the sum of two clipped deltas (closing on the bore axis, then depth into
+it), so a critic gets shaped progress; `check_success` is depth > 30 mm of the 38 mm bore,
+which is unreachable outside the hole.
+
+**Reading the wrench on this task — the two families mean different things, and the arm sums
+are the ones that see the insertion.** The fingers squeeze in opposition, so grip preload
+cancels in the arm totals but not in the links. Measured over 5 demos per rung:
+
+- `wrench/<link>` sits at a flat **~29 N plateau for the whole carry**, identical across all
+  three rungs — that is the gripper holding the peg at a constant commanded position, not
+  contact with the socket. It swamps the insertion.
+- `wrench/<arm>` (the sum) is near zero while carrying and rises only on **external** contact.
+  Peak over an episode: **0.6 N (loose) / 5.8 N (med) / 23.5 N (tight)**; within the insertion
+  window alone, **0.01 / 3.8 / 19.0 N**. A ~40x monotonic spread, which is the signal the
+  ladder exists to produce.
+
+So `loose` is effectively a **contact-free control condition** — at 6 mm clearance the peg never
+touches the bore — while `tight` binds hard (one demo peaked at 97 N). A critic given only
+`wrench.{fl,fr}_link*` will mostly see grip preload; give it `wrench.{left,right}` too, or
+instead, if what you want is the interaction force.
 
 ---
 
@@ -457,6 +552,22 @@ destroys the existing dataset.** `NatashaYang/robotwin_demo_clean_50_lerobot` (2
 episodes, 126 GB) is the one already on disk here.
 
 The `<repo_id>` you pick is what you reference in the training config (§5.1).
+
+**This path keeps rgb + qpos only.** Depth, point clouds, endposes, camera matrices and the
+contact wrench are dropped by `process_data.py` before the converter ever runs, so a dataset
+built this way can train the policy but cannot co-train a critic on anything the critic senses
+(§5d). The **multimodal** converter reads the collected HDF5 directly and carries all of it
+(`examples/aloha_real/convert_robotwin_multimodal_to_lerobot.py`, on the `killarney` branch —
+it is what built `robotwin_demo_{clean,randomized}_multimodal_50x10_lerobot`).
+
+One convention it does **not** yet apply: a demo HDF5 holds the wrench as one `(save_freq, 6)`
+physics-step trace per frame (§3.4), and a demo frame is one primitive step, so the dataset
+column should be that trace's **average** — one `(6,)` per frame, the same quantity a rollout
+dataset stores per primitive step. `script/demo_wrench_per_control_step.py <repo_id>` collapses
+an already-built dataset in place (nan-aware, idempotent, atomic per episode; it also fixes
+`meta/info.json` and the per-episode stats). Run it after converting, or let the reader average
+on the fly — `demo_retrieval` handles both layouts — but the stored form is what an offline
+trainer reading the columns directly will see.
 
 
 ---
@@ -684,6 +795,7 @@ the same directory, since it rewrites its own `resume_state.json` every episode 
 | episode rows + MA windows | `_episode_results.csv` | reloaded so the averages continue across the break |
 | critic params, target, **Adam state, LR schedule position** | `online_value_critic.pkl` | see below |
 | guidance ramp position | `critic_ramp_baseline` in `resume_state.json` | see below |
+| best-checkpoint bar | `best_success_rate_ma` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
 | W&B run | `wandb_run_id` → `resume="allow"` | keeps the critic curves one continuous series |
 
 The optimizer half needed a change in `multisensory_steering`: `OnlineValueCritic.save` now
@@ -960,6 +1072,42 @@ truncated one — writing in place at this rate would otherwise make the interru
 to survive destroy the checkpoint too. There is **no** separate end-of-run save: a run that
 finishes got its last write from its last episode, so `main` only prints where the file is.
 
+It is additionally written **every `critic_save_every_updates` TD updates** (default **200**;
+`0` turns the mid-episode writes off), because an episode runs for up to `step_lim` control
+steps and so can be hundreds of updates long — an interrupt inside one would otherwise discard
+every update since the last episode boundary. The cadence counts the critic's own lifetime
+`num_updates`, so it is in updates regardless of `train_freq`. This is the one file that can be
+*ahead* of `resume_state.json` rather than behind it: a resume then replays the interrupted
+episode's seed against a critic that already saw part of that episode, which duplicates a little
+training data and loses none. Only the state file's `critic_updates` field goes stale, and
+nothing reads it back — the guidance ramp is measured from `critic_ramp_baseline` against the
+checkpoint's own counter, which is right precisely because those updates did happen.
+
+**Two files, not one.** `online_value_critic.pkl` is the run's *state* — whatever the last
+episode left, which is what a resume must pick up — but online TD on a few thousand correlated
+transitions is not monotone, so the last episode is generally not the run's best. Alongside it,
+`online_value_critic_best.pkl` holds the critic as of the episode with the highest
+`success_rate_ma` (the `wandb_ma_window`-episode moving average, the same number the csv and the
+W&B curve carry). That is the one to point a later `critic_ckpt` at when you want to *use* the
+critic — evaluate it frozen, warm-start another run — and the latest is the one to point at when
+you want to *continue* this run. Never resume from the best file: it would rewind the optimizer
+to an episode `_episode_results.csv` and `resume_state.json` already count as done.
+
+Both are written the same way, and the best one is a copy of the latest (which was pickled from
+the same object a moment earlier) rather than a second pickle, through the same temp-and-rename.
+Only the latest moves on the mid-episode cadence above — `success_rate_ma` is an episode-level
+number, so there is nothing to rank a mid-episode critic against.
+Two details of "best": while the moving-average window is still **filling** the best file just
+tracks the latest — a mean over one episode makes a single early success read as a success rate
+of 1.0 that no honest 20-episode average could beat, which would freeze "best" at episode 1 —
+and once it is full only a **strict** improvement moves it, so a plateau keeps the earliest
+critic to reach it. The bar itself rides in `resume_state.json`
+(`best_success_rate_ma` / `best_success_rate_ma_episode`) so a resumed run keeps comparing
+against the pre-interruption best instead of replacing it with its own first episode; a state
+file written before 2026-08-29, or reconstructed by `resume_state_from_log.py`, has no such key
+and the bar starts over. This applies to whichever critic family is running — `eval_policy.py`
+only ever calls `online_critic.save`, so the DSRL critic (§5c) is checkpointed identically.
+
 `freeze_encoder` is implemented in `qmfm.py::freeze_encoder_tx` as an `optax.multi_transform`
 that zeroes the updates of everything under the params tree's `encoder` key, rather than as a
 `stop_gradient` inside the module: `critic_def` stays one pure function, so the guidance path —
@@ -1158,11 +1306,29 @@ embodiment's dims contributes nothing to it. The denominator is floored, so a qu
 is somehow zero reads as a plain unscaled distance rather than an infinity that swallows the
 average.
 
-There is no `wrench` signal, though it would be the natural third: **no demo dataset carries
-one.** `collect_data.py` computes the contact wrench live and never writes it to the HDF5, and
-neither `process_data.py` nor the LeRobot converter carries it downstream — so it exists only in
-rollout datasets (§7a) and in the live observation, never in a demonstration. Adding it would
-mean persisting the wrench through the demo pipeline and re-collecting.
+There is no `wrench` signal, and now for a different reason than "no demo dataset carries one".
+A **multimodal** demo dataset does carry it (`observation.wrench.<key>`, one row per frame — see
+below); what stops it being a *distance* term is NaN: a frame near the start of an episode has
+fewer rows behind it than the trace is wide, and an L2 over NaN is NaN. It reaches the critic as
+a modality instead — a bank row's own `(wrench_trace_len, 6)` trace, served by
+`DemoRetriever.critic_keys` alongside the row's SigLIP maps and pose, so a cross-attending
+critic keys on it even though the shortlist was not ranked by it. The stock rgb-only pipeline
+(`process_data.py` → `convert_aloha_data_to_lerobot_robotwin.py`) still drops the wrench, so
+which of the two a `repo_id` came from decides whether the modality exists; naming one a dataset
+does not have raises at startup, listing what it does have.
+
+**How a demonstration's wrench becomes a `(wrench_trace_len, 6)` trace.** The dataset stores one
+`(6,)` row per **frame** — that frame's physics steps averaged, the same reduction
+`_close_step_wrench` makes online (§6.1) — because a demo frame *is* one primitive step. The
+trace a control step observes is then the window of those rows the previous chunk covered:
+`t - wrench_trace_len + 1 … t`, ending at the row's own frame, NaN-padded at the tail when the
+episode has fewer rows behind it (frame 0 carries a single sample, exactly as an episode's first
+drain does online). `demo_retrieval.wrench_traces` does the windowing, for the retrieval bank and
+the co-training rows (§5d) alike, at the run's own `wrench_trace_len` — which is why that key is
+the one thing the width follows, not the demo's `save_freq` and not `pi0_step` separately.
+`script/demo_wrench_per_control_step.py` collapses a dataset written the old way, one
+`(save_freq, 6)` physics-step trace per frame, into the per-frame rows; the reader averages an
+uncollapsed one on the way in as well, so both layouts reach a critic as the same array.
 
 **What control mode a proposal is in.** pi0.5's native aloha mode, not absolute pose: the
 action is a **joint-space** target (6 arm joints + 1 gripper per arm), and
@@ -1420,13 +1586,18 @@ why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
 | `siglip.{head,left_wrist,right_wrist}` | ✔ `(16, 16, 1152)` fp16 | this run's own tower pass |
 | `state` | ✔ normalized, embodiment dims | this run's own input transform |
 | action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
-| `wrench.*`, `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
-| `images.<cam>` | ✘ | a demo frame is 480x640, the sim's is 240x320 — not the same array |
+| `wrench.<key>` | ✔ `(wrench_trace_len, 6)`, **multimodal demo datasets only** | windowed out of the dataset's own per-frame rows (§5b) |
+| `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
+| `images.<cam>` | ✘ | a demo frame is 480x640 (the multimodal converter's, its own) while the sim's is 240x320 — not the same array |
 
-A critic naming one of the ✘ modalities is refused **at startup**, listing them, rather than an
-hour into the rollouts (`offline_replay.check_demo_modalities`). Note that `cfgs/qmfm.yaml`'s
-default `encoder_modalities` lists the `wrench.*` modalities at whichever granularity, so
-turning this on means turning those off.
+A critic naming one of the ✘ modalities is refused, listing what a demonstration does carry
+(`DemoRetriever.cotrain_rows`, and `offline_replay.check_demo_modalities` hoists the check to
+startup rather than an hour into the rollouts). The wrench moved off that list on 2026-08-30:
+`cfgs/qmfm.yaml`'s default `encoder_modalities` names the `wrench.*` modalities, and co-training
+on a **multimodal** demo dataset now serves them instead of forcing them off — but which keys
+exist follows the dataset (`robotwin_demo_clean_multimodal_50x10_lerobot` has the four link
+columns only; the randomized one also has the `left` / `right` arm totals), and an rgb-only demo
+dataset still has none.
 
 Rows are the frames at `frame_index % horizon == 0` — the control steps the online critic takes,
 so a demo row and a live transition are the same distance apart in time and the same discount

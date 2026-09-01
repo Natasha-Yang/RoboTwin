@@ -1429,3 +1429,37 @@ def get_all_tasks():
         if key.isupper() and isinstance(value, dict) and value  # value非空dict
     }
 
+
+
+INSERT_PEG_SOCKET = {
+    "task_name": "insert_peg_socket_loose",
+    "task_description":
+    "Pick up the peg standing on the table and insert it into the socket's square bore. \
+                        Both objects are on the same side of the table, so use one arm: if the peg's x coordinate \
+                        (dim 0) is greater than 0 use the right arm, else the left. Grasp the peg's upper contact \
+                        band (contact_point_id=[0,1,2,3]) so the fingers stay clear of the socket rim, lift it, then \
+                        align its functional point 0 (the tip) with the socket's functional point 0 (the mouth of the \
+                        bore, whose axis points INTO the hole) and drive it in with a NEGATIVE `dis`. Approach in two \
+                        stages -- a waypoint just above the mouth, then the insertion -- so the constrained descent is \
+                        short; the tighter variants have no room for planner drift. Open the gripper to release, then \
+                        retract along the arm axis. \
+                        Note: `insert_peg_socket_{loose,med,tight}` share this description and differ only in the \
+                        socket's bore clearance and chamfer.",
+    "current_code": """
+                class gpt_insert_peg_socket_loose(insert_peg_socket_loose):
+                    def play_once(self):
+                        pass
+                """,
+    "actor_list": {
+        "self.peg": {
+            "name": "peg",
+            "description": "The 40 x 40 x 120 mm peg standing on the table, to be inserted.",
+            "modelname": "box",
+        },
+        "self.socket": {
+            "name": "socket",
+            "description": "The static socket with a chamfered square blind bore; functional point 0 is the mouth.",
+            "modelname": "121_peg-socket",
+        },
+    },
+}

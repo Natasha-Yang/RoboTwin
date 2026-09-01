@@ -253,6 +253,11 @@ class PI0:
             self.policy._input_transform,
             repo_id=repo_id,
             invert="noise_proposals" in self.proposal_modalities,
+            # A demo dataset that carries `observation.wrench.*` can serve a bank row's own
+            # contact trace as a cross-attention key, and the width has to be the one the
+            # critic's `wrench.*` modality was built with -- i.e. this run's, not a second
+            # setting inside the retrieval block (which may still override it deliberately).
+            wrench_trace_len=cfg.pop("wrench_trace_len", self.wrench_trace_len),
             **cfg,
         )
         episodes = self.demo_retriever.episodes_for_task(self.task_name)
@@ -480,7 +485,12 @@ class PI0:
             if key in ("root", "encode_batch_size", "seed") and value is not None
         }
         return DemoRetriever(
-            self.policy._model, self.policy._input_transform, repo_id=repo_id, invert=False, **cfg
+            self.policy._model,
+            self.policy._input_transform,
+            repo_id=repo_id,
+            invert=False,
+            wrench_trace_len=self.wrench_trace_len,
+            **cfg,
         )
 
     def _attach_demo_cotrain(self):
