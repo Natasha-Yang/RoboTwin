@@ -1459,7 +1459,110 @@ bash eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id>
 (currently `allenai/MolmoAct2-BimanualYAM`), `molmoact_step`, `instruction_type` — are
 in `policy/MolmoAct/deploy_policy.yml`.
 
-### 6.4 Other baselines
+### 6.4 Motus
+
+Motus is a joint video-action diffusion policy (a Wan2.2-5B video backbone + a Qwen3-VL-2B
+understanding expert + an action expert). Upstream lives at
+`/home/natashay/projects/aip-florian7/natashay/Motus`; `policy/Motus/` here is a **copy** of its
+`inference/robotwin/Motus/`, which is how that repo ships its RoboTwin adapter (its README says
+`cp -r inference/robotwin/Motus /path/to/RoboTwin/policy/`). Re-copy it to take an upstream
+update, then re-apply the two local changes noted at the end of this section.
+
+```bash
+# single task, under SLURM (the eval needs the sim, so it goes through the render-capable job)
+sbatch cluster/robotwin_gpu.sh bash -c \
+    'cd policy/Motus && bash eval.sh <task_name> [gpu_id] [--key value ...]'
+
+# on an salloc'd GPU node
+cd policy/Motus && bash eval.sh beat_block_hammer 0
+```
+
+Unlike every other policy here, **Motus is configured by a file, not by `eval.sh`'s positional
+args**: `policy/Motus/paths_config.yml` carries the checkpoint and both backbone paths, the task
+config, the seed and the GPU list, and `eval.sh` greps them out of it. The configured paths on
+Killarney:
+
+| Key | Value | What reads it |
+|---|---|---|
+| `checkpoint_path` | `~/scratch/motus_pretrained/Motus_robotwin2` | `Motus.load_checkpoint`, which wants the **directory** holding `mp_rank_00_model_states.pt` (16 GB) |
+| `wan_path` | `~/scratch/motus_pretrained/Wan2.2-TI2V-5B` | the Wan `config.json`, `Wan2.2_VAE.pth`, and the T5 encoder + `google/umt5-xxl` tokenizer |
+| `vlm_path` | `~/scratch/motus_pretrained/Qwen3-VL-2B-Instruct` | `AutoConfig` + `AutoProcessor` only |
+
+They live on **scratch**, not `/project` — `/project` is at 4886/5000 GiB and these are ~30 GB.
+Scratch is purged on inactivity, so an eval that has not run in months may need a re-fetch:
+
+```bash
+export HF_HOME=/home/natashay/scratch/hf_cache_motus       # login node; compute nodes have no internet
+DEST=/home/natashay/scratch/motus_pretrained
+hf download motus-robotics/Motus_robotwin2 --local-dir $DEST/Motus_robotwin2
+hf download Wan-AI/Wan2.2-TI2V-5B --local-dir $DEST/Wan2.2-TI2V-5B \
+    --include "config.json" "configuration.json" "Wan2.2_VAE.pth" \
+              "models_t5_umt5-xxl-enc-bf16.pth" "google/umt5-xxl/*"
+hf download Qwen/Qwen3-VL-2B-Instruct --local-dir $DEST/Qwen3-VL-2B-Instruct --exclude "*.safetensors"
+```
+
+**Both `--include`/`--exclude` narrowings are deliberate, not shortcuts.** `deploy_policy.py`
+builds the model with `load_pretrained_backbones=False` — every weight comes from the Motus
+checkpoint — so `WanVideoModel.from_config` reads only Wan's `config.json` and its VAE, and
+`Qwen3VLForConditionalGeneration._from_config` reads only Qwen's config. That drops Wan's 20 GB
+diffusion transformer and Qwen's 4.3 GB safetensors, taking the fetch from ~55 GB to ~30 GB. If
+anything ever flips `load_pretrained_backbones` back on, both have to be re-fetched in full.
+
+**It runs in the main `RoboTwin` conda env**, not a venv of its own — that is what upstream's
+README prescribes, and it is the env that has the sim, the py3.10 curobo build and SAPIEN. Its
+dependencies were installed there under `policy/Motus/constraints.txt`, which pins torch 2.4.1 /
+torchvision / numpy 1.x / `setuptools==69.5.1` / sapien / mplib / open3d so pip **errors** rather
+than silently upgrading the things curobo and SAPIEN are built against (§1.2, §8). Re-run as:
+
+```bash
+policy/Motus/.../python -m pip install -c policy/Motus/constraints.txt -r policy/Motus/requirements.txt
+```
+
+Four of those deps needed a version upstream's unpinned `requirements.txt` does not name, all
+for the same reason — this env is on **torch 2.4.1 + cu121**, older than what Motus develops on:
+
+| Package | Pinned to | Why the resolver's choice fails |
+|---|---|---|
+| `transformers` | `4.57.1` | unpinned resolves to 5.x, whose API breaks `motus.py`'s `_from_config(cfg, torch_dtype=...)`. 4.57 is the first release with Qwen3-VL, so the window is narrow |
+| `diffusers` | `0.31.0` | 0.40 requires `huggingface-hub>=1.23`, which transformers 4.57 will not take. 0.31.0 is also the version `wan/utils/fm_solvers_unipc.py` says it was copied from |
+| `deepspeed` | `0.16.9` | 0.19's `compile/custom_ops` annotates a torch custom op `list[int]`, which torch 2.4's `infer_schema` rejects at **import** — and `utils/common.py` imports `deepspeed.comm` unconditionally, so this kills the policy on load |
+| `flash_attn` | `2.7.4.post1` wheel | required, not optional: Wan's `flash_attention()` ends in `assert FLASH_ATTN_2_AVAILABLE`. Install the prebuilt `+cu12torch2.4cxx11abiFALSE-cp310` wheel from Dao-AILab's releases — building from source needs nvcc and would be killed by the login node's memory cap |
+
+Installing these bumped `huggingface-hub` 0.25.0 → 0.36.2 in the shared env; nothing else
+pre-existing moved, and `sapien` / `mplib` / `curobo` still import.
+
+Two things to know before reading results:
+
+- **`ckpt_setting` is the checkpoint path**, not a label — `eval.sh` passes `checkpoint_path`
+  straight into it, and `deploy_policy.py::get_model` reads the checkpoint out of it. Since
+  `eval_policy.py` also uses `ckpt_setting` as a *directory component*, results land at
+  `eval_result/<task>/Motus/<config>/home/natashay/scratch/motus_pretrained/Motus_robotwin2/<timestamp>/`.
+  Ugly, but it is upstream's contract and both ends have to agree, so it was left alone.
+- **Nothing denormalizes the actions.** `deploy_policy.py` defines `_denormalize_actions` and
+  loads `utils/stat.json`, and `update_obs` computes `current_state_norm` — but `get_action`
+  feeds `inference_step`'s output straight to `take_action(..., 'qpos')`, and `update_obs` passes
+  the **raw** state in. `Motus.inference_step` does no scaling either, and upstream's real-world
+  reference script does the same. So the robotwin2 checkpoint is trained on raw qpos and the
+  normalization code is vestigial — confirmed empirically, in that a 2-episode
+  `beat_block_hammer` run scored 2/2, which a policy emitting [0,1]-scaled joint targets could
+  not. Worth knowing anyway: it is the first thing to check if a *differently* trained
+  checkpoint ever produces wild or clipped actions.
+
+Three local changes to the copied tree. Two are in `eval.sh`: it takes `<task_name> [gpu_id]`
+from argv (upstream hardcodes `TASK_NAME` at the top even though its README documents an
+argument), and anything after those is forwarded to `eval_policy.py --overrides`, so `bash
+eval.sh lift_pot 0 --test_num 5` works. The third is in `utils/common.py`, where
+`import deepspeed.comm.comm` moved into a lazy `_ds_dist()` helper. That import runs deepspeed's
+op-builder probe, which raises `MissingCUDAException: CUDA_HOME does not exist` on a compute node
+with no cuda module loaded — and since `models/motus.py` imports `utils.common`, it killed
+`eval_policy.py` at import, *before* any model loaded. It only reaches a GPU node: on a login
+node deepspeed picks the CPU accelerator and skips the probe, so this cannot be caught locally.
+Only `get_rank()` and `zero_first()` ever needed it, and inference calls neither. The alternative
+fix was `module load cuda/12.6; export CUDA_HOME=$EBROOTCUDA` in every launcher; the lazy import
+was preferred because it fixes every entry point at once and adds no runtime module dependency. `auto_eval.sh` fans tasks across every GPU `nvidia-smi` reports, which suits
+a multi-GPU workstation rather than Killarney's one-L40S jobs — submit per task instead.
+
+### 6.5 Other baselines
 
 `policy/` also ships DP, ACT, DP3, RDT, pi0, openvla-oft, TinyVLA, DexVLA,
 LLaVA-VLA, GO1. Each follows the same `deploy_policy.yml` + `eval.sh` convention;
@@ -1934,6 +2037,9 @@ sbatch cluster/robotwin_gpu.sh bash -c \
 # MolmoAct:
 sbatch cluster/robotwin_gpu.sh bash -c \
   'cd policy/MolmoAct && bash eval.sh beat_block_hammer demo_clean <norm_tag> 0 0'
+# Motus (paths/config come from policy/Motus/paths_config.yml, not from argv):
+sbatch cluster/robotwin_gpu.sh bash -c \
+  'cd policy/Motus && bash eval.sh beat_block_hammer 0'
 
 # --- collect a rollout dataset (compute node records; push from a login node) ---
 sbatch cluster/robotwin_gpu.sh bash -c \

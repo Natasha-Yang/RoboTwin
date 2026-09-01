@@ -28,6 +28,7 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+*.png
 
 policy/*/training_data/*
 

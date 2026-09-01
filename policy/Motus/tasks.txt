@@ -1,0 +1,7 @@
+lift_pot
+open_microwave
+handover_block
+handover_mic
+hanging_mug
+turn_switch
+put_object_cabinet

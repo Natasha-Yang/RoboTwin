@@ -1,0 +1,27 @@
+# Motus Evaluation Path Configuration
+# Paths needed for inference
+
+# ============================================================================
+# Core Paths - MUST MODIFY THESE
+# ============================================================================
+robotwin_root: "/project/6101811/natashay/RoboTwin"
+conda_env: "/project/6101811/natashay/miniforge3/envs/RoboTwin"
+checkpoint_path: "/home/natashay/scratch/motus_pretrained/Motus_robotwin2"   # holds mp_rank_00_model_states.pt
+
+# Pretrained model paths (only for loading configs, not weights)
+# Both are built with load_pretrained_backbones=False, so only the config/tokenizer/VAE/T5
+# files were fetched -- Wan's 20 GB diffusion transformer and Qwen's 4.3 GB safetensors are
+# deliberately absent.  Re-fetch them with `hf download` if that ever changes.
+wan_path: "/home/natashay/scratch/motus_pretrained/Wan2.2-TI2V-5B"
+vlm_path: "/home/natashay/scratch/motus_pretrained/Qwen3-VL-2B-Instruct"
+
+# ============================================================================
+# Optional Configuration
+# ============================================================================
+# GPU IDs (empty means auto-detect)
+gpu_ids: [0]   # Killarney jobs request l40s:1, so there is exactly one visible device
+
+# Task configuration
+task_config: "demo_randomized"
+seed: 42
+tasks_file: "tasks.txt"
