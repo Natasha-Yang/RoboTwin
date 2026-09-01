@@ -143,6 +143,29 @@ demo_retrieval:
   # (Contact wrench would be the natural third signal but no demo dataset carries it -- the
   # RoboTwin collection pipeline computes it live and never persists it.)
   signals: null
+  # Recorded sensors to keep per bank row, on top of the camera views, the pose and the contact
+  # wrench. These are what lets **any** modality a demo dataset carries be a cross-attention key
+  # (`critic_keys`) or a co-training column (`cotrain_rows`), not just `siglip.<view>` /
+  # `state` / `wrench.<key>`: name them here and a retrieved demo frame serves its own
+  # `depth.head`, `pointcloud`, raw `images.<cam>`, ... under the same modality names the live
+  # observation uses.
+  #
+  # Which ones exist follows the dataset, and it is checked at startup: the rgb-only converter
+  # writes three camera views, the multimodal one adds `depth.<cam>`, `pointcloud` and a fourth
+  # `front` camera. `null` (or []) keeps none, which is exactly the behaviour before this key
+  # existed; `true` keeps everything the dataset has.
+  #
+  # Opt-in because unlike a SigLIP map these cannot be re-encoded from something smaller -- they
+  # are resident for every bank row (~0.23 MB a camera frame, ~0.15 MB a depth map, ~24 KB a
+  # point cloud), so the cost scales with `num_demos` x episode length, not with `top_k`. The
+  # bank banner prints the total.
+  #
+  # A shape mismatch is the thing to watch: a demo frame has to be the same array the sim hands
+  # the critic online. The rgb-only demo datasets store 480x640 frames against the sim's
+  # 240x320, so their `images.<cam>` is NOT a usable key; the multimodal ones store 240x320 and
+  # are. Nothing here can check it -- the online shape is not known until the first observation
+  # -- so a mismatch surfaces in the critic's encoder.
+  sensor_modalities: null
   # The bank is a jit argument, so it is padded to a fixed size (padding can never be
   # retrieved). Raise it if `num_demos` x episode length overflows and frames get subsampled.
   # This is also the run's biggest memory item: every row keeps its SigLIP patch map per view

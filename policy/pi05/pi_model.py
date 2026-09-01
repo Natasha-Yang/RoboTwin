@@ -271,6 +271,8 @@ class PI0:
               + (f", inverted at num_steps={self.demo_retriever.num_steps} x "
                  f"{self.demo_retriever.num_inner_steps} fixed-point iterations"
                  if self.demo_retriever.invert else ", no inversion (action_proposals only)"))
+        print(f"[pi_model] demo rows can be keys for: "
+              f"{list(self.demo_retriever.cotrain_modalities)}")
 
     @staticmethod
     def _siglip_views(collect_siglip):

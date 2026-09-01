@@ -1249,6 +1249,38 @@ index. `bank_size` is then free in device memory, and `top_k` / the critic's `ke
 are what the replay buffer's size keys off. A critic that pools the set
 (`encoder: action_proposals`) asks for none of this.
 
+**A key can be any modality the demo dataset carries**, not just the SigLIP maps and the pose.
+`DemoRetriever` reads the dataset's own schema (`LeRobotEpisodeReader.sensor_columns`) and maps
+each column to the modality name the *live* observation uses, so a retrieved demo frame can
+serve its own `depth.head`, `pointcloud` or raw `images.<cam>` under exactly the name the critic
+encodes the query with. Which ones exist follows the converter: the rgb-only pipeline writes
+three camera views and nothing else, the multimodal one adds `depth.<cam>`, `pointcloud`, the
+`wrench.*` columns and a fourth `front` camera (which this fork's `get_obs` has no counterpart
+for, so it stays `images.front` rather than being guessed into `images.third_view`).
+
+| modality | where a demo row's copy comes from |
+|---|---|
+| `siglip.<view>` | re-encoded per control step by this run's own image tower |
+| `state` | the policy's input transform, model space, narrowed to the embodiment's dims |
+| `wrench.<key>` | windowed out of the dataset's per-frame rows at `wrench_trace_len` |
+| `depth.<cam>`, `pointcloud`, `images.<cam>`, … | the dataset column, cast to the dtype the sim hands the critic |
+
+The last row is **opt-in**, via `demo_retrieval.sensor_modalities` in `deploy_policy.yml`
+(`null` keeps none — the behaviour before the key existed; `true` keeps everything the dataset
+has). Opt-in because unlike a SigLIP map these cannot be re-encoded from something smaller: a
+depth map *is* the key, so it has to be resident for every bank row, and the cost scales with
+`num_demos` × episode length rather than with `top_k` — ~0.23 MB a camera frame, ~0.15 MB a
+depth map, ~24 KB a point cloud. The bank banner prints the total, and a name the dataset does
+not have is refused when the retriever is built rather than an hour into the rollouts.
+
+**Shape agreement is the thing to check.** A demo row has to be the same array the sim hands the
+critic online, and only the dtype is normalized here. The rgb-only demo datasets store 480×640
+frames against the sim's 240×320, so their `images.<cam>` is *not* a usable key; the multimodal
+ones store 240×320 and are. `pointcloud` matches only when the task config's
+`pcd_down_sample_num` equals the dataset's (1024 for the multimodal converter). Nothing on this
+side can check it — the online shape is not known until the first observation — so a mismatch
+surfaces in the critic's encoder.
+
 **What "nearest" means.** Not a cosine but the **average of several independent relative L2
 distances**, one per signal, smallest wins (`signals`, `SIMILARITY_SIGNALS`):
 
@@ -1281,10 +1313,11 @@ below); what stops it being a *distance* term is NaN: a frame near the start of 
 fewer rows behind it than the trace is wide, and an L2 over NaN is NaN. It reaches the critic as
 a modality instead — a bank row's own `(wrench_trace_len, 6)` trace, served by
 `DemoRetriever.critic_keys` alongside the row's SigLIP maps and pose, so a cross-attending
-critic keys on it even though the shortlist was not ranked by it. The stock rgb-only pipeline
-(`process_data.py` → `convert_aloha_data_to_lerobot_robotwin.py`) still drops the wrench, so
-which of the two a `repo_id` came from decides whether the modality exists; naming one a dataset
-does not have raises at startup, listing what it does have.
+critic keys on it even though the shortlist was not ranked by it — the same route every other
+recorded sensor now takes (above). The stock rgb-only pipeline (`process_data.py` →
+`convert_aloha_data_to_lerobot_robotwin.py`) still drops the wrench, so which of the two a
+`repo_id` came from decides whether the modality exists; naming one a dataset does not have
+raises at startup, listing what it does have.
 
 **How a demonstration's wrench becomes a `(wrench_trace_len, 6)` trace.** The dataset stores one
 `(6,)` row per **frame** — that frame's physics steps averaged, the same reduction
@@ -1556,17 +1589,27 @@ why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
 | `state` | ✔ normalized, embodiment dims | this run's own input transform |
 | action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
 | `wrench.<key>` | ✔ `(wrench_trace_len, 6)`, **multimodal demo datasets only** | windowed out of the dataset's own per-frame rows (§5b) |
-| `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
-| `images.<cam>` | ✘ | a demo frame is 480x640 (the multimodal converter's, its own) while the sim's is 240x320 — not the same array |
+| `depth.<cam>`, `pointcloud`, raw `images.<cam>`, … | ✔ **if the dataset has the column and the run kept it** | the column itself, cast to the dtype the sim hands the critic (§5b) |
+| privileged task state | ✘ | nothing persists it through the demo pipeline |
 
-A critic naming one of the ✘ modalities is refused, listing what a demonstration does carry
-(`DemoRetriever.cotrain_rows`, and `offline_replay.check_demo_modalities` hoists the check to
-startup rather than an hour into the rollouts). The wrench moved off that list on 2026-08-30:
-`cfgs/qmfm.yaml`'s default `encoder_modalities` names the `wrench.*` modalities, and co-training
-on a **multimodal** demo dataset now serves them instead of forcing them off — but which keys
-exist follows the dataset (`robotwin_demo_clean_multimodal_50x10_lerobot` has the four link
-columns only; the randomized one also has the `left` / `right` arm totals), and an rgb-only demo
-dataset still has none.
+The ✔ on the third row is conditional twice over, and both conditions are checked at startup
+rather than an hour into the rollouts. First, the **dataset** has to carry the column: an
+rgb-only demo dataset has three camera views and nothing else, the multimodal converter's has
+depth, point clouds, the wrench and a fourth camera. Second, the **run** has to have asked to
+keep it, in `demo_retrieval.sensor_modalities` — the co-training rows come from the same
+retriever the bank does, so one key controls both. A critic naming something neither offers is
+refused, listing what a demonstration does carry (`DemoRetriever.cotrain_rows`, and
+`offline_replay.check_demo_modalities` hoists the check to startup).
+
+Two dates worth knowing. The wrench moved off the ✘ list on 2026-08-30: `cfgs/qmfm.yaml`'s
+default `encoder_modalities` names the `wrench.*` modalities, and co-training on a multimodal
+demo dataset serves them instead of forcing them off — which keys exist follows the dataset
+(`robotwin_demo_clean_multimodal_50x10_lerobot` has the four link columns only; the randomized
+one also has the `left` / `right` arm totals). Everything else recorded followed on 2026-09-01,
+by reading the schema instead of a fixed list. `images.<cam>` had been excluded for a subtler
+reason than "not recorded" — the rgb-only converter writes 480x640 frames against the sim's
+240x320, so they are not the same array — and that is still true of *those* datasets; the
+multimodal ones write 240x320 and work.
 
 Rows are the frames at `frame_index % horizon == 0` — the control steps the online critic takes,
 so a demo row and a live transition are the same distance apart in time and the same discount
