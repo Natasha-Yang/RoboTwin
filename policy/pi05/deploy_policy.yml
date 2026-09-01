@@ -5,13 +5,6 @@ task_name: null
 task_config: null
 ckpt_setting: null
 seed: null
-# Pins the scene for the whole run: background texture, light colors, table height and
-# head-camera jitter are drawn from this seed rather than each episode's, so every episode
-# renders the same environment while object poses keep varying with the episode seed. Overrides
-# the task config's own `env_seed`; null falls back to it (which itself defaults to null =
-# scene redrawn per episode). Per run: `bash eval.sh ... --env_seed 7` (eval.sh passes anything
-# past its 12th positional arg straight through).
-env_seed: null
 instruction_type: unseen
 
 # Add Parameters You Need

@@ -640,18 +640,15 @@ def main(usr_args):
     # One scene for the whole run (see Base_Task._init_task_env_): with `env_seed` set, the
     # background texture, light colors, table height and head-camera jitter come from it instead
     # of the episode's own seed, so every episode looks the same while object poses keep varying.
-    # The task config supplies the default and deploy_policy.yml / `--env_seed <n>` overrides it
-    # per run. Resolved here, ahead of the config snapshot below, so the snapshot records the
-    # value actually used.
-    # `None` from either side means "unset", so the deploy/collect yml's own `env_seed: null`
-    # falls through to the task config rather than shadowing it.
-    env_seed = usr_args.get("env_seed")
-    if env_seed is None:
-        env_seed = args.get("env_seed")
+    #
+    # It is a task-config key and deliberately has no override here. That is what makes it
+    # shared: `script/collect_data.py` reads the same key out of the same file, so evaluating
+    # under the task config a policy's demos were collected with puts it in the environment
+    # those demos were recorded in.
+    env_seed = args.get("env_seed")
     if isinstance(env_seed, str):
         env_seed = None if env_seed.strip().lower() in ("", "none", "null") else int(env_seed)
     args["env_seed"] = None if env_seed is None else int(env_seed)
-    usr_args["env_seed"] = args["env_seed"]
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = Path(CONFIGS_PATH) / "_embodiment_config.yml"
@@ -764,6 +761,15 @@ def main(usr_args):
     print("\033[95mEnv Seed:\033[0m " +
           (f'{args["env_seed"]} (scene fixed for the whole run)' if args["env_seed"] is not None
            else "None (scene redrawn per episode)"))
+    # `env_seed` names the same scene here as it does during collection -- except for the
+    # textures, which RoboTwin deliberately draws from a held-out pool at eval time
+    # (`_base_task.create_table_and_wall`: `seen/` when collecting, `unseen/` under eval_mode).
+    # Lights, table height and camera jitter still match; say so rather than let it look like a
+    # bug when a run's background does not resemble its demos'.
+    if args["env_seed"] is not None and args["domain_randomization"]["random_background"]:
+        print(" - note: textures come from the held-out `unseen/` pool at eval time, so they "
+              "differ from collection's `seen/` ones at the same env_seed; lights, table height "
+              "and camera jitter match")
 
     print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))

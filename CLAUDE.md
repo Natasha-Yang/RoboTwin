@@ -303,13 +303,33 @@ does shift the global stream, since the scene draws no longer consume it, so a g
 inherent to splitting the streams; it means an `env_seed` run is not comparable episode-by-
 episode with a non-`env_seed` one, only within itself.
 
-It is plumbed as an ordinary task-config key (`args` → `_init_task_env_`), so
-`collect_data.py` picks it up with no extra flag. The two policy drivers can additionally
-override it per run — `env_seed` in `policy/pi05/deploy_policy.yml` and
-`policy/pi05/collect_dataset.yml`, or on the command line as
-`bash eval.sh <…6 positional args…> --env_seed 7` (eval.sh passes anything past its 12th
-positional arg through verbatim). The eval banner prints which is in force, and the run's
-`deploy_policy.yml` snapshot records the resolved value.
+**It lives in the task config and nowhere else**, and that is the point: `collect_data.py`,
+`eval_policy.py` and `collect_dataset.py` all read the same key out of the same file (`args`
+→ `_init_task_env_`), so collecting demos and then evaluating under one task config puts the
+policy in the environment its demonstrations were recorded in. No driver has a flag of its own
+that could drift from it — there is deliberately no `--env_seed`, and no key in
+`deploy_policy.yml` / `collect_dataset.yml`. Both banners print the value in force.
+
+**One thing `env_seed` cannot make identical across collect and eval: the textures.**
+`create_table_and_wall` draws them from `assets/background_texture/seen/` when collecting and
+from `unseen/` under `eval_mode`, which is RoboTwin's own held-out split and nothing to do with
+this key. Measured at `env_seed: 7`, `beat_block_hammer`:
+
+| | `demo_clean` (`random_background: false`) | `demo_randomized` (`random_background: true`) |
+|---|---|---|
+| wall / table texture | match (both `None`) | **differ** — `seen/6015`,`seen/8583` vs `unseen/895`,`unseen/391` |
+| table height, light colors, crazy-light flip, head-camera pose | match exactly | match exactly |
+
+So under a clean config the environment is identical between the two; under a randomized one
+everything but the texture pool is, and the eval banner says so. Give the two runs the same
+scene *including* textures by setting `random_background: false`, or accept the split.
+
+`collect_data.py` additionally writes an `env_seed.txt` marker into the run's `save_path` and
+**refuses to start** if a later run into that same directory asks for a different `env_seed`
+(`check_env_seed_marker`). Collection resumes from `seed.txt` and replays *cached* joint
+trajectories, and `env_seed` moves the table under them — the result would be a directory of
+demos that silently disagree with each other rather than a crash. A directory collected before
+the marker existed has none and is left alone.
 
 ### 3.1 Single task (interactive / one GPU)
 
@@ -448,9 +468,25 @@ symmetric peg is up to a 90° wrist swing for a geometric no-op — and near 180
 `get_align_matrix` hits its `||v1 x v2|| < 1e-6` branch and silently returns identity, i.e.
 no correction at all.
 
-`step_reward()` is the sum of two clipped deltas (closing on the bore axis, then depth into
-it), so a critic gets shaped progress; `check_success` is depth > 30 mm of the 38 mm bore,
-which is unreachable outside the hole.
+`step_reward()` gives a critic shaped progress as a sum of four terms: a **one-time 0.1** the
+first time the peg is correctly grasped (gripper commanded closed, in contact with the peg, on
+its upper half, peg still upright), plus three clipped deltas — closing on the **bore axis**,
+depth **into** the bore, and uprightness **while inserted**. Every delta is symmetric, so undoing
+progress refunds it and nothing ratchets. Three details carry it:
+
+- **Depth only counts inside the bore** (tip within `ALIGN_RADIUS` = the 10 mm `SUCCESS_LATERAL`
+  of the bore axis). `depth` on its own is the signed distance below the mouth *plane*, which
+  spans the whole table, so a peg standing anywhere beside the socket reads a full bore's worth
+  — which used to make the shaping penalise lifting the peg and pay for setting it back down.
+- **Approach is the lateral offset only** — height is deliberately left out, so lifting the peg
+  is worth exactly 0 rather than reading as moving away from the mouth. The cost is a dead zone:
+  the descent from the pre-insert waypoint down to the mouth plane earns nothing, since the depth
+  term does not switch on until the tip is inside the bore.
+- **Uprightness is only live inside the bore**, and its previous value is dropped on the way out,
+  so re-entering measures from the value on entry rather than paying the whole cosine at once.
+
+`check_success` is unchanged: depth > 30 mm of the 38 mm bore, which is unreachable outside the
+hole.
 
 **Reading the wrench on this task — the two families mean different things, and the arm sums
 are the ones that see the insertion.** The fingers squeeze in opposition, so grip preload
