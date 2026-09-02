@@ -7,6 +7,7 @@ from sapien.render import clear_cache
 from collections import OrderedDict
 import pdb
 from envs import *
+from envs._base_task import resolve_background_texture_pool
 import yaml
 import importlib
 import json
@@ -102,6 +103,11 @@ def main(task_name=None, task_config=None):
     print("\033[95mRandom Background:\033[0m " + str(args["domain_randomization"]["random_background"]))
     if args["domain_randomization"]["random_background"]:
         print(" - Clean Background Rate: " + str(args["domain_randomization"]["clean_background_rate"]))
+        # Resolved by the env's own function, so this and the eval banner cannot disagree.
+        configured = args["domain_randomization"].get("background_texture_pool")
+        print(" - Texture Pool: " + resolve_background_texture_pool(configured, eval_mode=False) + "/"
+              + (" (explicit -- eval draws from the same one)" if configured
+                 else " (RoboTwin's held-out split: eval will draw from `unseen/`)"))
     print("\033[95mRandom Light:\033[0m " + str(args["domain_randomization"]["random_light"]))
     if args["domain_randomization"]["random_light"]:
         print(" - Crazy Random Light Rate: " + str(args["domain_randomization"]["crazy_random_light_rate"]))

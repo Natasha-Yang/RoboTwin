@@ -34,6 +34,34 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
 
+BACKGROUND_TEXTURE_POOLS = ("seen", "unseen")
+
+
+def resolve_background_texture_pool(pool, eval_mode):
+    """Which `assets/background_texture/<pool>` the wall/table textures are drawn from.
+
+    RoboTwin's own behaviour is a *split*: collection draws from `seen/`, eval from the held-out
+    `unseen/`, to test generalisation to backgrounds the policy never trained on. That is what
+    `pool=None` keeps, and it is the default.
+
+    Naming a pool explicitly (`domain_randomization.background_texture_pool`) overrides the
+    split for BOTH sides, which is how you make eval render the same background as collection:
+    with `seen` (or `unseen`) on both, the same `env_seed` draws the same texture, because it is
+    then the same directory, the same file count and the same generator state. `env_seed` itself
+    deliberately does not touch this -- it fixes *which* texture is drawn, not which pool.
+    """
+    if pool is None:
+        return "seen" if not eval_mode else "unseen"
+    text = str(pool).strip().lower()
+    if text in ("", "none", "null"):
+        return "seen" if not eval_mode else "unseen"
+    if text not in BACKGROUND_TEXTURE_POOLS:
+        raise ValueError(
+            f"domain_randomization.background_texture_pool must be one of "
+            f"{list(BACKGROUND_TEXTURE_POOLS)} or null (RoboTwin's seen/unseen split), got {pool!r}")
+    return text
+
+
 class Base_Task(gym.Env):
 
     def __init__(self):
@@ -100,6 +128,11 @@ class Base_Task(gym.Env):
         self.random_table_height = random_setting.get("random_table_height", 0)
         self.random_light = random_setting.get("random_light", False)
         self.crazy_random_light_rate = random_setting.get("crazy_random_light_rate", 0)
+        # Which texture pool `random_background` draws from; null = RoboTwin's seen/unseen
+        # split (see `resolve_background_texture_pool`). Validated here rather than at the
+        # first draw, so a typo fails before the scene is built.
+        self.background_texture_pool = random_setting.get("background_texture_pool", None)
+        resolve_background_texture_pool(self.background_texture_pool, self.eval_mode)
         self.crazy_random_light = (0 if not self.random_light else self._env_rng.rand() < self.crazy_random_light_rate)
         self.random_embodiment = random_setting.get("random_embodiment", False)  # TODO
 
@@ -367,19 +400,7 @@ class Base_Task(gym.Env):
         table_height += self.table_z_bias
 
         if self.random_background:
-            # RoboTwin's held-out split: collection draws backgrounds from `seen/`, eval from
-            # `unseen/`, to test generalisation to textures the policy never trained on.
-            #
-            # `env_seed` overrides it, because the two promises are incompatible and this one is
-            # explicit. A pinned scene is meant to be THE SAME scene across collection and eval
-            # -- otherwise the same env_seed drew `seen/6015` while collecting and `unseen/895`
-            # at eval, and the pools are not even the same size (10000 vs 1000), so the index the
-            # generator produces cannot line up either. With `env_seed` set, both sides draw from
-            # `seen/`: the same pool, the same count, the same generator state, hence the same
-            # texture. Held-out backgrounds are still what an eval gets by default, since
-            # `env_seed` is null unless a task config asks for it.
-            pinned_scene = self.env_seed is not None
-            texture_type = "seen" if (not self.eval_mode or pinned_scene) else "unseen"
+            texture_type = resolve_background_texture_pool(self.background_texture_pool, self.eval_mode)
             directory_path = f"./assets/background_texture/{texture_type}"
             file_count = len(
                 [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])

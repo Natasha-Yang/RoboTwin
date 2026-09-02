@@ -24,6 +24,7 @@ sys.path.append("./")
 sys.path.append(f"./policy")
 sys.path.append("./description/utils")
 from envs import CONFIGS_PATH
+from envs._base_task import resolve_background_texture_pool
 from envs.utils.create_actor import UnStableError
 from envs.utils.debug_vis import DemoRetrievalRecorder, QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
 
@@ -761,13 +762,20 @@ def main(usr_args):
     print("\033[95mEnv Seed:\033[0m " +
           (f'{args["env_seed"]} (scene fixed for the whole run)' if args["env_seed"] is not None
            else "None (scene redrawn per episode)"))
-    # A pinned scene overrides RoboTwin's seen/unseen texture split, so this run's background
-    # is the one collection saw at this env_seed rather than a held-out one
-    # (`_base_task.create_table_and_wall`). Worth printing: it is the one place `env_seed`
-    # changes eval semantics rather than just fixing a draw.
-    if args["env_seed"] is not None and args["domain_randomization"]["random_background"]:
-        print(" - textures pinned to the `seen/` pool (same as collection at this env_seed), "
-              "NOT the held-out `unseen/` split")
+    # Which texture pool this eval draws from, resolved by the same function the env uses so the
+    # banner cannot claim one thing and the scene do another. `env_seed` pins *which* texture is
+    # drawn; the pool is `background_texture_pool`'s business alone.
+    if args["domain_randomization"]["random_background"]:
+        configured = args["domain_randomization"].get("background_texture_pool")
+        pool = resolve_background_texture_pool(configured, eval_mode=True)
+        print(f" - Texture Pool: {pool}/" + (" (explicit -- collection draws from the same one)"
+                                             if configured else " (RoboTwin's held-out split)"))
+        # The one combination that surprises: a pinned scene whose background still differs from
+        # the one its demonstrations were collected on, because the split is still in force.
+        if configured is None and args["env_seed"] is not None:
+            print("   note: env_seed fixes the texture *within* a pool, and collection draws "
+                  "from `seen/`, so this eval's background differs from its demos'. Set "
+                  "domain_randomization.background_texture_pool: seen to match them.")
 
     print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))
@@ -803,15 +811,6 @@ def main(usr_args):
     # -- or pretrained on a rollout dataset -- has to have been made with the same value.
     args["wrench_trace_len"] = int(usr_args.get("wrench_trace_len") or usr_args.get("pi0_step", 10))
 
-    # Demo-retrieval proposals are `data_type`s like the rest (see the task config), but the
-    # policy produces them rather than the sim, so they cannot reach the model on the
-    # observation the way depth or a point cloud does -- they are forwarded to `get_model`
-    # instead. Everything else about retrieval (which demo dataset, how many demos, how many
-    # neighbours) is in deploy_policy.yml under `demo_retrieval`; these two only say whether
-    # the critic is offered them. Both default off.
-    usr_args["demo_proposals"] = {
-        name: bool(args["data_type"].get(name, False)) for name in ("action_proposals", "noise_proposals")
-    }
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
@@ -1019,7 +1018,7 @@ def eval_policy(task_name,
               + (f"ON, top-{max(retriever.top_k, retriever.debug_top_k)} "
                  f"(saving to {debug_save_dir}/episode<N>/)"
                  if retrieval_recorder is not None
-                 else "OFF (no data_type.action_proposals / data_type.noise_proposals)") + "\033[0m")
+                 else "OFF (the critic's encoder_modalities names no proposals)") + "\033[0m")
 
     # Where each finished episode is committed (see the notes above `append_episode_row`).
     csv_path = save_dir / EPISODE_CSV

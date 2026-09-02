@@ -27,6 +27,16 @@ domain_randomization:
   random_table_height: 0.03
   random_light: true
   crazy_random_light_rate: 0.02
+  # Which pool `random_background` draws wall/table textures from
+  # (assets/background_texture/<pool>):
+  #   null    RoboTwin's held-out split -- `seen/` when collecting, `unseen/` under eval_mode,
+  #           so an eval tests generalisation to backgrounds the policy never trained on
+  #   seen    both sides draw from `seen/`
+  #   unseen  both sides draw from `unseen/`
+  # Naming a pool is what makes an eval render the SAME background as collection: with the same
+  # pool on both sides, one `env_seed` picks the same file. `env_seed` on its own does not do
+  # that -- it fixes which texture is drawn, not which directory it comes from.
+  background_texture_pool: null
 camera:
   head_camera_type: D435
   wrist_camera_type: D435
