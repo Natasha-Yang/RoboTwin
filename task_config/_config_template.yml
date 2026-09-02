@@ -14,9 +14,10 @@ language_num: 100
 #
 # This is the ONLY place it is set: collection, eval and rollout collection all read this key
 # out of this file, so a policy is evaluated in the environment its demos were recorded in. No
-# driver has a flag that could drift from it. The one thing it cannot equalise is the texture:
-# eval draws from the held-out `unseen/` pool where collection draws from `seen/`, so set
-# `random_background: false` if the backgrounds must match too.
+# driver has a flag that could drift from it. Setting it also pins the texture POOL to `seen/`
+# on both sides, overriding RoboTwin's seen/unseen split -- otherwise eval would draw a
+# held-out background and the same env_seed would not mean the same scene. Leave it null to
+# keep that split.
 env_seed: null
 domain_randomization:
   random_background: true

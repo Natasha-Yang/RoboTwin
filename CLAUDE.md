@@ -286,7 +286,7 @@ objects, which is the comparison you usually want when the background is randomi
 
 | | drawn from |
 |---|---|
-| wall / table texture, `clean_background_rate` flips | `env_seed` |
+| wall / table texture, `clean_background_rate` flips (and the `seen/` pool, see below) | `env_seed` |
 | directional + point light colors, `crazy_random_light_rate` flip, and the per-frame crazy-light jitter | `env_seed` |
 | `random_table_height` → `table_z_bias` | `env_seed` |
 | `random_head_camera_dis` jitter | `env_seed` |
@@ -310,19 +310,25 @@ policy in the environment its demonstrations were recorded in. No driver has a f
 that could drift from it — there is deliberately no `--env_seed`, and no key in
 `deploy_policy.yml` / `collect_dataset.yml`. Both banners print the value in force.
 
-**One thing `env_seed` cannot make identical across collect and eval: the textures.**
-`create_table_and_wall` draws them from `assets/background_texture/seen/` when collecting and
-from `unseen/` under `eval_mode`, which is RoboTwin's own held-out split and nothing to do with
-this key. Measured at `env_seed: 7`, `beat_block_hammer`:
+**A pinned scene overrides RoboTwin's held-out texture split**, and this is the one place
+`env_seed` changes eval semantics rather than only fixing a draw. `create_table_and_wall`
+normally picks backgrounds from `assets/background_texture/seen/` when collecting and from
+`unseen/` under `eval_mode`, to test generalisation to textures the policy never trained on.
+Those two promises are incompatible — and the pools are not even the same size (10000 vs 1000),
+so the generator's index could not line up across them either. `env_seed` wins: with it set,
+**both sides draw from `seen/`**, so the same value really does name the same background. The
+eval banner says so when it applies. With `env_seed` null — the default — the split is
+untouched and eval still draws from `unseen/`.
 
-| | `demo_clean` (`random_background: false`) | `demo_randomized` (`random_background: true`) |
+Measured at `env_seed: 7`, `beat_block_hammer`, collect path vs eval path:
+
+| | `demo_clean` | `demo_randomized` |
 |---|---|---|
-| wall / table texture | match (both `None`) | **differ** — `seen/6015`,`seen/8583` vs `unseen/895`,`unseen/391` |
+| wall / table texture | match (both `None`) | match — `seen/6015`, `seen/8583` on both sides |
 | table height, light colors, crazy-light flip, head-camera pose | match exactly | match exactly |
 
-So under a clean config the environment is identical between the two; under a randomized one
-everything but the texture pool is, and the eval banner says so. Give the two runs the same
-scene *including* textures by setting `random_background: false`, or accept the split.
+So at equal `env_seed` the eval environment *is* the collection environment. (Verified in the
+same run that `env_seed: null` still gives collect `seen/…` and eval `unseen/…`.)
 
 `collect_data.py` additionally writes an `env_seed.txt` marker into the run's `save_path` and
 **refuses to start** if a later run into that same directory asks for a different `env_seed`

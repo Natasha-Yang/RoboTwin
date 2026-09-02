@@ -367,7 +367,19 @@ class Base_Task(gym.Env):
         table_height += self.table_z_bias
 
         if self.random_background:
-            texture_type = "seen" if not self.eval_mode else "unseen"
+            # RoboTwin's held-out split: collection draws backgrounds from `seen/`, eval from
+            # `unseen/`, to test generalisation to textures the policy never trained on.
+            #
+            # `env_seed` overrides it, because the two promises are incompatible and this one is
+            # explicit. A pinned scene is meant to be THE SAME scene across collection and eval
+            # -- otherwise the same env_seed drew `seen/6015` while collecting and `unseen/895`
+            # at eval, and the pools are not even the same size (10000 vs 1000), so the index the
+            # generator produces cannot line up either. With `env_seed` set, both sides draw from
+            # `seen/`: the same pool, the same count, the same generator state, hence the same
+            # texture. Held-out backgrounds are still what an eval gets by default, since
+            # `env_seed` is null unless a task config asks for it.
+            pinned_scene = self.env_seed is not None
+            texture_type = "seen" if (not self.eval_mode or pinned_scene) else "unseen"
             directory_path = f"./assets/background_texture/{texture_type}"
             file_count = len(
                 [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])

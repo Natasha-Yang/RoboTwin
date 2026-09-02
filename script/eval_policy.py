@@ -761,15 +761,13 @@ def main(usr_args):
     print("\033[95mEnv Seed:\033[0m " +
           (f'{args["env_seed"]} (scene fixed for the whole run)' if args["env_seed"] is not None
            else "None (scene redrawn per episode)"))
-    # `env_seed` names the same scene here as it does during collection -- except for the
-    # textures, which RoboTwin deliberately draws from a held-out pool at eval time
-    # (`_base_task.create_table_and_wall`: `seen/` when collecting, `unseen/` under eval_mode).
-    # Lights, table height and camera jitter still match; say so rather than let it look like a
-    # bug when a run's background does not resemble its demos'.
+    # A pinned scene overrides RoboTwin's seen/unseen texture split, so this run's background
+    # is the one collection saw at this env_seed rather than a held-out one
+    # (`_base_task.create_table_and_wall`). Worth printing: it is the one place `env_seed`
+    # changes eval semantics rather than just fixing a draw.
     if args["env_seed"] is not None and args["domain_randomization"]["random_background"]:
-        print(" - note: textures come from the held-out `unseen/` pool at eval time, so they "
-              "differ from collection's `seen/` ones at the same env_seed; lights, table height "
-              "and camera jitter match")
+        print(" - textures pinned to the `seen/` pool (same as collection at this env_seed), "
+              "NOT the held-out `unseen/` split")
 
     print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))
