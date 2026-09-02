@@ -64,6 +64,16 @@ overrides=()
 # the environment for collection and eval alike (see task_config/_config_template.yml).
 [ "$#" -gt 12 ] && overrides+=("${@:13}")
 
+# Required. An empty gpu_id would `export CUDA_VISIBLE_DEVICES=`, which CUDA reads as "no
+# devices" -- and curobo builds a CUDA tensor as a default argument in motion_gen.py, i.e. at
+# import, so it then dies with "No CUDA GPUs are available". envs/robot/planner.py swallows that
+# and reports "check if Curobo is installed correctly", which sends you after the wrong problem
+# entirely. Fail here instead, where the cause is still legible.
+if [ -z "${gpu_id}" ]; then
+    echo -e "\033[31meval.sh: missing gpu_id (6th argument)\033[0m" >&2
+    echo "usage: bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> [...]" >&2
+    exit 1
+fi
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 

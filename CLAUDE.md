@@ -2044,6 +2044,16 @@ Notes:
     `missing pytorch3d` message, so don't read that as "not installed".
   (The `fps` call higher up in `get_pcd` is dead code — an unconditional `return`
   precedes it.)
+- **An empty `CUDA_VISIBLE_DEVICES` reads as "no GPUs", and curobo dies at *import*.**
+  `curobo/wrap/reacher/motion_gen.py` builds `Pose.from_list(...)` as a **default argument**, so
+  it runs at class-body execution and puts a tensor on CUDA before you have called anything. With
+  no visible device that raises `RuntimeError: No CUDA GPUs are available`, `envs/robot/planner.py`
+  swallows it and prints "check if Curobo is installed correctly" — which is wrong and costs you
+  an hour — and the run dies at `ImportError: cannot import name 'CuroboPlanner'`, exactly as if
+  curobo were missing. The usual cause is forgetting a launcher's `gpu_id` argument: every
+  `eval.sh` / `collect_data.sh` here does `export CUDA_VISIBLE_DEVICES=${gpu_id}` unguarded, so an
+  omitted 6th positional arg exports the empty string. `policy/pi05/eval.sh` now checks for it and
+  says so; the others still do not.
 - **curobo must be built into BOTH envs — eval will not even import without it.**
   `envs/robot/robot.py` does an unconditional `from .planner import CuroboPlanner`, and
   `envs/robot/planner.py` wraps the curobo import in a `try:` — so a missing curobo is **not**
