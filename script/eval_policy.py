@@ -6,8 +6,12 @@ every control step and runs TD updates on that critic, which steers the frozen p
 sampler; the critic persists and keeps learning across episodes for the whole eval run, and
 progress is logged to W&B. Under ``save_critic`` it is written to the result directory after
 every episode, so an interrupted run leaves a checkpoint the next one can resume from via
-``critic_ckpt``; a second copy of the best episode's critic (highest ``success_rate_ma``) is
-kept alongside it. Setting ``train_critic_online: false`` keeps the guidance but leaves
+``critic_ckpt``; a second copy of the best episode's critic is kept alongside it. Which episode
+counts as best is decided by ``eval_interval``: with it set, every that many episodes the run
+re-plays a fixed set of ``eval_seed`` episodes with the policy frozen and scores it
+(``run_holdout_eval``), and that held-out success rate is the criterion; with it 0 the criterion
+falls back to ``success_rate_ma`` over the training episodes. Setting ``train_critic_online:
+false`` keeps the guidance but leaves
 the critic frozen at its checkpoint -- no transitions are collected and no TD update runs. With
 no critic this is the plain baseline rollout. Configure via
 ``policy/<policy_name>/deploy_policy.yml``.
@@ -15,7 +19,9 @@ no critic this is the plain baseline rollout. Configure via
 
 import sys
 import os
+import contextlib
 import json
+import random
 import re
 import subprocess
 import shutil
@@ -91,6 +97,9 @@ def init_wandb(usr_args, save_dir, current_time, resume_id=None):
     wandb.define_metric("rollout/*", step_metric="critic/update")
     wandb.define_metric("eval/episode")
     wandb.define_metric("eval/*", step_metric="eval/episode")
+    # The periodic held-out evaluation (`eval_interval`), logged against the training episode it
+    # ran after -- so its curve lines up with `eval/success_rate_ma`, the criterion it replaces.
+    wandb.define_metric("holdout/*", step_metric="eval/episode")
     return run
 
 
@@ -494,12 +503,37 @@ CRITIC_CKPT = "online_value_critic.pkl"
 # The best critic seen so far, alongside the latest one. `CRITIC_CKPT` is the run's *state* --
 # what a resume must pick up, and by construction whatever the last episode happened to leave --
 # while online TD on a few thousand correlated transitions is not monotone, so the end of a run
-# is not reliably its best point. `CRITIC_CKPT_BEST` is the checkpoint at the highest
-# `success_rate_ma` any episode of this run reached, which is what you want to evaluate or ship.
-# Never resumed from: resuming from it would rewind the seed sequence and the optimizer to an
-# episode the csv says is already done.
+# is not reliably its best point. `CRITIC_CKPT_BEST` is the checkpoint at the best score any
+# episode of this run reached, which is what you want to evaluate or ship. Never resumed from:
+# resuming from it would rewind the seed sequence and the optimizer to an episode the csv says
+# is already done.
+#
+# *Which* score is `eval_interval`'s business. With the periodic held-out evaluation on (the
+# default in policy/pi05/deploy_policy.yml) it is the success rate over a fixed set of
+# `eval_seed` episodes, re-run with the critic frozen every `eval_interval` episodes; with it
+# off it falls back to `success_rate_ma`, the moving average over the training episodes
+# themselves. The held-out score is the better criterion for the same reason a held-out set
+# always is: the training episodes are the ones the critic just learned from, they are a
+# different set of seeds every time, and their moving average moves with the seeds as much as
+# with the critic. See `run_holdout_eval`.
 CRITIC_CKPT_BEST = "online_value_critic_best.pkl"
 EPISODE_COLUMNS = ["episode", "seed", "num_steps", "success", "reward", "success_rate_ma", "reward_ma"]
+# One row per held-out evaluation: which training episode it ran after, the critic's lifetime
+# update count at the time (what identifies the checkpoint being scored) and the score itself.
+HOLDOUT_CSV = "_holdout_results.csv"
+# How far above the run's own first seed the held-out search starts by default. The run consumes
+# seeds upward from `st_seed` -- one per candidate, so more than one per episode, since the
+# expert gate rejects some -- and the held-out set is only held out while it stays below this.
+# 1000 is comfortable for the usual `test_num: 300`; `eval_policy` warns if a run ever reaches it.
+HOLDOUT_SEED_OFFSET = 1000
+HOLDOUT_COLUMNS = ["episode", "critic_updates", "guidance_scale",
+                   "episodes", "successes", "success_rate", "reward_mean", "steps_mean"]
+
+
+def append_holdout_row(csv_path, row):
+    pd.DataFrame([row], columns=HOLDOUT_COLUMNS).to_csv(
+        csv_path, mode="a", header=not csv_path.exists(), index=False
+    )
 
 
 def append_episode_row(csv_path, row):
@@ -810,6 +844,26 @@ def main(usr_args):
     # name: the critic's obs shape is fixed when it is built, so a checkpoint warm-started here
     # -- or pretrained on a rollout dataset -- has to have been made with the same value.
     args["wrench_trace_len"] = int(usr_args.get("wrench_trace_len") or usr_args.get("pi0_step", 10))
+    # ===== Periodic held-out evaluation =====
+    # `eval_interval` training episodes apart, re-run a fixed set of `eval_episodes` episodes
+    # with the policy frozen and score it; that score picks the best critic checkpoint. 0 = off.
+    args["eval_interval"] = max(0, int(usr_args.get("eval_interval") or 0))
+    args["eval_episodes"] = max(1, int(usr_args.get("eval_episodes") or 10))
+    # Where the held-out seed search starts -- an actual seed, not a `seed`-style block index.
+    # Default: the run's own block offset by `HOLDOUT_SEED_OFFSET`, i.e. `100000 * (1 + seed) +
+    # 1000`. The offset is the whole guard: the run walks its own seeds upward from `st_seed`
+    # (one per candidate, accepted or rejected), so the held-out episodes are held out exactly
+    # as long as it does not walk 1000 seeds. `eval_policy` checks that as it goes rather than
+    # guessing here, since how many seeds a run consumes depends on the expert's reject rate.
+    #
+    # Staying inside the run's own block rather than jumping to the next one is a readability
+    # choice, not a distributional one: nothing about a seed's magnitude biases the scene. With
+    # `env_seed` set the scene is pinned for the whole run and every episode renders identically
+    # whatever its seed is; with it unset the scene is drawn from the episode's own seed, so it
+    # already varies episode to episode and one seed is as good as another.
+    eval_seed = usr_args.get("eval_seed")
+    args["eval_seed"] = (100000 * (1 + int(usr_args["seed"])) + HOLDOUT_SEED_OFFSET
+                         if eval_seed is None else int(eval_seed))
 
 
     st_seed = 100000 * (1 + seed)
@@ -867,12 +921,14 @@ def main(usr_args):
             # `eval_policy`, which is called once per checkpoint setting.
             state_path = save_dir / RESUME_STATE  # read directly: `load_resume_state` also trims the csv
             final_state = json.loads(state_path.read_text()) if state_path.exists() else {}
-            best_ma = final_state.get("best_success_rate_ma")
+            best_score = final_state.get("best_score", final_state.get("best_success_rate_ma"))
+            criterion = final_state.get("best_score_criterion") or "success rate"
             if (save_dir / CRITIC_CKPT_BEST).exists():
                 print(f"saved best online critic to {save_dir / CRITIC_CKPT_BEST}"
-                      + (f" (episode {final_state.get('best_success_rate_ma_episode')}, "
-                         f"success rate MA {best_ma:.3f})" if best_ma is not None
-                         else " (moving-average window never filled: same as the latest)"))
+                      + (f" (episode {final_state.get('best_score_episode')}, "
+                         f"{criterion} {best_score:.3f})" if best_score is not None
+                         else " (the best-checkpoint criterion never produced a score: same as "
+                              "the latest)"))
         else:
             print("train_critic_online is off -- not saving the critic (unchanged from "
                   f"{usr_args.get('critic_ckpt')})")
@@ -881,6 +937,209 @@ def main(usr_args):
     if wandb_run is not None:
         wandb_run.finish()
     # return task_reward
+
+
+# ===== Shared rollout pieces =====
+# The main seed loop and the periodic held-out evaluation run the same two things -- the expert
+# feasibility gate and a policy rollout -- and have to keep running the *same* two, or the
+# held-out score would not be measuring the number the run reports for itself. They live here
+# rather than inline so there is only one of each.
+
+
+def frozen_for_eval(model):
+    """Context in which rollouts measure the policy without changing it.
+
+    pi05 implements this (`PI0.frozen_for_eval`): no transition is stashed, the DSRL warmup
+    budget and its RNG stay put, the debug recorders' pending values are cleared on the way out,
+    and -- deliberately -- the guidance scale is left exactly where the ramp has it, so what is
+    scored is the policy as it behaves right now. A policy that does not know the idea has
+    nothing to freeze: it has no critic, so its rollouts change nothing anyway.
+    """
+    freeze = getattr(model, "frozen_for_eval", None)
+    return freeze() if callable(freeze) else contextlib.nullcontext()
+
+
+def run_expert_check(TASK_ENV, args, seed, now_ep_num):
+    """Run the scripted expert once on `seed`; its `info` if it solved the task, else None.
+
+    The per-seed feasibility gate both loops apply, so an episode a policy is scored on is one
+    the task is known to be solvable from -- and the same gate on both sides is what makes a
+    held-out success rate comparable with the run's own. Rendering is off for the duration (the
+    expert's trajectory is not what the video is of) and restored however this returns.
+
+    An unstable spawn (`UnStableError`) is a rejected seed like any other and stays quiet; any
+    other exception is a bug in the task or the planner, so it is printed before the seed is
+    dropped.
+    """
+    render_freq = args["render_freq"]
+    args["render_freq"] = 0
+    try:
+        TASK_ENV.setup_demo(now_ep_num=now_ep_num, seed=seed, is_test=True, **args)
+        episode_info = TASK_ENV.play_once()
+        solved = TASK_ENV.plan_success and TASK_ENV.check_success()
+        TASK_ENV.close_env()
+        return episode_info if solved else None
+    except UnStableError:
+        TASK_ENV.close_env()
+        return None
+    except Exception as e:
+        print(" -------------")
+        print("Error: ", e)
+        print(traceback.format_exc())
+        print(" -------------")
+        TASK_ENV.close_env()
+        print("error occurs !")
+        return None
+    finally:
+        args["render_freq"] = render_freq
+
+
+def set_episode_instruction(TASK_ENV, task_name, episode_info, instruction_type, test_num):
+    """Draw this episode's language instruction from the expert run's own `info` and set it."""
+    results = generate_episode_descriptions(task_name, [episode_info["info"]], test_num)
+    instruction = np.random.choice(results[0][instruction_type])
+    TASK_ENV.set_instruction(instruction=instruction)
+    return instruction
+
+
+def rollout_episode(TASK_ENV, model, eval_func, reset_func, use_step_reward,
+                    on_observation=None, on_step=None):
+    """One policy rollout, to the first success or `step_lim`.
+
+    Returns `(success, steps, total_reward)`. The two hooks are where everything a *training*
+    episode does on top of the rollout lives -- the debug visualisation before the chunk is
+    drawn, and the recorders plus the critic's `commit`/`train_step` after it -- so the held-out
+    evaluation can run the identical loop with neither.
+
+    `control_step_reward` is called exactly once per control step whether or not anyone wants
+    the number: the task's `step_reward` is a delta against its own previous call, so skipping
+    it in the held-out rollouts would leave the next training episode paying an accumulated one.
+    """
+    reset_func(model)
+    succ = False
+    prev_success = False
+    episode_reward = 0.0
+    while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
+        # The step this observation was taken at, held because `take_action_cnt` advances
+        # during the chunk -- the Q recorder logs against the observation's own index.
+        step = TASK_ENV.take_action_cnt
+        observation = TASK_ENV.get_obs()
+        if on_observation is not None:
+            on_observation(step, observation)
+        eval_func(TASK_ENV, model, observation)
+        success_now = bool(TASK_ENV.eval_success)
+        reward = control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward)
+        episode_reward += reward
+        if on_step is not None:
+            on_step(step, observation, reward, success_now)
+        prev_success = success_now
+        if success_now:
+            succ = True
+            break
+    return succ, TASK_ENV.take_action_cnt, episode_reward
+
+
+# ===== Periodic held-out evaluation =====
+# Every `eval_interval` training episodes, re-run a *fixed* set of episodes with the critic
+# frozen and score it. That score -- not the training episodes' moving average -- is what
+# decides which critic `online_value_critic_best.pkl` holds.
+#
+# Fixed is the whole point, and it is fixed twice over. The seeds are the first `eval_episodes`
+# the expert can solve counting up from `eval_seed`, which is deterministic in `eval_seed` and
+# therefore identical at every evaluation and across runs; and the `random` module is reseeded
+# from `eval_seed` for the duration, so each evaluation draws the same language instructions in
+# the same order (RoboTwin draws instructions from `random`, which nothing else seeds). Two
+# evaluations of the same critic therefore differ only by the sampler's own noise, and two
+# evaluations of different critics differ by the critic.
+#
+# The seed *search* is not cheap -- every rejected seed is a full expert rollout -- so it runs
+# once and the answer is carried in `resume_state.json`.
+
+
+def find_holdout_seeds(TASK_ENV, args, start_seed, num_episodes, info_cache):
+    """The held-out seed set: the first `num_episodes` seeds >= `start_seed` the expert solves.
+
+    Fills `info_cache` with each accepted seed's expert `info` on the way past. That is not an
+    optimisation detail: the episode's language instruction is built from those placeholders, so
+    without the cache every evaluation would have to re-run the expert pass in every held-out
+    scene just to name the objects. The scene is a function of the seed, so one pass is enough
+    for the whole run -- and a resumed run, whose cache starts empty, refills it the same way.
+    """
+    seeds = []
+    seed = start_seed
+    print(f"\033[96m[holdout]\033[0m searching for {num_episodes} expert-feasible seed(s) "
+          f"from {start_seed} (once per run; the result is carried in {RESUME_STATE})")
+    while len(seeds) < num_episodes:
+        info = run_expert_check(TASK_ENV, args, seed, now_ep_num=len(seeds))
+        if info is not None:
+            info_cache[seed] = info
+            seeds.append(seed)
+        seed += 1
+    print(f"\033[96m[holdout]\033[0m seed set: {seeds}")
+    return seeds
+
+
+def run_holdout_eval(TASK_ENV, args, model, eval_func, reset_func, seeds, info_cache,
+                     instruction_type, use_step_reward, test_num, eval_seed):
+    """Score the current policy+critic on the fixed held-out seeds, changing nothing.
+
+    Returns `(success_rate, successes, reward_mean, steps_mean)`.
+
+    Three things are saved and restored around it, because an evaluation must not be visible to
+    the run that ran it: the policy's own collection/RNG state (`frozen_for_eval`), the global
+    numpy RNG (`setup_demo` reseeds it per episode anyway, but the instruction draw reads it) and
+    the `random` module's state, which is reseeded from `eval_seed` so the instructions are the
+    same at every evaluation. `TASK_ENV.suc` / `test_num` are the run's own counters and are
+    deliberately not touched -- a held-out episode is not one of the `test_num` episodes the run
+    was asked for.
+
+    Video and the debug recorders are off: `eval_video_save_dir` is dropped from the env args
+    (the env writes head-camera frames into the run's ffmpeg pipe whenever that path is set, and
+    there is no pipe here), and `rollout_episode` is called with no hooks.
+    """
+    holdout_args = {k: v for k, v in args.items() if k != "eval_video_save_dir"}
+    numpy_state = np.random.get_state()
+    random_state = random.getstate()
+    random.seed(eval_seed)
+    successes = 0
+    rewards, steps = [], []
+    try:
+        with frozen_for_eval(model):
+            for idx, seed in enumerate(seeds):
+                # The instruction is built from the expert run's `info` placeholders, which is
+                # why the gate's `info` was cached: the scene is a function of the seed, so the
+                # expert pass that accepted this seed answers for every later evaluation of it.
+                # A resumed run has no cache and pays for one pass per seed, once.
+                if seed not in info_cache:
+                    info_cache[seed] = run_expert_check(TASK_ENV, args, seed, now_ep_num=idx)
+                    if info_cache[seed] is None:
+                        # The gate accepted this seed once and it is deterministic in the seed,
+                        # so this means the task or the config changed under a resumed run --
+                        # in which case the held-out set is not the one the earlier scores were
+                        # over and the comparison is meaningless. Say so rather than scoring on.
+                        raise RuntimeError(
+                            f"held-out seed {seed} is no longer expert-feasible: the task or the "
+                            f"task config has changed since this run's seed set was chosen, so "
+                            f"its held-out scores are not comparable. Start a fresh run "
+                            f"(resume: false), or change eval_seed."
+                        )
+                TASK_ENV.setup_demo(now_ep_num=idx, seed=seed, is_test=True, **holdout_args)
+                set_episode_instruction(TASK_ENV, args["task_name"], info_cache[seed],
+                                        instruction_type, test_num)
+                succ, episode_steps, episode_reward = rollout_episode(
+                    TASK_ENV, model, eval_func, reset_func, use_step_reward)
+                successes += int(succ)
+                rewards.append(episode_reward)
+                steps.append(episode_steps)
+                TASK_ENV.close_env()
+                print(f"\033[96m[holdout]\033[0m seed {seed}: "
+                      + ("\033[92msuccess\033[0m" if succ else "\033[91mfail\033[0m")
+                      + f" ({episode_steps} steps, reward {episode_reward:.3f}) "
+                      f"-- {successes}/{idx + 1}")
+    finally:
+        random.setstate(random_state)
+        np.random.set_state(numpy_state)
+    return (successes / len(seeds), successes, _window_mean(rewards), _window_mean(steps))
 
 
 def eval_policy(task_name,
@@ -945,17 +1204,17 @@ def eval_policy(task_name,
     # snapshotted config already names.
     save_critic = train_critic and bool(args.get("save_critic", False))
     critic_ckpt_announced = False
-    # The best critic of the run, tracked alongside the latest (see CRITIC_CKPT_BEST). `best_ma`
-    # is None until the moving-average window has actually filled: a partial window is a mean
-    # over one or two episodes, so a single early success reads as a success rate of 1.0 that no
-    # honest 20-episode average can ever beat, and the "best" checkpoint would be frozen at
-    # episode 1 forever. While it fills, the best file just tracks the latest, so a run killed
-    # during warmup still leaves both files valid.
-    best_ma = None
-    best_ma_episode = None
+    # The best critic of the run, tracked alongside the latest (see CRITIC_CKPT_BEST).
+    # `best_score` is None until the criterion in force has produced its first number; while it
+    # is, the best file simply tracks the latest, so a run killed early still leaves both files
+    # valid. Which criterion that is, is `eval_interval`'s business -- see below.
+    best_score = None
+    best_score_episode = None
+    best_criterion = None
     # Second, finer checkpoint cadence: write the latest critic every N TD updates as well as
-    # after every episode (0 turns it off). Only the *latest* file moves -- `success_rate_ma` is
-    # an episode-level number, so there is no bar to rank a mid-episode critic against.
+    # after every episode (0 turns it off). Only the *latest* file moves -- the best-checkpoint
+    # criterion is an episode-level number, so there is no bar to rank a mid-episode critic
+    # against.
     save_every_updates = int(args.get("critic_save_every_updates", 200) or 0) if save_critic else 0
     periodic_ckpt_announced = False
     train_freq = int(args.get("train_freq", 1))
@@ -968,8 +1227,38 @@ def eval_policy(task_name,
     reward_window = deque(maxlen=ma_window)
     chunk_count = 0
     last_info = None
+
+    # ===== Periodic held-out evaluation (see run_holdout_eval) =====
+    # Every `eval_interval` training episodes, re-run a fixed set of `eval_episodes` episodes
+    # drawn from `eval_seed` with the policy frozen -- no transitions collected, no TD updates --
+    # and make that success rate the criterion for `online_value_critic_best.pkl`. 0 turns it off
+    # and falls back to `success_rate_ma` over the training episodes, which is what this used
+    # before: cheaper, but it moves with the seeds as much as with the critic, since the training
+    # episodes are a different (and unrepeatable) set every time.
+    eval_interval = max(0, int(args.get("eval_interval") or 0))
+    eval_episodes = max(1, int(args.get("eval_episodes") or 10))
+    # Where the held-out seed search starts: an actual seed, defaulting to `st_seed +
+    # HOLDOUT_SEED_OFFSET` (see `main`). It is above the run's own first seed and the run walks
+    # upward, so the two sets are disjoint only while the run stays below it -- the top of the
+    # seed loop checks that as it goes, since the reject rate decides how fast the run gets there.
+    eval_seed = args.get("eval_seed")
+    eval_seed = st_seed + HOLDOUT_SEED_OFFSET if eval_seed is None else int(eval_seed)
+    holdout_overlap_warned = False
+    # The seed set itself, and the expert `info` each one's instruction is built from. Found once
+    # (every rejected seed costs a full expert rollout) and carried in `resume_state.json`.
+    holdout_seeds = None
+    holdout_info_cache = {}
     print(f"\033[95mStep reward (shaped progress):\033[0m "
           + ("ON" if use_step_reward else "OFF (sparse success reward only)"))
+    print(f"\033[95mHeld-out evaluation:\033[0m "
+          + (f"every {eval_interval} episode(s), {eval_episodes} episode(s) from seed "
+             f"{eval_seed} ({eval_seed - st_seed:+d} from this run's first seed), policy frozen"
+             + (f" -- and the criterion for {CRITIC_CKPT_BEST}" if save_critic
+                else " (no critic to checkpoint: scored and logged only)")
+             if eval_interval else
+             "OFF (eval_interval is 0"
+             + (f"; {CRITIC_CKPT_BEST} falls back to the MA{ma_window} success rate over the "
+                f"training episodes)" if save_critic else ")")))
 
     # Debug visualization of depth maps / point clouds (see visualize_debug_obs).
     debug = args.get("debug", False)
@@ -1038,15 +1327,27 @@ def eval_policy(task_name,
         chunk_count = resume_state["chunk_count"]
         set_numpy_random_state(resume_state["numpy_random_state"])
         # The best-so-far bar, so a resumed run does not overwrite a better checkpoint from
-        # before the break with a worse one after it. Absent in state files written before
-        # 2026-08-29 (and in one reconstructed by `resume_state_from_log.py`, which has no
-        # critic to speak of), in which case the bar starts over -- the moving averages in the
-        # csv would give the right number, but the checkpoint that earned it is already gone.
-        best_ma = resume_state.get("best_success_rate_ma")
-        best_ma_episode = resume_state.get("best_success_rate_ma_episode")
-        if best_ma is not None:
-            print(f"\033[93m[resume] best critic so far: MA{ma_window} {best_ma:.3f} "
-                  f"at episode {best_ma_episode}\033[0m")
+        # before the break with a worse one after it. `best_score` is the criterion-agnostic
+        # name; `best_success_rate_ma` is what state files written before the held-out
+        # evaluation existed called the same field (a moving-average success rate, which is
+        # still what the bar means when `eval_interval` is 0). Absent in state files written
+        # before 2026-08-29 (and in one reconstructed by `resume_state_from_log.py`, which has
+        # no critic to speak of), in which case the bar starts over -- the moving averages in
+        # the csv would give the right number, but the checkpoint that earned it is already gone.
+        best_score = resume_state.get("best_score", resume_state.get("best_success_rate_ma"))
+        best_score_episode = resume_state.get("best_score_episode",
+                                              resume_state.get("best_success_rate_ma_episode"))
+        best_criterion = resume_state.get("best_score_criterion")
+        if best_score is not None:
+            print(f"\033[93m[resume] best critic so far: {best_score:.3f} "
+                  f"({best_criterion or f'MA{ma_window} success rate'}) "
+                  f"at episode {best_score_episode}\033[0m")
+        # The held-out seed set, so a resumed run scores on the same episodes rather than paying
+        # for the search again -- and, more to the point, rather than scoring on a different set
+        # than the numbers already in `_holdout_results.csv`.
+        if resume_state.get("holdout_seeds"):
+            holdout_seeds = [int(v) for v in resume_state["holdout_seeds"]]
+            print(f"\033[93m[resume] held-out seed set: {holdout_seeds}\033[0m")
 
         # The csv is the record of the episodes themselves; reload it so the moving averages
         # continue over the interruption rather than restarting from an empty window.
@@ -1058,52 +1359,90 @@ def eval_policy(task_name,
         print(f"\033[93m[resume] {len(past)} episode(s) reloaded, resuming at seed {now_seed} "
               f"({succ_seed}/{test_num} done)\033[0m")
 
+    # What a *training* episode does on top of the bare rollout, as the two hooks
+    # `rollout_episode` calls. The held-out evaluation runs the same rollout with neither: it
+    # writes no debug output, feeds nothing to the recorders, and above all collects no
+    # transition and runs no TD update.
+    def on_observation(step, observation):
+        if debug:
+            visualize_debug_obs(
+                observation,
+                step_idx=step,
+                save_dir=(debug_save_dir / f"episode{TASK_ENV.test_num}"
+                          if debug_save_dir else None),
+                show=debug_show,
+                task_env=TASK_ENV,
+                wrench_recorder=wrench_recorder,
+            )
+
+    def on_step(step, observation, reward, success_now):
+        nonlocal chunk_count, last_info, periodic_ckpt_announced
+        # The chunk's Q only exists once the policy has sampled it, so unlike the wrench this is
+        # logged after the control step -- but against `step`, the count the observation it was
+        # drawn from was taken at, so it lines up with that frame.
+        if q_recorder is not None:
+            q_recorder.record(model, observation, step, reward)
+        # Retrieval happens *before* the chunk is drawn, so it belongs to `observation`; it is
+        # read here only because the policy runs it inside `get_action`.
+        if retrieval_recorder is not None:
+            retrieval_recorder.record(model, observation, step)
+        if best_of_n_recorder is not None:
+            best_of_n_recorder.record(model)
+
+        # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped for a
+        # frozen critic -- it guides, but its parameters and buffer stay untouched.
+        online_critic = getattr(model, "online_critic", None) if train_critic else None
+        if online_critic is None:
+            return
+        done = success_now or (TASK_ENV.take_action_cnt >= TASK_ENV.step_lim)
+        online_critic.commit(reward, done)
+        chunk_count += 1
+        if chunk_count % train_freq != 0:
+            return
+        info = online_critic.train_step()
+        if info is None:
+            return
+        last_info = info
+        log_critic_update(wandb_run, online_critic, model, info, chunk_count,
+                          TASK_ENV.test_num, TASK_ENV.take_action_cnt)
+        # Mid-episode checkpoint. The per-episode write below is the commit point, but an
+        # episode is up to `step_lim` control steps and so can be hundreds of TD updates long --
+        # a kill inside one would otherwise discard all of them. Counted on the critic's own
+        # lifetime `num_updates` rather than on `chunk_count`, so the cadence is in updates
+        # whatever `train_freq` is.
+        updates = int(online_critic.num_updates)
+        if save_every_updates and updates % save_every_updates == 0:
+            save_critic_atomically(online_critic, critic_path)
+            if not periodic_ckpt_announced:
+                print(f"\033[96m[critic]\033[0m also checkpointing every "
+                      f"{save_every_updates} updates to {critic_path}")
+                periodic_ckpt_announced = True
+
     while succ_seed < test_num:
-        render_freq = args["render_freq"]
-        args["render_freq"] = 0
+        # The run walks its seeds upward and the held-out set sits `HOLDOUT_SEED_OFFSET` above
+        # the start, so a long run (or an unusually high expert reject rate) can eventually
+        # reach it -- at which point the "held-out" episodes are also episodes the critic
+        # trained on, and the scores after this point are no longer a clean measurement. Said
+        # once, and not fatal: the run is still valid, its best-checkpoint criterion is just no
+        # longer held out. Raise `eval_seed` (or lower `test_num`) next time.
+        if eval_interval and not holdout_overlap_warned and now_seed >= eval_seed:
+            holdout_overlap_warned = True
+            print(f"\033[93m[holdout] the run has reached seed {now_seed}, at or past the "
+                  f"held-out set's start ({eval_seed}) -- from here the held-out episodes are "
+                  f"no longer held out. Raise eval_seed next time.\033[0m")
 
-        expert_success = False
-        if expert_check:
-            try:
-                TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-                episode_info = TASK_ENV.play_once()
-                expert_success = TASK_ENV.plan_success and TASK_ENV.check_success()
-                TASK_ENV.close_env()
-            except UnStableError as e:
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
-                TASK_ENV.close_env()
-                now_seed += 1
-                args["render_freq"] = render_freq
-                continue
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                print(" -------------")
-                print("Error: ", e)
-                print(stack_trace)
-                print(" -------------")
-                TASK_ENV.close_env()
-                now_seed += 1
-                args["render_freq"] = render_freq
-                print("error occurs !")
-                continue
-
-        if (not expert_check) or expert_success:
-            succ_seed += 1
-            suc_test_seed_list.append(now_seed)
-        else:
+        # The per-seed feasibility gate (`run_expert_check` -- rendering off, the seed dropped
+        # on failure). `episode_info` is the expert's own placeholder dict, which the episode's
+        # language instruction is built from.
+        episode_info = run_expert_check(TASK_ENV, args, now_seed, now_ep_num=now_id) if expert_check else None
+        if expert_check and episode_info is None:
             now_seed += 1
-            args["render_freq"] = render_freq
             continue
-
-        args["render_freq"] = render_freq
+        succ_seed += 1
+        suc_test_seed_list.append(now_seed)
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
-        TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+        set_episode_instruction(TASK_ENV, args["task_name"], episode_info, instruction_type, test_num)
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -1134,83 +1473,9 @@ def eval_policy(task_name,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
-        succ = False
-        reset_func(model)
-        prev_success = False
-        episode_reward = 0.0
-        while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
-            # The step this observation was taken at, held because `take_action_cnt` advances
-            # during the chunk -- the Q recorder logs against the observation's own index.
-            step = TASK_ENV.take_action_cnt
-            observation = TASK_ENV.get_obs()
-            if debug:
-                visualize_debug_obs(
-                    observation,
-                    step_idx=TASK_ENV.take_action_cnt,
-                    save_dir = (
-                        debug_save_dir / f"episode{TASK_ENV.test_num}"
-                        if debug_save_dir else None
-                    ),
-                    show=debug_show,
-                    task_env=TASK_ENV,
-                    wrench_recorder=wrench_recorder,
-                )
-            eval_func(TASK_ENV, model, observation)
-            success_now = bool(TASK_ENV.eval_success)
-            reward = control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward)
-            episode_reward += reward
-
-            # The chunk's Q only exists once the policy has sampled it, so unlike the wrench
-            # this is logged after the control step -- but against `step`, the count the
-            # observation it was drawn from was taken at, so it lines up with that frame.
-            if q_recorder is not None:
-                q_recorder.record(model, observation, step, reward)
-            # Retrieval happens *before* the chunk is drawn, so it belongs to `observation`; it
-            # is read here only because the policy runs it inside `get_action`.
-            if retrieval_recorder is not None:
-                retrieval_recorder.record(model, observation, step)
-            if best_of_n_recorder is not None:
-                best_of_n_recorder.record(model)
-
-            # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped
-            # for a frozen critic -- it guides, but its parameters and buffer stay untouched.
-            online_critic = getattr(model, "online_critic", None) if train_critic else None
-            if online_critic is not None:
-                done = success_now or (TASK_ENV.take_action_cnt >= TASK_ENV.step_lim)
-                online_critic.commit(reward, done)
-                chunk_count += 1
-                if chunk_count % train_freq == 0:
-                    info = online_critic.train_step()
-                    if info is not None:
-                        last_info = info
-                        log_critic_update(
-                            wandb_run,
-                            online_critic,
-                            model,
-                            info,
-                            chunk_count,
-                            TASK_ENV.test_num,
-                            TASK_ENV.take_action_cnt,
-                        )
-                        # Mid-episode checkpoint. The per-episode write below is the commit
-                        # point, but an episode is up to `step_lim` control steps and so can be
-                        # hundreds of TD updates long -- a kill inside one would otherwise
-                        # discard all of them. Counted on the critic's own lifetime
-                        # `num_updates` rather than on `chunk_count`, so the cadence is in
-                        # updates whatever `train_freq` is.
-                        updates = int(online_critic.num_updates)
-                        if save_every_updates and updates % save_every_updates == 0:
-                            save_critic_atomically(online_critic, critic_path)
-                            if not periodic_ckpt_announced:
-                                print(f"\033[96m[critic]\033[0m also checkpointing every "
-                                      f"{save_every_updates} updates to {critic_path}")
-                                periodic_ckpt_announced = True
-
-            prev_success = success_now
-            if success_now:
-                succ = True
-                break
-        episode_steps = TASK_ENV.take_action_cnt
+        succ, episode_steps, episode_reward = rollout_episode(
+            TASK_ENV, model, eval_func, reset_func, use_step_reward,
+            on_observation=on_observation, on_step=on_step)
         episode_seed = now_seed
         episode_results["episode"].append(TASK_ENV.test_num)
         episode_results["seed"].append(episode_seed)
@@ -1310,25 +1575,83 @@ def eval_policy(task_name,
         # `save_critic` already folds in `train_critic`: a frozen critic is a byte-for-byte copy
         # of the checkpoint it was loaded from, so there is nothing to write. Announced only the
         # first time -- it happens every episode, and the `[critic]` line above already reports
-        # the update count that identifies which state was written.
+        # the update count that identifies which state was written. This is the *latest* file
+        # and it is written before the held-out evaluation below, which is what `promote_best_
+        # critic` then copies from -- the evaluation changes nothing about the critic, so the
+        # bytes are the same either way, but the copy needs the file to exist.
         if save_critic and online_critic is not None:
             save_critic_atomically(online_critic, critic_path)
-            # ... and keep a second copy of the best episode's critic. Until the MA window is
-            # full there is no average worth ranking on, so the best file simply follows the
-            # latest; after that it only moves on a strict improvement, which leaves the
-            # earliest critic to reach a plateau as the one kept.
-            if len(success_window) < ma_window:
-                promote_best_critic(critic_path, best_critic_path)
-            elif best_ma is None or success_rate_ma >= best_ma:
-                promote_best_critic(critic_path, best_critic_path)
-                best_ma, best_ma_episode = success_rate_ma, TASK_ENV.test_num
-                print(f"\033[96m[critic]\033[0m new best: MA{ma_window} success rate "
-                      f"{best_ma:.3f} -> {best_critic_path.name}")
             if not critic_ckpt_announced:
                 print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
                       f"{critic_path} (set `critic_ckpt` to it to resume this run); the best "
                       f"episode's critic is kept alongside it as {best_critic_path.name}")
                 critic_ckpt_announced = True
+
+        # ===== Periodic held-out evaluation =====
+        # Every `eval_interval` episodes, score the current policy + critic on the fixed
+        # `eval_seed` episode set, frozen. This is the only place `best_score` gets a number
+        # when the evaluation is on, so between evaluations the best checkpoint simply does not
+        # move.
+        holdout_score = None
+        if eval_interval and TASK_ENV.test_num % eval_interval == 0:
+            if holdout_seeds is None:
+                holdout_seeds = find_holdout_seeds(
+                    TASK_ENV, args, eval_seed, eval_episodes, holdout_info_cache)
+            guidance = float(model.scheduled_guidance_scale()) if online_critic is not None else 0.0
+            updates = int(online_critic.num_updates) if online_critic is not None else 0
+            print(f"\033[96m[holdout]\033[0m episode {TASK_ENV.test_num}: evaluating "
+                  f"{len(holdout_seeds)} held-out episode(s) frozen "
+                  f"(critic updates={updates}, guidance={guidance:.4g})")
+            holdout_score, holdout_successes, holdout_reward, holdout_steps = run_holdout_eval(
+                TASK_ENV, args, model, eval_func, reset_func, holdout_seeds, holdout_info_cache,
+                instruction_type, use_step_reward, test_num, eval_seed)
+            print(f"\033[96m[holdout]\033[0m episode {TASK_ENV.test_num}: "
+                  f"\033[95m{holdout_successes}/{len(holdout_seeds)}\033[0m "
+                  f"=> \033[95m{round(holdout_score * 100, 1)}%\033[0m "
+                  f"(reward {holdout_reward:.3f}, {holdout_steps:.0f} steps mean)")
+            append_holdout_row(save_dir / HOLDOUT_CSV, {
+                "episode": TASK_ENV.test_num,
+                "critic_updates": updates,
+                "guidance_scale": guidance,
+                "episodes": len(holdout_seeds),
+                "successes": holdout_successes,
+                "success_rate": holdout_score,
+                "reward_mean": holdout_reward,
+                "steps_mean": holdout_steps,
+            })
+            if wandb_run is not None:
+                wandb_run.log({
+                    "eval/episode": int(TASK_ENV.test_num),
+                    "holdout/success_rate": float(holdout_score),
+                    "holdout/successes": int(holdout_successes),
+                    "holdout/episodes": int(len(holdout_seeds)),
+                    "holdout/reward_mean": float(holdout_reward),
+                    "holdout/steps_mean": float(holdout_steps),
+                    "holdout/critic_updates": updates,
+                })
+
+        # ... and keep a second copy of the best episode's critic, on whichever criterion is in
+        # force. With `eval_interval` on that is the held-out success rate and it exists only on
+        # the episodes an evaluation just ran; with it off it is the training episodes' moving
+        # average, which is only meaningful once the window has filled (a mean over one or two
+        # episodes makes a single early success read as 1.0, which no honest window can beat, and
+        # would freeze "best" at episode 1). Until the criterion has produced anything the best
+        # file just follows the latest, so a run killed early leaves both files valid.
+        if save_critic and online_critic is not None:
+            if eval_interval:
+                score, criterion = holdout_score, f"held-out success rate ({eval_episodes} ep)"
+            elif len(success_window) >= ma_window:
+                score, criterion = success_rate_ma, f"MA{ma_window} success rate"
+            else:
+                score, criterion = None, None
+            if score is None:
+                if best_score is None:
+                    promote_best_critic(critic_path, best_critic_path)
+            elif best_score is None or score >= best_score:
+                promote_best_critic(critic_path, best_critic_path)
+                best_score, best_score_episode, best_criterion = score, TASK_ENV.test_num, criterion
+                print(f"\033[96m[critic]\033[0m new best: {criterion} "
+                      f"{best_score:.3f} -> {best_critic_path.name}")
         write_resume_state(save_dir, {
             "episodes": succ_seed,
             "successes": TASK_ENV.suc,
@@ -1344,10 +1667,18 @@ def eval_policy(task_name,
             # from `critic_ckpt`. Restored on resume so the ramp continues rather than
             # restarting against the run's own checkpoint (see the resume block in `main`).
             "critic_ramp_baseline": int(getattr(model, "critic_ramp_baseline", 0)),
-            # The bar `online_value_critic_best.pkl` currently holds, so a resumed run keeps
-            # comparing against it rather than replacing it with its own first episode.
-            "best_success_rate_ma": best_ma,
-            "best_success_rate_ma_episode": best_ma_episode,
+            # The bar `online_value_critic_best.pkl` currently holds, and what it is a bar on,
+            # so a resumed run keeps comparing against it rather than replacing it with its own
+            # first episode. `best_success_rate_ma` is the name the same field had before the
+            # held-out evaluation existed; it is still written so an older reader keeps working.
+            "best_score": best_score,
+            "best_score_episode": best_score_episode,
+            "best_score_criterion": best_criterion,
+            "best_success_rate_ma": best_score,
+            "best_success_rate_ma_episode": best_score_episode,
+            # The held-out episode set, so a resume scores on the same episodes the numbers
+            # already in `_holdout_results.csv` were measured over.
+            "holdout_seeds": holdout_seeds,
             "wandb_run_id": wandb_run.id if wandb_run is not None else None,
         })
 

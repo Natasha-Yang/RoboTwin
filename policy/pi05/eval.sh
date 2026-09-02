@@ -57,7 +57,9 @@ overrides=()
 [ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
 # Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
 # positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
-# without editing the yml (and so without steering a concurrent eval into that run's directory).
+# without editing the yml (and so without steering a concurrent eval into that run's directory),
+# and the periodic held-out evaluation that picks the best critic checkpoint
+# (`--eval_interval 20 --eval_episodes 10 --eval_seed 7`; `--eval_interval 0` turns it off).
 # `env_seed` is deliberately NOT among them: it is a task-config key, so that one file decides
 # the environment for collection and eval alike (see task_config/_config_template.yml).
 [ "$#" -gt 12 ] && overrides+=("${@:13}")

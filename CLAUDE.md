@@ -684,7 +684,8 @@ Evaluation is driven by `script/eval_policy.py`, configured by each policy's
 loop does an expert-feasibility check per seed, then runs the policy and optionally
 logs video (`eval_video_log`). Results go to
 `eval_result/<task>/<policy>/<config>/<ckpt>/<timestamp>/` (`_result.txt`,
-`_episode_results.csv`, videos, and `debug_vis/` when the task config sets `debug`).
+`_episode_results.csv`, `_holdout_results.csv` when `eval_interval` is on (§5a.1), videos, and
+`debug_vis/` when the task config sets `debug`).
 
 Alongside those, each run snapshots `deploy_policy.yml` and the `critic_config_path`
 file it includes into the result dir (`script/eval_policy.py::snapshot_config`). The
@@ -736,7 +737,9 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
 - Camera → model mapping (in `deploy_policy.py::encode_obs` / `pi_model.py`):
   `head_camera → cam_high`, `left_camera → cam_left_wrist`, `right_camera → cam_right_wrist`.
 - Results land in `eval_result/<task_name>/<policy_name>/<task_config>/<ckpt_setting>/<timestamp>/`.
-  Alongside `_result.txt` / `_episode_results.csv`, each run snapshots `deploy_policy.yml` and the
+  Alongside `_result.txt` / `_episode_results.csv` (and `_holdout_results.csv`, the periodic
+  frozen held-out score that picks the best critic checkpoint — §5a.1), each run snapshots
+  `deploy_policy.yml` and the
   `critic_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
   The copies keep their comments but carry the values **actually used** — `eval.sh`'s positional
   args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
@@ -784,7 +787,8 @@ the same directory, since it rewrites its own `resume_state.json` every episode 
 | episode rows + MA windows | `_episode_results.csv` | reloaded so the averages continue across the break |
 | critic params, target, **Adam state, LR schedule position** | `online_value_critic.pkl` | see below |
 | guidance ramp position | `critic_ramp_baseline` in `resume_state.json` | see below |
-| best-checkpoint bar | `best_success_rate_ma` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
+| best-checkpoint bar | `best_score` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
+| held-out seed set | `holdout_seeds` in `resume_state.json` | re-searching costs an expert rollout per rejected seed, and a different set would not be comparable with the scores already in `_holdout_results.csv` (§5a.1) |
 | W&B run | `wandb_run_id` → `resume="allow"` | keeps the critic curves one continuous series |
 
 The optimizer half needed a change in `multisensory_steering`: `OnlineValueCritic.save` now
@@ -1075,27 +1079,114 @@ checkpoint's own counter, which is right precisely because those updates did hap
 **Two files, not one.** `online_value_critic.pkl` is the run's *state* — whatever the last
 episode left, which is what a resume must pick up — but online TD on a few thousand correlated
 transitions is not monotone, so the last episode is generally not the run's best. Alongside it,
-`online_value_critic_best.pkl` holds the critic as of the episode with the highest
-`success_rate_ma` (the `wandb_ma_window`-episode moving average, the same number the csv and the
-W&B curve carry). That is the one to point a later `critic_ckpt` at when you want to *use* the
-critic — evaluate it frozen, warm-start another run — and the latest is the one to point at when
-you want to *continue* this run. Never resume from the best file: it would rewind the optimizer
-to an episode `_episode_results.csv` and `resume_state.json` already count as done.
+`online_value_critic_best.pkl` holds the critic as of the run's best-scoring episode. That is the
+one to point a later `critic_ckpt` at when you want to *use* the critic — evaluate it frozen,
+warm-start another run — and the latest is the one to point at when you want to *continue* this
+run. Never resume from the best file: it would rewind the optimizer to an episode
+`_episode_results.csv` and `resume_state.json` already count as done.
+
+**Which score "best" means is `eval_interval`'s (§5a.1).** With the periodic held-out evaluation
+on — the default in `deploy_policy.yml` — it is the success rate over a *fixed* set of episodes,
+re-measured with the critic frozen every `eval_interval` episodes. With `eval_interval: 0` it
+falls back to `success_rate_ma`, the `wandb_ma_window`-episode moving average over the training
+episodes themselves (the same number the csv and the W&B curve carry), which is what this used
+before.
 
 Both are written the same way, and the best one is a copy of the latest (which was pickled from
 the same object a moment earlier) rather than a second pickle, through the same temp-and-rename.
-Only the latest moves on the mid-episode cadence above — `success_rate_ma` is an episode-level
+Only the latest moves on the mid-episode cadence above — either criterion is an episode-level
 number, so there is nothing to rank a mid-episode critic against.
-Two details of "best": while the moving-average window is still **filling** the best file just
-tracks the latest — a mean over one episode makes a single early success read as a success rate
-of 1.0 that no honest 20-episode average could beat, which would freeze "best" at episode 1 —
-and once it is full only a **strict** improvement moves it, so a plateau keeps the earliest
-critic to reach it. The bar itself rides in `resume_state.json`
-(`best_success_rate_ma` / `best_success_rate_ma_episode`) so a resumed run keeps comparing
-against the pre-interruption best instead of replacing it with its own first episode; a state
-file written before 2026-08-29, or reconstructed by `resume_state_from_log.py`, has no such key
-and the bar starts over. This applies to whichever critic family is running — `eval_policy.py`
-only ever calls `online_critic.save`, so the DSRL critic (§5c) is checkpointed identically.
+Two details of "best": until the criterion has produced its **first** number the best file just
+tracks the latest (so a run killed early leaves both files valid) — for the moving average that
+is while the window is still filling, since a mean over one episode makes a single early success
+read as a success rate of 1.0 that no honest 20-episode average could beat, and for the held-out
+evaluation it is until the first one runs — and after that only an improvement moves it. The bar
+itself rides in `resume_state.json` (`best_score` / `best_score_episode` /
+`best_score_criterion`, also written under the old names `best_success_rate_ma` /
+`best_success_rate_ma_episode`, which is what a state file written before 2026-09-02 carries) so
+a resumed run keeps comparing against the pre-interruption best instead of replacing it with its
+own first episode; a state file written before 2026-08-29, or reconstructed by
+`resume_state_from_log.py`, has neither and the bar starts over. This applies to whichever critic
+family is running — `eval_policy.py` only ever calls `online_critic.save`, so the DSRL critic
+(§5c) is checkpointed identically.
+
+### 5a.1. The best-checkpoint criterion: periodic held-out evaluation (`eval_interval`)
+
+Every `eval_interval` completed episodes the run stops, re-plays a **fixed** set of
+`eval_episodes` episodes with the policy frozen, and scores it. That success rate is what decides
+which critic `online_value_critic_best.pkl` keeps.
+
+```yaml
+# policy/pi05/deploy_policy.yml
+eval_interval: 20    # completed episodes between evaluations; 0 = off
+eval_episodes: 10    # episodes per evaluation
+eval_seed: null      # where the held-out seed search starts; null = 100000*(1+seed) + 1000
+```
+
+It exists because `success_rate_ma` is a poor criterion for the thing it was being used to
+choose. The training episodes are the ones the critic just learned from, and each is a *different*
+seed — so the moving average moves with which seeds happened to come up about as much as with the
+critic, and two episodes of the run are never a repeat measurement of anything. A fixed held-out
+set is the same episodes every time, so two scores differ by the critic.
+
+**Frozen means frozen, and only the critic can move.** pi0.5 is frozen in every run;
+`PI0.frozen_for_eval` (a context manager `eval_policy.py` wraps the evaluation in) is what stops
+the *critic* moving: no transition is stashed into the replay buffer (`get_action`'s own stash
+needs its own switch — the driver's skipping `commit`/`train_step` is not enough), no TD update
+runs, and the DSRL warmup budget and its RNG do not advance. The guidance scale is deliberately
+left exactly where the ramp has it rather than jumping to the target the way
+`train_online: false` does: what is being scored is the policy as it behaves *right now*. The
+DSRL actor stays stochastic, as jaxrl2's own eval does. The debug recorders are switched off and
+their pending values cleared on the way out, so an evaluation's Q or best-of-N scores cannot be
+logged against the next training episode's first control step.
+
+**Fixed twice over.** The seeds are the first `eval_episodes` the scripted expert can solve
+counting up from `eval_seed` — the same feasibility gate the main loop applies
+(`run_expert_check`, now shared), so a held-out episode is one the task is known to be solvable
+from and the two success rates are comparable. That search is deterministic
+in `eval_seed`, and expensive (every rejected seed is a full expert rollout), so it runs once and
+the seed set is carried in `resume_state.json`. Separately, the `random` module is reseeded from
+`eval_seed` for the duration, so every evaluation draws the same language instructions in the
+same order — RoboTwin draws instructions from `random`, which nothing else seeds, so without this
+the "fixed" set would still be re-worded every time. Two evaluations of the same critic therefore
+differ only by the sampler's own noise.
+
+Nothing about the run leaks into an evaluation or back out of it: the global numpy and `random`
+states are saved and restored around it, `eval_video_save_dir` is dropped from the env args (the
+env writes head-camera frames into the run's ffmpeg pipe whenever that path is set, and there is
+no pipe here), and `TASK_ENV.suc` / `test_num` are untouched — a held-out episode is not one of
+the `test_num` episodes the run was asked for and gets no row in `_episode_results.csv`. It gets
+one in **`_holdout_results.csv`** instead (`episode`, `critic_updates`, `guidance_scale`,
+`episodes`, `successes`, `success_rate`, `reward_mean`, `steps_mean`) and a `holdout/*` group in
+W&B, logged against the training episode it ran after so the curve lines up with
+`eval/success_rate_ma`.
+
+`eval_seed` is an **actual seed**, not a `seed`-style block index, and defaults to
+`100000 * (1 + seed) + 1000` — the run's own block, 1000 seeds ahead of where it starts. That
+offset is the only thing keeping the two sets disjoint: the run walks its seeds upward one per
+*candidate*, not per episode, since the expert gate rejects some. It is comfortable at
+`test_num: 300`, and `eval_policy` prints a one-time warning if a run ever reaches it — after
+which the held-out episodes are episodes the critic trained on and the score stops being a clean
+measurement, though the run is otherwise fine.
+
+**No choice of `eval_seed` changes what the scene looks like**, which is worth stating because it
+is the obvious thing to worry about. Every draw that decides the environment — wall and table
+texture, light colors and the crazy-light flip, table height, head-camera jitter — comes off
+`_env_rng` (§3), which under a task config's `env_seed` is `RandomState(env_seed)` rebuilt
+identically at every `setup_demo`: a run with `env_seed` set renders the same room in every
+episode, held-out ones included, whatever their seeds are. With `env_seed: null` that generator
+*is* `np.random`, seeded from the episode's own seed, so the background already varies episode to
+episode within the run and one seed is as good as another — `randint(0, file_count)` over the
+same directory either way. Which pool that directory is stays
+`domain_randomization.background_texture_pool`'s business (§3), not this key's.
+
+**The cost is real**: `eval_episodes` extra rollouts every `eval_interval` episodes, plus one
+expert pass per held-out seed (once), so 10 every 20 makes a run roughly 50% longer.
+`eval_interval: 0` turns the whole thing off and restores the old criterion exactly.
+
+A run resumed after this landed keeps its seed set and its bar; one whose `resume_state.json`
+predates it re-derives the seed set on its next evaluation (deterministically, so it is the same
+set) and starts the bar over.
 
 `freeze_encoder` is implemented in `qmfm.py::freeze_encoder_tx` as an `optax.multi_transform`
 that zeroes the updates of everything under the params tree's `encoder` key, rather than as a

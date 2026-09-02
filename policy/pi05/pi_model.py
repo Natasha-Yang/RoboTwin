@@ -3,6 +3,7 @@
 """
 #!/usr/bin/python3
 """
+import contextlib
 import json
 import sys
 import jax
@@ -148,6 +149,13 @@ class PI0:
         # values. It only makes sense against a `critic_ckpt` (see below).
         self.uses_online_critic = bool(online_critic)
         self.train_critic_online = bool(train_critic_online)
+        # The second half of that switch, and the one a *held-out evaluation* flips: whether the
+        # control steps being run are collected at all. `train_critic_online` is a property of
+        # the run and never moves; this goes False for the duration of a `frozen_for_eval` block
+        # so the driver's periodic held-out episodes (eval_interval in deploy_policy.yml) score
+        # the critic without also feeding it -- they are a measurement of the current critic, and
+        # a critic that trained on its own test set could not be compared across evaluations.
+        self._collect_transitions = True
         self.online_critic = None
         self.critic_action_dim = None
         # Which family that critic is, and therefore how it acts on the sampler (CRITIC_TYPES).
@@ -631,6 +639,60 @@ class PI0:
         progress = min(1.0, updates / float(self.guidance_ramp_updates))
         return self.guidance_scale_target * progress
 
+    @contextlib.contextmanager
+    def frozen_for_eval(self):
+        """Run rollouts that measure this policy without changing it.
+
+        Used by the driver's periodic held-out evaluation (`eval_interval` in
+        deploy_policy.yml), which re-runs a fixed set of `eval_seed` episodes every so often and
+        makes the resulting success rate the criterion for which critic checkpoint is kept. That
+        only means anything if the evaluation is a pure measurement, so for the duration of the
+        block:
+
+        * **no transition is stashed** -- the driver already skips `commit`/`train_step`, but the
+          stash happens inside `get_action`, so it needs its own switch (`_collect_transitions`).
+          A critic that trained on its own held-out episodes would make successive scores
+          incomparable, and would leak 10 episodes of the fixed evaluation set into the buffer
+          every interval.
+        * **the guidance scale is left exactly where the ramp has it.** Deliberately not the
+          `train_critic_online: false` path, which jumps guidance straight to the target: what is
+          being scored is the policy as it behaves *right now*, not as a later frozen run would.
+        * **the DSRL warmup budget and its RNG do not advance.** `_warmup_noise` draws (and
+          counts down) once per control step, so without this a run with `noise_warmup_chunks`
+          set would spend its warmup on evaluation episodes, and every run's latent sequence
+          would depend on how many evaluations had happened.
+        * **the debug recorders are switched off and their pending values cleared on the way
+          out**, since `QValueRecorder.record` / `BestOfNRecorder.record` consume whatever the
+          last `get_action` left -- a value from an evaluation episode would otherwise be logged
+          against the first control step of the next training episode.
+
+        What is deliberately *not* frozen is the DSRL actor's stochasticity: `noise_apply` samples
+        rather than taking the distribution's mode, exactly as jaxrl2 does in its own eval, so an
+        evaluation sees the same policy the rollouts do.
+        """
+        state = (self._collect_transitions, self._noise_warmup_left,
+                 self._noise_rng.bit_generator.state,
+                 self.record_q_values, self.record_demo_retrieval)
+        self._collect_transitions = False
+        self.record_q_values = False
+        self.record_demo_retrieval = False
+        if self.demo_retriever is not None:
+            self.demo_retriever.record_retrieval = False
+        try:
+            yield
+        finally:
+            (self._collect_transitions, self._noise_warmup_left,
+             self._noise_rng.bit_generator.state,
+             self.record_q_values, self.record_demo_retrieval) = state
+            if self.demo_retriever is not None:
+                self.demo_retriever.record_retrieval = self.record_demo_retrieval
+            # Anything the evaluation's last control step left behind. These are read-and-clear
+            # on the driver's side, so a leftover would be attributed to the wrong episode.
+            self.last_q_values = None
+            self.last_best_scores = None
+            self.last_best_index = None
+            self.last_demo_retrieval = None
+
     # set img_size
     def set_img_size(self, img_size):
         self.img_size = img_size
@@ -830,7 +892,7 @@ class PI0:
         # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
         # skips this entirely -- nothing would ever train on the transitions, and the buffer
         # is allocated lazily, so it never costs the run any memory.
-        if self.train_critic_online:
+        if self.train_critic_online and self._collect_transitions:
             self.online_critic.stash(critic_obs, critic_action)
         if self.record_q_values:
             self.last_q_values = self.online_critic.q_values(critic_obs, critic_action)
