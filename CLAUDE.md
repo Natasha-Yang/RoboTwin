@@ -1533,6 +1533,15 @@ whatever family the agent acts in), the guidance ramp (nothing to ramp), and bes
 `freeze_encoder`, `critic_ckpt`, `restore_optimizer`, `save_critic`, the resume machinery,
 `use_step_reward` and the W&B/debug outputs all work exactly as they do for the QMFM critic —
 `script/eval_policy.py` keys off `model.online_critic` and never learns which family it got.
+So both DSRL runs write the same two files under the same names as a QMFM run —
+`online_value_critic.pkl` (latest, per episode and per `critic_save_every_updates` updates) and
+`online_value_critic_best.pkl` (the best `success_rate_ma` episode) — holding the actor and
+temperature alongside the critic, since `OnlineDSRLAgent.save` pickles all three. That said,
+`save_critic` defaults to **false** in `eval_policy.py`, so a run only checkpoints because its
+critic config turns it on: `cfgs/dsrl.yaml` and `cfgs/dsrl_low_rank.yaml` set `save_critic: true`
+as `cfgs/qmfm.yaml` does, and did not until 2026-09-01 — DSRL runs before that finished with
+nothing on disk and every TD update they paid for lost. Check the key is there before starting a
+long run under a new critic config.
 The per-update W&B log now forwards whatever keys the update reported, so a DSRL run's
 `critic/actor_loss`, `critic/entropy`, `critic/temperature` and `critic/policy_std_mean` appear
 alongside the shared TD curves. `debug: true` still writes `q_episode<N>.*` — the Q plotted there
