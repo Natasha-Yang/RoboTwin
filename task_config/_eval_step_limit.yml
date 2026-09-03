@@ -51,3 +51,8 @@ turn_switch: 400
 insert_peg_socket_loose: 500
 insert_peg_socket_med: 500
 insert_peg_socket_tight: 500
+insert_peg_socket_round_med: 500
+put_battery_slot: 500
+put_book_bookcase: 500
+insert_knife_cover: 600
+put_dumbbell_rack: 500
