@@ -65,9 +65,23 @@ overrides=()
 [ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
 # Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
 # positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
-# without editing the yml (and so without steering a concurrent eval into that run's directory).
+# without editing the yml (and so without steering a concurrent eval into that run's directory),
+# and the periodic held-out evaluation that picks the best critic checkpoint
+# (`--eval_interval 20 --eval_episodes 10 --eval_seed 7`; `--eval_interval 0` turns it off).
+# `env_seed` is deliberately NOT among them: it is a task-config key, so that one file decides
+# the environment for collection and eval alike (see task_config/_config_template.yml).
 [ "$#" -gt 12 ] && overrides+=("${@:13}")
 
+# Required. An empty gpu_id would `export CUDA_VISIBLE_DEVICES=`, which CUDA reads as "no
+# devices" -- and curobo builds a CUDA tensor as a default argument in motion_gen.py, i.e. at
+# import, so it then dies with "No CUDA GPUs are available". envs/robot/planner.py swallows that
+# and reports "check if Curobo is installed correctly", which sends you after the wrong problem
+# entirely. Fail here instead, where the cause is still legible.
+if [ -z "${gpu_id}" ]; then
+    echo -e "\033[31meval.sh: missing gpu_id (6th argument)\033[0m" >&2
+    echo "usage: bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> [...]" >&2
+    exit 1
+fi
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 

@@ -202,14 +202,34 @@ On the **login node**:
 bash script/_download_assets.sh   # downloads + unzips assets, then fixes paths
 ```
 
-**The peg-insertion socket is generated, not downloaded.** `assets/*` is gitignored, so the
-`121_peg-socket` mesh used by `insert_peg_socket_{loose,med,tight}` (§3.5) is produced by a
+**The peg-insertion assets are generated, not downloaded.** `assets/*` is gitignored, so the
+three meshes the peg-insertion tasks use (§3.5) — `121_peg-socket` (square bore),
+`122_peg-round` (round peg) and `123_peg-socket-round` (round bore) — are produced by one
 checked-in script rather than shipped. Run it once per clone / cluster, on a login node or
 anywhere — it needs no GPU:
 
 ```bash
 python script/gen_peg_socket_asset.py --verify
 ```
+
+One command writes all of them, and the task module raises at import if **any** is missing.
+
+A **second** generator does the same job for the four tasks in §3.6:
+
+```bash
+python script/gen_task_assets.py --verify
+```
+
+It both **generates** two receptacles nothing in the library provides (`124_knife-cover`,
+`125_battery-slot`) and **annotates, in place**, four shipped assets that are unusable as they
+stand. That second job is worth knowing about: **24 of the ~121 shipped assets carry only
+`{stable, center, extents}`** in their `model_data*.json` — no `scale`, no contact points, no
+functional points. That is not a soft failure. `create_actor` swallows the missing `scale` in a
+bare `except` (`envs/utils/create_actor.py:531`), leaves `scale` at its `(1,1,1)` default and
+sets `model_data=None`, so the asset loads at its **raw ~1.9 m size** and every
+`get_contact_point` / `get_functional_point` returns `None`. Three of the four tasks below
+depend on exactly such assets. Re-running `script/_download_assets.sh` restores the shipped
+files and reverts the annotation — re-run the generator afterwards.
 
 `--verify` loads each variant in a headless SAPIEN scene and asserts the geometry survived.
 That check is not optional paranoia: SAPIEN's actor builder swallows collision-shape cook
@@ -301,6 +321,83 @@ new one from the template:
 bash task_config/create_task_config.sh <my_config>   # copies _config_template.yml
 # then edit task_config/<my_config>.yml
 ```
+
+**`env_seed` — one scene for a whole run.** Every episode is normally seeded by its own
+`seed`, and *everything* random is drawn from that one stream: not just where the objects
+land but what the room looks like. `env_seed` (top-level in the task config, next to
+`episode_num`) splits the two. With it set, the draws that decide **scene appearance** —
+wall and table texture, directional/point light colors and the crazy-light coin flip, table
+height, head-camera jitter — come from a generator seeded with `env_seed` instead, rebuilt
+identically at the start of every episode, while `load_actors` keeps drawing object poses
+from the episode's own `seed`. So a run holds the environment fixed and varies only the task
+objects, which is the comparison you usually want when the background is randomized.
+
+| | drawn from |
+|---|---|
+| wall / table texture, `clean_background_rate` flips | `env_seed` |
+| directional + point light colors, `crazy_random_light_rate` flip, and the per-frame crazy-light jitter | `env_seed` |
+| `random_table_height` → `table_z_bias` | `env_seed` |
+| `random_head_camera_dis` jitter | `env_seed` |
+| object poses (`load_actors`), cluttered-table objects | the episode `seed` |
+
+Clutter is deliberately on the episode stream: `get_cluttered_table` rejection-samples
+against `prohibited_area`, which moves with the task objects, so it could not be held fixed
+even in principle.
+
+`null` (the default everywhere) is the original behaviour to the byte — with no `env_seed`
+the generator *is* `np.random`, so the draw order and every value are unchanged. Setting it
+does shift the global stream, since the scene draws no longer consume it, so a given episode
+`seed` places objects differently than the same seed would without `env_seed`. That is
+inherent to splitting the streams; it means an `env_seed` run is not comparable episode-by-
+episode with a non-`env_seed` one, only within itself.
+
+**It lives in the task config and nowhere else**, and that is the point: `collect_data.py`,
+`eval_policy.py` and `collect_dataset.py` all read the same key out of the same file (`args`
+→ `_init_task_env_`), so collecting demos and then evaluating under one task config puts the
+policy in the environment its demonstrations were recorded in. No driver has a flag of its own
+that could drift from it — there is deliberately no `--env_seed`, and no key in
+`deploy_policy.yml` / `collect_dataset.yml`. Both banners print the value in force.
+
+**`env_seed` fixes *which* texture is drawn, not which pool it comes from** — that is
+`domain_randomization.background_texture_pool`, and it is the one thing you must set as well to
+make an eval render the same background as collection. `create_table_and_wall` normally draws
+from `assets/background_texture/seen/` when collecting and from `unseen/` under `eval_mode`,
+RoboTwin's held-out split, to test generalisation to backgrounds the policy never trained on.
+The two pools are not even the same size (10000 vs 1000), so the same generator state cannot
+name the same file across them.
+
+| `background_texture_pool` | collecting | eval |
+|---|---|---|
+| `null` (default) | `seen/` | `unseen/` — the held-out split, untouched |
+| `seen` | `seen/` | `seen/` |
+| `unseen` | `unseen/` | `unseen/` |
+
+Naming a pool applies it to **both** sides, which is what makes one `env_seed` pick the same
+file on each. Anything else raises at startup rather than falling back. Both banners print the
+resolved pool (through the env's own `resolve_background_texture_pool`, so they cannot disagree
+with the scene), and the eval banner additionally flags the one combination that surprises: a
+pinned `env_seed` with the split still in force, where the background differs from the demos'
+even though everything else matches.
+
+Measured, `beat_block_hammer` at `env_seed: 7`, collect path vs eval path:
+
+| `background_texture_pool` | wall / table texture |
+|---|---|
+| `null` | collect `seen/6015`,`seen/8583` vs eval `unseen/895`,`unseen/391` — **differ** |
+| `seen` | `seen/6015`, `seen/8583` on both sides — match |
+| `unseen` | `unseen/895`, `unseen/391` on both sides — match |
+
+Table height, every light color, the crazy-light flip and the head-camera pose match at equal
+`env_seed` in all three rows — the pool is the only thing this key decides. So `env_seed: 7`
+plus `background_texture_pool: seen` makes the eval environment the collection environment
+exactly; `env_seed` alone holds everything but the background fixed.
+
+`collect_data.py` additionally writes an `env_seed.txt` marker into the run's `save_path` and
+**refuses to start** if a later run into that same directory asks for a different `env_seed`
+(`check_env_seed_marker`). Collection resumes from `seed.txt` and replays *cached* joint
+trajectories, and `env_seed` moves the table under them — the result would be a directory of
+demos that silently disagree with each other rather than a crash. A directory collected before
+the marker existed has none and is left alone.
 
 ### 3.1 Single task (interactive / one GPU)
 
@@ -401,12 +498,13 @@ Two consequences worth knowing:
 - A config with `save_freq: null` has no frame cadence to stack against, so the wrench is left
   out rather than stored ragged.
 
-### 3.5 The peg-insertion ladder (`insert_peg_socket_{loose,med,tight}`)
+### 3.5 The peg-insertion tasks (`insert_peg_socket_*`)
 
-Three registered tasks added by this fork, and the only **clearance fit** in the task set —
+Four registered tasks added by this fork, and the only **clearance fits** in the task set —
 every shipped RoboTwin task is a pick-and-place, hang, press or stack, where contact force is
-incidental. Here it is the signal, which is what makes it the task to point a `wrench.*`
-critic at (§5a, §6.1).
+incidental. Here it is the signal, which is what makes them the tasks to point a `wrench.*`
+critic at (§5a, §6.1). Three are a square-peg difficulty ladder; the fourth is the round-peg
+counterpart of its middle rung (§3.5.1).
 
 One arm grasps a standing 40 x 40 x 120 mm peg (a `create_box` primitive, so its contact and
 functional points come for free) and inserts it into a static socket's chamfered square blind
@@ -453,9 +551,25 @@ symmetric peg is up to a 90° wrist swing for a geometric no-op — and near 180
 `get_align_matrix` hits its `||v1 x v2|| < 1e-6` branch and silently returns identity, i.e.
 no correction at all.
 
-`step_reward()` is the sum of two clipped deltas (closing on the bore axis, then depth into
-it), so a critic gets shaped progress; `check_success` is depth > 30 mm of the 38 mm bore,
-which is unreachable outside the hole.
+`step_reward()` gives a critic shaped progress as a sum of four terms: a **one-time 0.1** the
+first time the peg is correctly grasped (gripper commanded closed, in contact with the peg, on
+its upper half, peg still upright), plus three clipped deltas — closing on the **bore axis**,
+depth **into** the bore, and uprightness **while inserted**. Every delta is symmetric, so undoing
+progress refunds it and nothing ratchets. Three details carry it:
+
+- **Depth only counts inside the bore** (tip within `ALIGN_RADIUS` = the 10 mm `SUCCESS_LATERAL`
+  of the bore axis). `depth` on its own is the signed distance below the mouth *plane*, which
+  spans the whole table, so a peg standing anywhere beside the socket reads a full bore's worth
+  — which used to make the shaping penalise lifting the peg and pay for setting it back down.
+- **Approach is the lateral offset only** — height is deliberately left out, so lifting the peg
+  is worth exactly 0 rather than reading as moving away from the mouth. The cost is a dead zone:
+  the descent from the pre-insert waypoint down to the mouth plane earns nothing, since the depth
+  term does not switch on until the tip is inside the bore.
+- **Uprightness is only live inside the bore**, and its previous value is dropped on the way out,
+  so re-entering measures from the value on entry rather than paying the whole cosine at once.
+
+`check_success` is unchanged: depth > 30 mm of the 38 mm bore, which is unreachable outside the
+hole.
 
 **Reading the wrench on this task — the two families mean different things, and the arm sums
 are the ones that see the insertion.** The fingers squeeze in opposition, so grip preload
@@ -473,6 +587,187 @@ So `loose` is effectively a **contact-free control condition** — at 6 mm clear
 touches the bore — while `tight` binds hard (one demo peaked at 97 N). A critic given only
 `wrench.{fl,fr}_link*` will mostly see grip preload; give it `wrench.{left,right}` too, or
 instead, if what you want is the interaction force.
+
+#### 3.5.1 The round rung (`insert_peg_socket_round_med`)
+
+A cylindrical peg in a round bore, and otherwise `insert_peg_socket_med` to the millimetre:
+same 120 mm peg length, same 40 mm width across the fit (the cylinder inscribes in the
+square), same 0.10 x 0.10 x 0.05 socket block, same 0.038 m bore depth, same 3.0 mm clearance
+per side, same 6 mm 45° lead-in, same spawn ranges, same expert, same grasp band. The
+cross-section of the fit is the only difference, so a difference in outcome is attributable to
+it. It is one task, not a ladder — the generator writes all three round rungs (`model_id`
+0/1/2, the same clearances), so adding `_round_loose` / `_round_tight` is one ten-line file
+each on the model of `envs/insert_peg_socket_round_med.py`.
+
+Two assets instead of one. A box gets contact and functional points from `create_box` for
+free; there is no such primitive for a cylinder (`create_cylinder` returns a bare `Entity`
+with no Actor data, and its long axis is X, not Z), so **`122_peg-round`** is a mesh whose
+`model_data0.json` reproduces the box's points exactly — the same two functional points at
+±60 mm and the same 8 contact points, 4 per band at the same azimuths and the same
+±0.7 · half-length. `contact_point_id=[0,1,2,3]` therefore means the same upper band on either
+peg and the two tasks grasp identically. A cylinder would happily take eight azimuths per
+band; matching the box is the deliberate choice, so the grasp phase is not a confound.
+
+**`123_peg-socket-round`** is the socket. An annulus is not convex, so its wall is cut into
+**32 angular wedges** (plus the floor: 33 convex pieces) rather than the square's four slabs.
+Each wedge is the convex hull of the same pentagon profile swept between two boundary rays, so
+its inner face is a **chord**, not an arc — the collision bore is really a regular 32-gon. The
+radii are scaled by `1/cos(π/32)` so the polygon **circumscribes** the nominal circle: the
+narrowest point of the bore is then exactly the nominal clearance and the faceting can only
+ever add room, at most **0.11 mm** — 3.7% of this rung's clearance, and far below the ~1.3 mm
+placement error the expert actually has. Wedge boundaries start at 45° so the outer square's
+corners land on them and each wedge meets exactly one square edge, which is what keeps the
+hull equal to the wedge instead of cutting a corner off. `--verify` asserts the fit directly:
+the bore must be clear at the nominal radius at every azimuth and solid 3 mm beyond it.
+
+**No yaw to get right**, and that is the substantive difference. The square task must rotate
+the peg onto one of the bore's four symmetry axes before descending; every yaw seats a
+cylinder, so the round task sets `place_constrain = "free"`, which aligns the peg's axis with
+the bore's by the minimal rotation and imposes nothing about rotation *around* it. That is the
+same argument that made the square peg offer four axes instead of one, taken to its limit, and
+it removes the `get_align_matrix` near-antiparallel discontinuity outright rather than merely
+steering around it. The clearance is also isotropic — a square peg in a square bore has 3.0 mm
+at the flats but 4.2 mm on the diagonal and can wedge on two corners; a round fit has 3.0 mm
+everywhere, which is the classical peg-in-hole geometry.
+
+Measured, and the two tasks are interchangeable where it matters:
+
+| | square med | round med |
+|---|---|---|
+| capture radius (peg released 5 mm above the mouth) | 8 mm | 8–10 mm |
+| expert yield, `demo_smoke` 10 episodes | 10/12 | 10/12 |
+| seeds the expert failed | 0, 1 | 0, 1 — **the same ones** |
+
+The shared failure set is the same grasp-phase plan failure the square ladder has, so eval's
+expert-feasibility gate selects the same seeds on both and success rates compare directly.
+
+**The wrench does not carry over, and this is the one thing to know before pointing a critic
+at it.** §3.5's rule — links are grip preload, arm sums are external contact — holds because
+two flat fingers on a flat face press in exact opposition and cancel in the sum. A cylinder
+has no face to align the fingers to: it settles wherever contact friction stops it, generally
+slightly off-centre, and the two normals come out **~14° from opposed**. Mid-carry, one demo:
+
+| | `fl_link7` | `fl_link8` | arm sum |
+|---|---|---|---|
+| square med | (−27.8, 5.1, 0.0) N | (27.8, −5.1, 0.0) N | **0.05 N** |
+| round med | (−21.6, 15.7, −0.3) N | (24.4, −10.0, 0.3) N | **6.4 N** |
+
+So the round task's `wrench.{left,right}` is **not** a near-zero-baseline external-contact
+channel: it sits on a flat ~6.4 N plateau for the whole carry, from grasp to release. It is
+still usable — the plateau is genuinely flat and remarkably episode-consistent (peak over 5
+demos: 6.42–6.73 N, σ 0.11 N, against the square rung's 0.52–9.02 N, which varies with whether
+that episode's peg caught a corner) — so external contact still reads as a deviation on top of
+it. But a critic cannot treat "arm sum ≈ 0" as "not touching anything", and the round task's
+absolute arm-sum numbers are not comparable with the square ladder's. `wrench/<link>` behaves
+as before: a ~27 N plateau that swamps the insertion.
+
+### 3.6 Four more receptacle tasks (dumbbell rack, bookcase, knife cover, battery slot)
+
+Added alongside the peg family, and sharing its shape: an object is grasped and put into (or
+onto) a static receptacle. Their assets come from `script/gen_task_assets.py` (§1.4), which
+must be run once per clone. **Not all four work** — the table says exactly where each stands,
+because a task that never succeeds is not a harmless no-op: the seed loop in `collect_data.py`
+is **uncapped**, so putting an unvalidated task into `collect_all_data.sh` /
+`submit_all_data.sh` spins forever rather than failing. Check the status column before adding
+one to a bulk run.
+
+| task | fit | assets | status |
+|---|---|---|---|
+| `put_battery_slot` | 31 mm cell in a 37 mm bore, **3.0 mm/side** | `061_battery/base1` (annotated) + `125_battery-slot` (generated) | **works** — clean insertions measured at 0.4 mm lateral, 39 mm of a 40 mm bore, uprightness 0.997. Yield needs raising (see below) |
+| `put_book_bookcase` | 32 mm book in a 44 mm bay, **6.0 mm/side** | `014_bookcase/base3` (annotated) + `043_book/base0` (rescaled, top-down grasp, bottom-edge point) | **works** — 4/8, seated to 1.7 mm with 0.8–2.9 mm lateral |
+| `insert_knife_cover` | 6.3 x 43.5 mm blade in a 10.3 x 47.5 mm slot, **2.0 mm/side** | `034_knife/base0` (rescaled, blade-tip point) + `124_knife-cover` (generated) | **0/6**, instruction JSON parked as `.json.disabled`. Assets verified; the expert does not plan and some seeds still eject the knife — see below |
+| `put_dumbbell_rack` | place-on | `052_dumbbell` + `013_dumbbell-rack/base0` (annotated) | **0/4 — blocked on the asset**, see below. Its instruction JSON is parked as `.json.disabled` so `collect_all_data.sh` does not sweep it up |
+
+All three insertions reuse the peg family's two idioms verbatim, for the reasons
+`envs/_peg_insertion_base.py` documents: a **hand-built two-stage constrained descent**
+(`place_actor` emits bare `Action(arm, "move", …)` with no `constraint_pose`, and the planner
+is free to bow the path by more than the clearance), and an explicit **`align_axis` list** so
+`get_align_matrix` never reaches its `‖v1 × v2‖ < 1e-6` branch, where it silently returns
+identity.
+
+**`put_battery_slot` yield, and what the failures are.** Against the peg family's ~75% this
+is low, but the successes are unambiguous: fully seated (39 mm of a 40 mm bore), lateral under
+half a millimetre, uprightness 0.997. Almost every failure is the **final constrained
+descent**, and it fails in a very specific state — the cell already hanging over the mouth
+aligned to **0.2 mm**, gripper closed, and curobo simply will not plan the last 43 mm with the
+orientation pinned. Things tried and measured: removing the `constraint_pose` on that leg
+(no better — the failure just moves later), shortening it via `NEAR_INSERT_DIS` (6 mm vs
+15 mm, no better), and narrowing the cell's `xlim` (helps the *grasp* failures, not this).
+What is left is the receptacle's y: the peg family puts its socket at **positive** y and the
+identical descent plans there, so that is what the slot now uses.
+
+**The reach trap, which cost both of the tasks that failed to plan.** `get_grasp_pose` stands
+the end-effector **0.12 m** back from the contact point along the approach direction
+(`_base_task.py:1200`), and `pre_grasp_dis` adds to that. So a *side* grasp of an object near
+the edge of its spawn range puts the pre-grasp pose ~0.2 m further out again — around
+|x| = 0.45 m for a book at x = −0.26, well outside the arm's reach — and the grasp fails to
+plan on every seed while the goal pose itself is perfectly reachable in isolation. Two fixes,
+both used here: annotate a **top-down** grasp instead (what took `put_book_bookcase` from 0/8
+to 4/8), or narrow the object's `xlim` (`put_battery_slot` is at ±0.22, not the peg family's
+±0.26). The same trap has a second form on the *place* side: a receptacle at **positive** y
+(away from the robot) was unplannable to carry an object out to, while the identical goal was
+reachable from the home pose — the shipped receptacle tasks all put theirs at negative y
+(`place_object_stand` uses `[-0.15, -0.1]`), and matching that fixed it.
+
+**`check_stable` does not catch an object that is launched.** It settles the scene and then
+flags only a **quaternion** change over the last samples (`_base_task.py:228-256`) — position
+drift is never checked. So a spawn pose that intersects the table produces an object PhysX
+ejects at high speed with its orientation intact, and the episode proceeds normally with the
+object metres away. Measured while debugging `insert_knife_cover`: a wrong spawn quaternion
+stood the 192 mm knife on end at a height meant for its 6 mm half-thickness, and it came to
+rest **42 m** from the table without a single warning. If a task fails in a way that makes no
+sense, print the actor's world position first. (The specific trap there: `[0.5, 0.5, 0.5, 0.5]`
+and `[0.5, -0.5, -0.5, -0.5]` are the two 120° rotations about (1,1,1) and they cycle the axes
+in *opposite* directions.)
+
+**One annotation bug worth remembering**, because it will recur with any objaverse-derived
+asset: the battery's long axis is its local **+Y**, not +Z. These assets are modelled +Y up —
+which is why every task spawns them with `qpos=[0.707, 0.707, 0, 0]` — so an uprightness test
+written as `get_face_prod(q, [0,0,1], [0,0,1])` reads ~0 for a *perfectly upright* object and
+rejects every success. It has to be `[0,1,0]`. Insertions were seating perfectly and scoring
+as failures until that was fixed.
+
+**`insert_knife_cover` is one of the two that do not work.** Its assets are fine and its
+spawn is now sane, but most seeds fail to plan and some still eject the knife. The cause most
+likely left is that the knife is 192 mm long while the spawn's separation test compares only
+actor **origins** at 0.15 m, so a knife pointing at the cover can still spawn intersecting it
+— a length-aware test and a wider gap are the next things to try. It is the hardest of the
+four geometrically: a long thin object going into a receptacle that has to lie on its side so
+the knife never needs re-orienting.
+
+**`put_dumbbell_rack` is the other, and there the blocker is the asset itself.** A
+dumbbell was dropped onto the rack over a 132-pose grid (both orientations, full width and
+depth, two drop heights): exactly **6** poses came to rest on it, all six the same
+configuration — bar perpendicular to the rack, straddling both rails, at a single depth
+offset. Everything else ends on the floor. `013_dumbbell-rack`'s tiers are narrow inclined
+ridges, not shelves (`base1`'s top rail is a **9 mm knife edge** at usable scale), so the
+target is a line rather than a surface. The expert does reach the cradle — the dumbbell has
+been observed at cradle height mid-episode — but releasing flush interpenetrates the rack and
+ejects the dumbbell off the table, while releasing above it lands off the line. Remaining
+options: a deeper cradle (another variant, or scaling the rack up so the ridge spacing exceeds
+the weight diameter), or a success criterion that does not require the dumbbell to stay put.
+
+**Not added: "use a shovel to flip a flat item."** `082_smallshovel` is annotated and usable,
+but the task is a different *class* from anything in this repo and nothing in the expert API
+expresses it. Three things stand in the way, in order of how hard they are to move:
+
+1. **The whole framework is prehensile and quasi-static.** All 50 shipped tasks are grasp →
+   move → place/press. The single tool-use precedent, `beat_block_hammer`, scores success by
+   **proximity + contact** (`abs(hammer_fp − block_fp) < 0.02` and `check_actors_contact`) —
+   never by a physical outcome of the strike. There is no primitive that expresses "scoop" or
+   "flip"; `grasp_actor` / `place_actor` / `move_by_displacement` are waypoint calls.
+2. **The blade cannot get under a flat item.** Measured on the *collision* mesh (what physics
+   sees, after convex decomposition rounds the edge): the leading edge is **8.2–12.1 mm**
+   thick across the three variants. An item lying flush on the table presents a zero gap, and
+   PhysX's default 0.01 m contact offset is the same order as the blade itself.
+3. **Replay.** `collect_data.py:252` asserts `check_success()` again on the replay pass, and a
+   dynamic flip is the least reproducible thing to re-execute.
+
+It becomes tractable if the task is redefined — a chamfered or raised item the blade can wedge
+under, or a `beat_block_hammer`-style proximity score instead of a physical flip — but that is
+a different task from the one asked for, so it was left out rather than quietly substituted.
+
+---
 
 ---
 
@@ -695,7 +990,8 @@ Evaluation is driven by `script/eval_policy.py`, configured by each policy's
 loop does an expert-feasibility check per seed, then runs the policy and optionally
 logs video (`eval_video_log`). Results go to
 `eval_result/<task>/<policy>/<config>/<ckpt>/<timestamp>/` (`_result.txt`,
-`_episode_results.csv`, videos, and `debug_vis/` when the task config sets `debug`).
+`_episode_results.csv`, `_holdout_results.csv` when `eval_interval` is on (§5a.1), videos, and
+`debug_vis/` when the task config sets `debug`).
 
 Alongside those, each run snapshots `deploy_policy.yml` and the `critic_config_path`
 file it includes into the result dir (`script/eval_policy.py::snapshot_config`). The
@@ -747,7 +1043,9 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
 - Camera → model mapping (in `deploy_policy.py::encode_obs` / `pi_model.py`):
   `head_camera → cam_high`, `left_camera → cam_left_wrist`, `right_camera → cam_right_wrist`.
 - Results land in `eval_result/<task_name>/<policy_name>/<task_config>/<ckpt_setting>/<timestamp>/`.
-  Alongside `_result.txt` / `_episode_results.csv`, each run snapshots `deploy_policy.yml` and the
+  Alongside `_result.txt` / `_episode_results.csv` (and `_holdout_results.csv`, the periodic
+  frozen held-out score that picks the best critic checkpoint — §5a.1), each run snapshots
+  `deploy_policy.yml` and the
   `critic_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
   The copies keep their comments but carry the values **actually used** — `eval.sh`'s positional
   args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
@@ -795,7 +1093,8 @@ the same directory, since it rewrites its own `resume_state.json` every episode 
 | episode rows + MA windows | `_episode_results.csv` | reloaded so the averages continue across the break |
 | critic params, target, **Adam state, LR schedule position** | `online_value_critic.pkl` | see below |
 | guidance ramp position | `critic_ramp_baseline` in `resume_state.json` | see below |
-| best-checkpoint bar | `best_success_rate_ma` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
+| best-checkpoint bar | `best_score` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
+| held-out seed set | `holdout_seeds` in `resume_state.json` | re-searching costs an expert rollout per rejected seed, and a different set would not be comparable with the scores already in `_holdout_results.csv` (§5a.1) |
 | W&B run | `wandb_run_id` → `resume="allow"` | keeps the critic curves one continuous series |
 
 The optimizer half needed a change in `multisensory_steering`: `OnlineValueCritic.save` now
@@ -1086,27 +1385,114 @@ checkpoint's own counter, which is right precisely because those updates did hap
 **Two files, not one.** `online_value_critic.pkl` is the run's *state* — whatever the last
 episode left, which is what a resume must pick up — but online TD on a few thousand correlated
 transitions is not monotone, so the last episode is generally not the run's best. Alongside it,
-`online_value_critic_best.pkl` holds the critic as of the episode with the highest
-`success_rate_ma` (the `wandb_ma_window`-episode moving average, the same number the csv and the
-W&B curve carry). That is the one to point a later `critic_ckpt` at when you want to *use* the
-critic — evaluate it frozen, warm-start another run — and the latest is the one to point at when
-you want to *continue* this run. Never resume from the best file: it would rewind the optimizer
-to an episode `_episode_results.csv` and `resume_state.json` already count as done.
+`online_value_critic_best.pkl` holds the critic as of the run's best-scoring episode. That is the
+one to point a later `critic_ckpt` at when you want to *use* the critic — evaluate it frozen,
+warm-start another run — and the latest is the one to point at when you want to *continue* this
+run. Never resume from the best file: it would rewind the optimizer to an episode
+`_episode_results.csv` and `resume_state.json` already count as done.
+
+**Which score "best" means is `eval_interval`'s (§5a.1).** With the periodic held-out evaluation
+on — the default in `deploy_policy.yml` — it is the success rate over a *fixed* set of episodes,
+re-measured with the critic frozen every `eval_interval` episodes. With `eval_interval: 0` it
+falls back to `success_rate_ma`, the `wandb_ma_window`-episode moving average over the training
+episodes themselves (the same number the csv and the W&B curve carry), which is what this used
+before.
 
 Both are written the same way, and the best one is a copy of the latest (which was pickled from
 the same object a moment earlier) rather than a second pickle, through the same temp-and-rename.
-Only the latest moves on the mid-episode cadence above — `success_rate_ma` is an episode-level
+Only the latest moves on the mid-episode cadence above — either criterion is an episode-level
 number, so there is nothing to rank a mid-episode critic against.
-Two details of "best": while the moving-average window is still **filling** the best file just
-tracks the latest — a mean over one episode makes a single early success read as a success rate
-of 1.0 that no honest 20-episode average could beat, which would freeze "best" at episode 1 —
-and once it is full only a **strict** improvement moves it, so a plateau keeps the earliest
-critic to reach it. The bar itself rides in `resume_state.json`
-(`best_success_rate_ma` / `best_success_rate_ma_episode`) so a resumed run keeps comparing
-against the pre-interruption best instead of replacing it with its own first episode; a state
-file written before 2026-08-29, or reconstructed by `resume_state_from_log.py`, has no such key
-and the bar starts over. This applies to whichever critic family is running — `eval_policy.py`
-only ever calls `online_critic.save`, so the DSRL critic (§5c) is checkpointed identically.
+Two details of "best": until the criterion has produced its **first** number the best file just
+tracks the latest (so a run killed early leaves both files valid) — for the moving average that
+is while the window is still filling, since a mean over one episode makes a single early success
+read as a success rate of 1.0 that no honest 20-episode average could beat, and for the held-out
+evaluation it is until the first one runs — and after that only an improvement moves it. The bar
+itself rides in `resume_state.json` (`best_score` / `best_score_episode` /
+`best_score_criterion`, also written under the old names `best_success_rate_ma` /
+`best_success_rate_ma_episode`, which is what a state file written before 2026-09-02 carries) so
+a resumed run keeps comparing against the pre-interruption best instead of replacing it with its
+own first episode; a state file written before 2026-08-29, or reconstructed by
+`resume_state_from_log.py`, has neither and the bar starts over. This applies to whichever critic
+family is running — `eval_policy.py` only ever calls `online_critic.save`, so the DSRL critic
+(§5c) is checkpointed identically.
+
+### 5a.1. The best-checkpoint criterion: periodic held-out evaluation (`eval_interval`)
+
+Every `eval_interval` completed episodes the run stops, re-plays a **fixed** set of
+`eval_episodes` episodes with the policy frozen, and scores it. That success rate is what decides
+which critic `online_value_critic_best.pkl` keeps.
+
+```yaml
+# policy/pi05/deploy_policy.yml
+eval_interval: 20    # completed episodes between evaluations; 0 = off
+eval_episodes: 10    # episodes per evaluation
+eval_seed: null      # where the held-out seed search starts; null = 100000*(1+seed) + 1000
+```
+
+It exists because `success_rate_ma` is a poor criterion for the thing it was being used to
+choose. The training episodes are the ones the critic just learned from, and each is a *different*
+seed — so the moving average moves with which seeds happened to come up about as much as with the
+critic, and two episodes of the run are never a repeat measurement of anything. A fixed held-out
+set is the same episodes every time, so two scores differ by the critic.
+
+**Frozen means frozen, and only the critic can move.** pi0.5 is frozen in every run;
+`PI0.frozen_for_eval` (a context manager `eval_policy.py` wraps the evaluation in) is what stops
+the *critic* moving: no transition is stashed into the replay buffer (`get_action`'s own stash
+needs its own switch — the driver's skipping `commit`/`train_step` is not enough), no TD update
+runs, and the DSRL warmup budget and its RNG do not advance. The guidance scale is deliberately
+left exactly where the ramp has it rather than jumping to the target the way
+`train_online: false` does: what is being scored is the policy as it behaves *right now*. The
+DSRL actor stays stochastic, as jaxrl2's own eval does. The debug recorders are switched off and
+their pending values cleared on the way out, so an evaluation's Q or best-of-N scores cannot be
+logged against the next training episode's first control step.
+
+**Fixed twice over.** The seeds are the first `eval_episodes` the scripted expert can solve
+counting up from `eval_seed` — the same feasibility gate the main loop applies
+(`run_expert_check`, now shared), so a held-out episode is one the task is known to be solvable
+from and the two success rates are comparable. That search is deterministic
+in `eval_seed`, and expensive (every rejected seed is a full expert rollout), so it runs once and
+the seed set is carried in `resume_state.json`. Separately, the `random` module is reseeded from
+`eval_seed` for the duration, so every evaluation draws the same language instructions in the
+same order — RoboTwin draws instructions from `random`, which nothing else seeds, so without this
+the "fixed" set would still be re-worded every time. Two evaluations of the same critic therefore
+differ only by the sampler's own noise.
+
+Nothing about the run leaks into an evaluation or back out of it: the global numpy and `random`
+states are saved and restored around it, `eval_video_save_dir` is dropped from the env args (the
+env writes head-camera frames into the run's ffmpeg pipe whenever that path is set, and there is
+no pipe here), and `TASK_ENV.suc` / `test_num` are untouched — a held-out episode is not one of
+the `test_num` episodes the run was asked for and gets no row in `_episode_results.csv`. It gets
+one in **`_holdout_results.csv`** instead (`episode`, `critic_updates`, `guidance_scale`,
+`episodes`, `successes`, `success_rate`, `reward_mean`, `steps_mean`) and a `holdout/*` group in
+W&B, logged against the training episode it ran after so the curve lines up with
+`eval/success_rate_ma`.
+
+`eval_seed` is an **actual seed**, not a `seed`-style block index, and defaults to
+`100000 * (1 + seed) + 1000` — the run's own block, 1000 seeds ahead of where it starts. That
+offset is the only thing keeping the two sets disjoint: the run walks its seeds upward one per
+*candidate*, not per episode, since the expert gate rejects some. It is comfortable at
+`test_num: 300`, and `eval_policy` prints a one-time warning if a run ever reaches it — after
+which the held-out episodes are episodes the critic trained on and the score stops being a clean
+measurement, though the run is otherwise fine.
+
+**No choice of `eval_seed` changes what the scene looks like**, which is worth stating because it
+is the obvious thing to worry about. Every draw that decides the environment — wall and table
+texture, light colors and the crazy-light flip, table height, head-camera jitter — comes off
+`_env_rng` (§3), which under a task config's `env_seed` is `RandomState(env_seed)` rebuilt
+identically at every `setup_demo`: a run with `env_seed` set renders the same room in every
+episode, held-out ones included, whatever their seeds are. With `env_seed: null` that generator
+*is* `np.random`, seeded from the episode's own seed, so the background already varies episode to
+episode within the run and one seed is as good as another — `randint(0, file_count)` over the
+same directory either way. Which pool that directory is stays
+`domain_randomization.background_texture_pool`'s business (§3), not this key's.
+
+**The cost is real**: `eval_episodes` extra rollouts every `eval_interval` episodes, plus one
+expert pass per held-out seed (once), so 10 every 20 makes a run roughly 50% longer.
+`eval_interval: 0` turns the whole thing off and restores the old criterion exactly.
+
+A run resumed after this landed keeps its seed set and its bar; one whose `resume_state.json`
+predates it re-derives the seed set on its next evaluation (deterministically, so it is the same
+set) and starts the bar over.
 
 `freeze_encoder` is implemented in `qmfm.py::freeze_encoder_tx` as an `optax.multi_transform`
 that zeroes the updates of everything under the params tree's `encoder` key, rather than as a
@@ -1175,8 +1561,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
 | `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-primitive-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
 | `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
-| `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
-| `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
+| `action_proposals` | not a sensor: naming it in `encoder_modalities` turns retrieval on (§5b) | `(top_k, 50, 14)` |
+| `noise_proposals` | the same, and pays for the flow inversion (§5b) | `(top_k, 50, 14)` |
 
 The names are the §7a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -1203,12 +1589,15 @@ Three things to keep in mind:
   the *following* chunk's trace instead — see §7a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§7a); a critic configured for `wrench.*` against a config
   that has it off — or naming a link this embodiment does not have — fails at startup.
-- **The proposal modalities are retrieved, not sensed.** `action_proposals` /
-  `noise_proposals` come from a bank of demonstrations rather than from the sim (§5b), so they
-  are the two `data_type` flags nothing in `get_obs` produces — `script/eval_policy.py` forwards
-  them to `deploy_policy.py::get_model` and `pi_model.py` fills them in per control step. They
-  are also the only modalities a rollout dataset does **not** carry, so a critic that uses them
-  cannot (yet) be pretrained offline.
+- **The proposal modalities are not modalities.** `action_proposals` / `noise_proposals` come
+  from a bank of demonstrations rather than from the sim (§5b), and they are not something a
+  run either has or lacks: they are the *mechanism* by which everything else the critic encodes
+  queries that bank. So they are **not** `data_type` flags and are not validated against what
+  the sim offers — nothing in `get_obs` produces them, so that check would reject every run.
+  Naming one in the critic's `encoder_modalities` is the whole switch; `pi_model.py` reads that
+  list, opens the retriever at startup and fills the proposals in per control step. They are
+  also the only entries a rollout dataset does **not** carry, so a critic that uses them cannot
+  (yet) be pretrained offline.
 - **Modalities are an architecture key.** They go into the checkpoint, and a warm start rebuilds
   the same encoder stack; changing the list makes an existing critic checkpoint refuse to load
   (loudly, leaf by leaf). Offline pretraining takes the same names — `multisensory_steering`'s
@@ -1224,10 +1613,10 @@ Two more critic modalities, and the only ones that do not come from this episode
 the noise seeds that would make the sampler reproduce them here.
 
 ```yaml
-# task_config/<config>.yml — the switches, both default false
-data_type:
+# the critic config (cfgs/qmfm.yaml) — naming either one IS the switch
+encoder_modalities:
   action_proposals: true    # the retrieved demo chunks
-  noise_proposals: true     # the seeds that map to them (pays for the flow inversion)
+  noise_proposals: false    # the seeds that map to them (pays for the flow inversion)
 ```
 ```yaml
 # policy/pi05/deploy_policy.yml — where they come from
@@ -1280,6 +1669,61 @@ index. `bank_size` is then free in device memory, and `top_k` / the critic's `ke
 are what the replay buffer's size keys off. A critic that pools the set
 (`encoder: action_proposals`) asks for none of this.
 
+**A key can be any modality the demo dataset carries**, not just the SigLIP maps and the pose.
+`DemoRetriever` reads the dataset's own schema (`LeRobotEpisodeReader.sensor_columns`) and maps
+each column to the modality name the *live* observation uses, so a retrieved demo frame can
+serve its own `depth.head`, `pointcloud` or raw `images.<cam>` under exactly the name the critic
+encodes the query with. Which ones exist follows the converter: the rgb-only pipeline writes
+three camera views and nothing else, the multimodal one adds `depth.<cam>`, `pointcloud`, the
+`wrench.*` columns and a fourth `front` camera. That last one **does** have a live counterpart:
+`aloha-agilex`'s `static_camera_list` declares a `front_camera` (a low, near-horizontal view
+from the front of the table) alongside `head_camera`, so the sim's own observation carries
+`images.front` / `depth.front` and the demo column pairs with it under the same name. It is not
+the observer camera — that is a different camera again, and reaches a critic as
+`images.third_view` — which is why the mapping passes an unrecognized camera through under its
+own name rather than guessing it into `third_view`.
+
+| modality | where a demo row's copy comes from |
+|---|---|
+| `siglip.<view>` | re-encoded per control step by this run's own image tower |
+| `state` | the policy's input transform, model space, narrowed to the embodiment's dims |
+| `wrench.<key>` | windowed out of the dataset's per-frame rows at `wrench_trace_len` |
+| `depth.<cam>`, `pointcloud`, `images.<cam>`, … | the dataset column, cast to the dtype the sim hands the critic |
+
+**Which of them a critic actually keys on is `key_modalities`**, in the proposal spec of the
+critic's own config. Any modality the critic encodes may be one, as long as the demo dataset can
+serve it — checked at startup (`PI0._init_critic` against `DemoRetriever.key_modalities`) rather
+than at the first control step. The *default* is every `siglip.*` and `state` entry, and stays
+that narrow because it has to hold for an rgb-only demo dataset too; widen it deliberately. The
+cost is per candidate per transition, obs and next_obs, so at `top_k: 3` a `wrench.<link>` is
+~1.4 KB/transition and a `depth.<cam>` is ~1.8 MB — ~9 GB at `buffer_size: 5000`. The wrench is
+nearly free; a depth camera is a `buffer_size` decision.
+
+The last row is loaded on demand, governed by `demo_retrieval.sensor_modalities` in
+`deploy_policy.yml`. The default (`null`) **derives** it — load whatever the critic asks for,
+i.e. its `encoder_modalities` plus any explicit `key_modalities`, intersected with the columns
+the dataset actually has — so a modality is named once, in the critic config, and not again
+here. That intersection is load-bearing: a critic legitimately encodes modalities no
+demonstration carries (they stay part of the attention *query*), so asking for them would break
+every run against an rgb-only demo dataset. An explicit list overrides it, for loading **less**
+than the critic could use; `[]` loads none and `true` loads everything the dataset has.
+
+It is a knob at all because unlike a SigLIP map these cannot be re-encoded from something
+smaller: a depth map *is* the key, so it has to be resident for every bank row, and the cost
+scales with `num_demos` × episode length rather than with `top_k` — ~0.23 MB a camera frame,
+~0.15 MB a depth map, ~24 KB a point cloud. That is a different axis from `key_modalities`,
+which scales with `top_k` × `buffer_size`. The bank banner prints the total, and a name the
+dataset does not have is refused when the retriever is built rather than an hour into the
+rollouts.
+
+**Shape agreement is the thing to check.** A demo row has to be the same array the sim hands the
+critic online, and only the dtype is normalized here. The rgb-only demo datasets store 480×640
+frames against the sim's 240×320, so their `images.<cam>` is *not* a usable key; the multimodal
+ones store 240×320 and are. `pointcloud` matches only when the task config's
+`pcd_down_sample_num` equals the dataset's (1024 for the multimodal converter). Nothing on this
+side can check it — the online shape is not known until the first observation — so a mismatch
+surfaces in the critic's encoder.
+
 **What "nearest" means.** Not a cosine but the **average of several independent relative L2
 distances**, one per signal, smallest wins (`signals`, `SIMILARITY_SIGNALS`):
 
@@ -1312,10 +1756,11 @@ below); what stops it being a *distance* term is NaN: a frame near the start of 
 fewer rows behind it than the trace is wide, and an L2 over NaN is NaN. It reaches the critic as
 a modality instead — a bank row's own `(wrench_trace_len, 6)` trace, served by
 `DemoRetriever.critic_keys` alongside the row's SigLIP maps and pose, so a cross-attending
-critic keys on it even though the shortlist was not ranked by it. The stock rgb-only pipeline
-(`process_data.py` → `convert_aloha_data_to_lerobot_robotwin.py`) still drops the wrench, so
-which of the two a `repo_id` came from decides whether the modality exists; naming one a dataset
-does not have raises at startup, listing what it does have.
+critic keys on it even though the shortlist was not ranked by it — the same route every other
+recorded sensor now takes (above). The stock rgb-only pipeline (`process_data.py` →
+`convert_aloha_data_to_lerobot_robotwin.py`) still drops the wrench, so which of the two a
+`repo_id` came from decides whether the modality exists; naming one a dataset does not have
+raises at startup, listing what it does have.
 
 **How a demonstration's wrench becomes a `(wrench_trace_len, 6)` trace.** The dataset stores one
 `(6,)` row per **frame** — that frame's physics steps averaged, the same reduction
@@ -1440,9 +1885,15 @@ whole run rather than per episode. Encoded episodes are additionally cached by i
 explicit re-draw landing on the same demonstration costs nothing; the cache tops out at a couple
 of MB per demo episode in host RAM.
 
-Nothing is built unless a critic exists **and** its `encoder_modalities` actually names one of
-the two: a run that turns the flags on without the critic side prints that it is turning
-retrieval back off rather than paying for output nobody reads.
+Nothing is built unless a critic exists **and** its `encoder_modalities` names one of the two —
+which since 2026-09-01 is the same statement, because that list is now the only switch. There
+used to be a second, in the task config's `data_type` block, and a run had to set both; a
+proposal is not a sensor, so validating it against what `get_obs` produces rejected every run
+that asked for one. The flags are gone from every task config and from
+`eval_policy.py` / `deploy_policy.py`; `PI0._configured_proposals` reads the critic config
+instead. The one case where the two can still disagree is a warm start, since a checkpoint's
+architecture keys override the config's: `_init_critic` re-checks against the critic actually
+built and turns retrieval back off, printing why, rather than paying for output nobody reads.
 
 `Pi0.invert_actions` is the general method underneath (`pi0.py`, tested in
 `pi0_invert_test.py`): given a clean chunk it recovers the exact noise `sample_actions` would
@@ -1596,17 +2047,27 @@ why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
 | `state` | ✔ normalized, embodiment dims | this run's own input transform |
 | action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
 | `wrench.<key>` | ✔ `(wrench_trace_len, 6)`, **multimodal demo datasets only** | windowed out of the dataset's own per-frame rows (§5b) |
-| `depth.*`, `pointcloud`, privileged poses | ✘ | nothing persists them through the demo pipeline |
-| `images.<cam>` | ✘ | a demo frame is 480x640 (the multimodal converter's, its own) while the sim's is 240x320 — not the same array |
+| `depth.<cam>`, `pointcloud`, raw `images.<cam>`, … | ✔ **if the dataset has the column and the run kept it** | the column itself, cast to the dtype the sim hands the critic (§5b) |
+| privileged task state | ✘ | nothing persists it through the demo pipeline |
 
-A critic naming one of the ✘ modalities is refused, listing what a demonstration does carry
-(`DemoRetriever.cotrain_rows`, and `offline_replay.check_demo_modalities` hoists the check to
-startup rather than an hour into the rollouts). The wrench moved off that list on 2026-08-30:
-`cfgs/qmfm.yaml`'s default `encoder_modalities` names the `wrench.*` modalities, and co-training
-on a **multimodal** demo dataset now serves them instead of forcing them off — but which keys
-exist follows the dataset (`robotwin_demo_clean_multimodal_50x10_lerobot` has the four link
-columns only; the randomized one also has the `left` / `right` arm totals), and an rgb-only demo
-dataset still has none.
+The ✔ on the third row is conditional twice over, and both conditions are checked at startup
+rather than an hour into the rollouts. First, the **dataset** has to carry the column: an
+rgb-only demo dataset has three camera views and nothing else, the multimodal converter's has
+depth, point clouds, the wrench and a fourth camera. Second, the **run** has to have asked to
+keep it, in `demo_retrieval.sensor_modalities` — the co-training rows come from the same
+retriever the bank does, so one key controls both. A critic naming something neither offers is
+refused, listing what a demonstration does carry (`DemoRetriever.cotrain_rows`, and
+`offline_replay.check_demo_modalities` hoists the check to startup).
+
+Two dates worth knowing. The wrench moved off the ✘ list on 2026-08-30: `cfgs/qmfm.yaml`'s
+default `encoder_modalities` names the `wrench.*` modalities, and co-training on a multimodal
+demo dataset serves them instead of forcing them off — which keys exist follows the dataset
+(`robotwin_demo_clean_multimodal_50x10_lerobot` has the four link columns only; the randomized
+one also has the `left` / `right` arm totals). Everything else recorded followed on 2026-09-01,
+by reading the schema instead of a fixed list. `images.<cam>` had been excluded for a subtler
+reason than "not recorded" — the rgb-only converter writes 480x640 frames against the sim's
+240x320, so they are not the same array — and that is still true of *those* datasets; the
+multimodal ones write 240x320 and work.
 
 Rows are the frames at `frame_index % horizon == 0` — the control steps the online critic takes,
 so a demo row and a live transition are the same distance apart in time and the same discount
@@ -2045,6 +2506,16 @@ Notes:
     now names the exception type to tell those apart.
   (The `fps` call higher up in `get_pcd` is dead code — an unconditional `return`
   precedes it.)
+- **An empty `CUDA_VISIBLE_DEVICES` reads as "no GPUs", and curobo dies at *import*.**
+  `curobo/wrap/reacher/motion_gen.py` builds `Pose.from_list(...)` as a **default argument**, so
+  it runs at class-body execution and puts a tensor on CUDA before you have called anything. With
+  no visible device that raises `RuntimeError: No CUDA GPUs are available`, `envs/robot/planner.py`
+  swallows it and prints "check if Curobo is installed correctly" — which is wrong and costs you
+  an hour — and the run dies at `ImportError: cannot import name 'CuroboPlanner'`, exactly as if
+  curobo were missing. The usual cause is forgetting a launcher's `gpu_id` argument: every
+  `eval.sh` / `collect_data.sh` here does `export CUDA_VISIBLE_DEVICES=${gpu_id}` unguarded, so an
+  omitted 6th positional arg exports the empty string. `policy/pi05/eval.sh` now checks for it and
+  says so; the others still do not.
 - **curobo must be built into BOTH envs — eval will not even import without it.**
   `envs/robot/robot.py` does an unconditional `from .planner import CuroboPlanner`, and
   `envs/robot/planner.py` wraps the curobo import in a `try:` — so a missing curobo is **not**
@@ -2192,6 +2663,8 @@ cd .. && bash .claude/hooks/sync-conversations.sh pull && bash .claude/hooks/syn
 ```bash
 # --- setup (login node) ---
 source setup_env.sh                     # every session/job
+python script/gen_peg_socket_asset.py --verify   # peg-insertion meshes (once per clone)
+python script/gen_task_assets.py --verify        # ditto for the sec 3.6 tasks
 
 # --- claude state sync (login node) ---  (or run the /sync-claude skill)
 bash .claude/hooks/sync-conversations.sh sync   # transcripts: bidirectional pull+push

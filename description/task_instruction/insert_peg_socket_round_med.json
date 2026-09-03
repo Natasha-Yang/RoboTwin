@@ -1,0 +1,21 @@
+{
+  "full_description": "pick up the peg and insert it into the socket's hole",
+  "schema": "{A} notifies the socket, {B} notifies the round peg. Arm use literal 'arm'",
+  "preference": "num of words should not exceed 6",
+  "seen": [
+    "Insert {B} into {A}.",
+    "Put {B} in {A}.",
+    "Place {B} into {A}.",
+    "Fit {B} into {A}.",
+    "Lift {B} and insert it.",
+    "Use arm to insert {B}.",
+    "Slot {B} into {A}.",
+    "Pick up {B}, insert it.",
+    "Drop {B} into {A}.",
+    "Seat {B} in {A}."
+  ],
+  "unseen": [
+    "Push {B} into {A}.",
+    "Set {B} inside {A}."
+  ]
+}

@@ -160,6 +160,16 @@ def build_env_args(usr_args):
     args["ckpt_setting"] = ckpt_setting
     args["policy_name"] = policy_name
 
+    # Same task-config key as the other two drivers (see script/eval_policy.py,
+    # script/collect_data.py and Base_Task._init_task_env_): with `env_seed` set, every episode
+    # renders the same scene -- background texture, light colors, table height, head-camera
+    # jitter -- while object poses keep varying with each episode's own seed. No override here,
+    # so the task config stays the one place it is set.
+    env_seed = args.get("env_seed")
+    if isinstance(env_seed, str):
+        env_seed = None if env_seed.strip().lower() in ("", "none", "null") else int(env_seed)
+    args["env_seed"] = None if env_seed is None else int(env_seed)
+
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
     with open(embodiment_config_path, "r", encoding="utf-8") as f:

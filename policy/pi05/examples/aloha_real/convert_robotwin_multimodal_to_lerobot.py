@@ -58,10 +58,21 @@ class DatasetConfig:
     video_backend: str | None = None
 
 
-def episode_files(data_dir: Path, task_config: str, episodes_per_task: int) -> list[tuple[str, Path]]:
-    """(task_name, episode hdf5) for every task that has this config, in a stable order."""
+def episode_files(
+    data_dir: Path, task_config: str, episodes_per_task: int, tasks: tuple[str, ...] = ()
+) -> list[tuple[str, Path]]:
+    """(task_name, episode hdf5) for every task that has this config, in a stable order.
+
+    `tasks` restricts it to those task names. Needed when a group of tasks shares its
+    instruction templates -- the three `insert_peg_socket_*` rungs all read "Insert {B} into
+    {A}." -- because `episode_selection.assign_episode_tasks` maps a demo episode back to its
+    task through those templates, so such tasks cannot be told apart inside one dataset and
+    have to be converted into one dataset each.
+    """
     out = []
     for task_dir in sorted(p for p in data_dir.iterdir() if (p / task_config / "data").is_dir()):
+        if tasks and task_dir.name not in tasks:
+            continue
         for i in range(episodes_per_task):
             ep = task_dir / task_config / "data" / f"episode{i}.hdf5"
             if ep.exists():
@@ -197,13 +208,19 @@ def main(
     depth_dtype: Literal["uint16", "float32"] = "uint16",
     instruction_type: str = "seen",
     seed: int = 42,
+    tasks: tuple[str, ...] = (),
     limit_tasks: int | None = None,
     dataset_config: DatasetConfig = DatasetConfig(),
 ):
     data_dir = data_dir.resolve()
-    eps = episode_files(data_dir, task_config, episodes_per_task)
+    eps = episode_files(data_dir, task_config, episodes_per_task, tasks)
     if not eps:
-        raise ValueError(f"no episodes under {data_dir}/*/{task_config}/data")
+        raise ValueError(
+            f"no episodes under {data_dir}/*/{task_config}/data"
+            + (f" for tasks {list(tasks)}" if tasks else "")
+        )
+    if tasks and (missing := sorted(set(tasks) - {t for t, _ in eps})):
+        raise ValueError(f"no episodes for {missing} under {data_dir}/*/{task_config}/data")
     if limit_tasks is not None:
         keep = sorted({t for t, _ in eps})[:limit_tasks]
         eps = [(t, p) for t, p in eps if t in keep]

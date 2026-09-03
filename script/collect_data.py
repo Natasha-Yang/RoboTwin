@@ -7,6 +7,7 @@ from sapien.render import clear_cache
 from collections import OrderedDict
 import pdb
 from envs import *
+from envs._base_task import resolve_background_texture_pool
 import yaml
 import importlib
 import json
@@ -46,6 +47,24 @@ def main(task_name=None, task_config=None):
 
     args['task_name'] = task_name
 
+    # One scene for the whole collection run (see Base_Task._init_task_env_): with `env_seed`
+    # set, the background texture, light colors, table height and head-camera jitter come from
+    # it instead of each episode's own seed, so every demo is recorded in the same environment
+    # while object poses keep varying.
+    #
+    # It lives in the task config and nowhere else, which is what makes it *shared*: eval and
+    # rollout collection read the same key out of the same file, so collecting and evaluating
+    # under one task config puts the policy in the environment its demos were recorded in. No
+    # driver has a flag of its own to drift from it.
+    #
+    # It applies to BOTH phases below. The env generator is rebuilt identically at every
+    # `setup_demo`, so the replay phase renders the scene the seed-search phase validated --
+    # which is what makes a cached trajectory safe to replay at all (see `check_env_seed_marker`).
+    env_seed = args.get("env_seed")
+    if isinstance(env_seed, str):
+        env_seed = None if env_seed.strip().lower() in ("", "none", "null") else int(env_seed)
+    args["env_seed"] = None if env_seed is None else int(env_seed)
+
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
 
@@ -84,11 +103,19 @@ def main(task_name=None, task_config=None):
     print("\033[95mRandom Background:\033[0m " + str(args["domain_randomization"]["random_background"]))
     if args["domain_randomization"]["random_background"]:
         print(" - Clean Background Rate: " + str(args["domain_randomization"]["clean_background_rate"]))
+        # Resolved by the env's own function, so this and the eval banner cannot disagree.
+        configured = args["domain_randomization"].get("background_texture_pool")
+        print(" - Texture Pool: " + resolve_background_texture_pool(configured, eval_mode=False) + "/"
+              + (" (explicit -- eval draws from the same one)" if configured
+                 else " (RoboTwin's held-out split: eval will draw from `unseen/`)"))
     print("\033[95mRandom Light:\033[0m " + str(args["domain_randomization"]["random_light"]))
     if args["domain_randomization"]["random_light"]:
         print(" - Crazy Random Light Rate: " + str(args["domain_randomization"]["crazy_random_light_rate"]))
     print("\033[95mRandom Table Height:\033[0m " + str(args["domain_randomization"]["random_table_height"]))
     print("\033[95mRandom Head Camera Distance:\033[0m " + str(args["domain_randomization"]["random_head_camera_dis"]))
+    print("\033[95mEnv Seed:\033[0m " +
+          (f'{args["env_seed"]} (scene fixed for the whole run)' if args["env_seed"] is not None
+           else "None (scene redrawn per episode)"))
 
     print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))
@@ -105,6 +132,40 @@ def main(task_name=None, task_config=None):
     args["record_step_wrench"] = bool(args["data_type"].get("wrench", False))
     args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
     run(task, args)
+
+
+def check_env_seed_marker(save_path, env_seed):
+    """Refuse to mix episodes collected under different `env_seed`s in one save_path.
+
+    A collection run resumes: `seed.txt` and the per-episode trajectory caches survive, and the
+    replay phase re-executes a cached joint path against a freshly built scene. `env_seed` moves
+    that scene -- above all `table_z_bias`, so the table is at a different height than the one
+    the trajectory was planned against -- and nothing downstream would notice. The result is a
+    directory of demos that silently disagree with each other, which is worse than a crash, so
+    this stops before the first episode instead.
+
+    The marker is written on the first run into a directory and only ever compared afterwards.
+    A directory collected before this existed has none, and is treated as matching whatever is
+    asked for now -- there is no way to know what it used, and assuming a mismatch would break
+    every existing resume.
+    """
+    marker_path = os.path.join(save_path, "env_seed.txt")
+    recorded = None
+    if os.path.exists(marker_path):
+        with open(marker_path, "r", encoding="utf-8") as file:
+            text = file.read().strip()
+        recorded = None if text in ("", "none", "null") else int(text)
+        if recorded != env_seed:
+            raise RuntimeError(
+                f"{save_path} was collected with env_seed={recorded}, but this run asks for "
+                f"env_seed={env_seed}. The cached seeds and trajectories in there were planned "
+                f"against a different scene (table height above all), so replaying them here "
+                f"would write demos that disagree with each other. Collect into a different "
+                f"`save_path`, or delete that directory to start over."
+            )
+    else:
+        with open(marker_path, "w", encoding="utf-8") as file:
+            file.write("null" if env_seed is None else str(env_seed))
 
 
 def run(TASK_ENV, args):
@@ -127,6 +188,7 @@ def run(TASK_ENV, args):
 
     # =========== Collect Seed ===========
     os.makedirs(args["save_path"], exist_ok=True)
+    check_env_seed_marker(args["save_path"], args["env_seed"])
 
     if not args["use_seed"]:
         print("\033[93m" + "[Start Seed and Pre Motion Data Collection]" + "\033[0m")

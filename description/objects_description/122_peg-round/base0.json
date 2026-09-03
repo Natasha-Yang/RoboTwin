@@ -1,0 +1,22 @@
+{
+    "raw_description": "peg",
+    "seen": [
+        "peg",
+        "round peg",
+        "orange peg",
+        "cylindrical peg",
+        "orange round peg",
+        "round rod",
+        "orange rod",
+        "upright peg",
+        "standing round peg",
+        "orange cylinder",
+        "cylindrical rod",
+        "tall orange peg"
+    ],
+    "unseen": [
+        "orange cylindrical peg",
+        "slim orange rod",
+        "standing cylinder"
+    ]
+}

@@ -31,6 +31,59 @@ wrench_trace_len: 10
 # Number of successful eval episodes to run.
 test_num: 300
 
+# ===== Periodic held-out evaluation (the best-checkpoint criterion) =====
+# Every `eval_interval` completed episodes, the run pauses and re-plays a FIXED set of
+# `eval_episodes` episodes with the policy frozen -- the pi0.5 sampler is frozen anyway, so what
+# this freezes is the critic (QMFM or DSRL): no transition is stashed into the replay buffer and
+# no TD update runs, and the guidance scale is left exactly where the ramp has it, so what is
+# scored is the policy as it behaves right now. The resulting success rate is what decides which
+# critic `online_value_critic_best.pkl` keeps.
+#
+# It is a better criterion than the `success_rate_ma` it replaces for the usual held-out reason:
+# the training episodes are the ones the critic just learned from, and each is a *different*
+# seed, so their moving average moves with which seeds came up as much as with the critic. The
+# held-out set is the same episodes every time, so two scores differ by the critic.
+#
+# Fixed twice over. The seeds are the first `eval_episodes` the scripted expert can solve
+# counting up from `eval_seed` -- the same feasibility gate the main loop applies, deterministic
+# in `eval_seed`, found once and then carried in `resume_state.json`
+# (each rejected seed is a full expert rollout). And the `random` module is reseeded from
+# `eval_seed` for the duration, so every evaluation draws the same language instructions in the
+# same order. Neither the run's own RNG streams nor its counters are disturbed: a held-out
+# episode is not one of the `test_num` episodes the run was asked for, and does not appear in
+# `_episode_results.csv`.
+#
+# Each evaluation appends a row to `_holdout_results.csv` (episode, critic_updates,
+# guidance_scale, successes, success_rate, reward_mean, steps_mean) and logs `holdout/*` to W&B.
+# Video and the debug recorders are off for these episodes.
+#
+# Cost is the honest objection: `eval_episodes` rollouts (plus, once, the expert passes that
+# choose the seeds) every `eval_interval` episodes, so at 10/20 the run is ~50% longer. Set
+# `eval_interval: 0` to turn it off, in which case the best checkpoint falls back to
+# `success_rate_ma` over the training episodes exactly as before.
+eval_interval: 20
+eval_episodes: 10
+# Where the held-out seed search starts. This is an ACTUAL seed, not a `seed`-style block index:
+# the run's own episodes start at `100000 * (1 + seed)` and walk upward from there, one seed per
+# candidate (so more than one per episode -- the expert gate rejects some).
+#   null (default)  `100000 * (1 + seed) + 1000` -- the run's own block, 1000 seeds ahead of
+#                   where it starts. That offset is the only thing keeping the two sets
+#                   disjoint, and it is comfortable at `test_num: 300`; the driver prints a
+#                   warning if a run ever walks up to it, after which the held-out episodes are
+#                   episodes the critic has trained on and the score stops being a clean
+#                   measurement.
+#   <an integer>    start there instead. Raise it for a long run.
+#
+# It does NOT change what the scene looks like, and no choice of it can. Every domain-
+# randomization draw that decides the environment -- wall and table texture, light colors, table
+# height, head-camera jitter -- comes from `_env_rng` (envs/_base_task.py), which under the task
+# config's `env_seed` is rebuilt identically at every episode, so a run with `env_seed` set
+# renders the same room in every episode, held-out ones included. With `env_seed: null` that
+# generator is the global one, seeded from the episode's own seed, so the scene already varies
+# episode to episode within the run and one seed is as good as another -- nothing about a seed's
+# magnitude biases the draw.
+eval_seed: null
+
 # ===== Crash recovery =====
 # Every finished episode is committed to the run directory as it completes: its row is appended
 # to _episode_results.csv, the online critic (params AND Adam state) is checkpointed, and
@@ -143,6 +196,29 @@ demo_retrieval:
   # (Contact wrench would be the natural third signal but no demo dataset carries it -- the
   # RoboTwin collection pipeline computes it live and never persists it.)
   signals: null
+  # Recorded sensors to keep per bank row, on top of the camera views, the pose and the contact
+  # wrench. These are what lets **any** modality a demo dataset carries be a cross-attention key
+  # (`critic_keys`) or a co-training column (`cotrain_rows`), not just `siglip.<view>` /
+  # `state` / `wrench.<key>`: name them here and a retrieved demo frame serves its own
+  # `depth.head`, `pointcloud`, raw `images.<cam>`, ... under the same modality names the live
+  # observation uses.
+  #
+  # Which ones exist follows the dataset, and it is checked at startup: the rgb-only converter
+  # writes three camera views, the multimodal one adds `depth.<cam>`, `pointcloud` and a fourth
+  # `front` camera. `null` (or []) keeps none, which is exactly the behaviour before this key
+  # existed; `true` keeps everything the dataset has.
+  #
+  # Opt-in because unlike a SigLIP map these cannot be re-encoded from something smaller -- they
+  # are resident for every bank row (~0.23 MB a camera frame, ~0.15 MB a depth map, ~24 KB a
+  # point cloud), so the cost scales with `num_demos` x episode length, not with `top_k`. The
+  # bank banner prints the total.
+  #
+  # A shape mismatch is the thing to watch: a demo frame has to be the same array the sim hands
+  # the critic online. The rgb-only demo datasets store 480x640 frames against the sim's
+  # 240x320, so their `images.<cam>` is NOT a usable key; the multimodal ones store 240x320 and
+  # are. Nothing here can check it -- the online shape is not known until the first observation
+  # -- so a mismatch surfaces in the critic's encoder.
+  sensor_modalities: null
   # The bank is a jit argument, so it is padded to a fixed size (padding can never be
   # retrieved). Raise it if `num_demos` x episode length overflows and frames get subsampled.
   # This is also the run's biggest memory item: every row keeps its SigLIP patch map per view

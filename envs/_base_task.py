@@ -34,6 +34,34 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
 
+BACKGROUND_TEXTURE_POOLS = ("seen", "unseen")
+
+
+def resolve_background_texture_pool(pool, eval_mode):
+    """Which `assets/background_texture/<pool>` the wall/table textures are drawn from.
+
+    RoboTwin's own behaviour is a *split*: collection draws from `seen/`, eval from the held-out
+    `unseen/`, to test generalisation to backgrounds the policy never trained on. That is what
+    `pool=None` keeps, and it is the default.
+
+    Naming a pool explicitly (`domain_randomization.background_texture_pool`) overrides the
+    split for BOTH sides, which is how you make eval render the same background as collection:
+    with `seen` (or `unseen`) on both, the same `env_seed` draws the same texture, because it is
+    then the same directory, the same file count and the same generator state. `env_seed` itself
+    deliberately does not touch this -- it fixes *which* texture is drawn, not which pool.
+    """
+    if pool is None:
+        return "seen" if not eval_mode else "unseen"
+    text = str(pool).strip().lower()
+    if text in ("", "none", "null"):
+        return "seen" if not eval_mode else "unseen"
+    if text not in BACKGROUND_TEXTURE_POOLS:
+        raise ValueError(
+            f"domain_randomization.background_texture_pool must be one of "
+            f"{list(BACKGROUND_TEXTURE_POOLS)} or null (RoboTwin's seen/unseen split), got {pool!r}")
+    return text
+
+
 class Base_Task(gym.Env):
 
     def __init__(self):
@@ -60,6 +88,25 @@ class Base_Task(gym.Env):
         torch.manual_seed(kwags.get("seed", 0))
         # random.seed(kwags.get('seed', 0))
 
+        # `env_seed` pins the *scene* while the episode's own `seed` keeps moving the objects.
+        # Every domain-randomization draw that decides what the room looks like -- wall/table
+        # texture, light colors and the crazy-light coin flip, table height, head-camera jitter
+        # -- is taken from this generator instead of the global one, so every episode of a run
+        # with the same `env_seed` renders the same environment while `load_actors` (which is
+        # not routed here) still draws object poses from `seed` and so varies episode to
+        # episode. Cluttered-table objects are deliberately left on the episode stream: their
+        # placement rejection-samples against `prohibited_area`, which moves with the task
+        # objects, so they could not be held fixed anyway.
+        #
+        # With `env_seed` unset this *is* `np.random`, so the draw order and every value is
+        # exactly what it was before this existed -- nothing changes for a run that does not
+        # ask for it. Setting it does shift the global stream (the scene draws no longer
+        # consume it), so a given episode `seed` places objects differently than the same seed
+        # would without `env_seed`. That is inherent to splitting the streams, not a bug.
+        env_seed = kwags.get("env_seed", None)
+        self.env_seed = None if env_seed is None else int(env_seed)
+        self._env_rng = (np.random if self.env_seed is None else np.random.RandomState(self.env_seed))
+
         self.FRAME_IDX = 0
         self.task_name = kwags.get("task_name")
         self.save_dir = kwags.get("save_path", "data")
@@ -81,7 +128,12 @@ class Base_Task(gym.Env):
         self.random_table_height = random_setting.get("random_table_height", 0)
         self.random_light = random_setting.get("random_light", False)
         self.crazy_random_light_rate = random_setting.get("crazy_random_light_rate", 0)
-        self.crazy_random_light = (0 if not self.random_light else np.random.rand() < self.crazy_random_light_rate)
+        # Which texture pool `random_background` draws from; null = RoboTwin's seen/unseen
+        # split (see `resolve_background_texture_pool`). Validated here rather than at the
+        # first draw, so a typo fails before the scene is built.
+        self.background_texture_pool = random_setting.get("background_texture_pool", None)
+        resolve_background_texture_pool(self.background_texture_pool, self.eval_mode)
+        self.crazy_random_light = (0 if not self.random_light else self._env_rng.rand() < self.crazy_random_light_rate)
         self.random_embodiment = random_setting.get("random_embodiment", False)  # TODO
 
         self.file_path = []
@@ -151,7 +203,7 @@ class Base_Task(gym.Env):
         self.record_cluttered_objects = list()  # record cluttered objects info
 
         self.eval_success = False
-        self.table_z_bias = (np.random.uniform(low=-self.random_table_height, high=0) + table_height_bias)  # TODO
+        self.table_z_bias = (self._env_rng.uniform(low=-self.random_table_height, high=0) + table_height_bias)  # TODO
         self.need_plan = kwags.get("need_plan", True)
         self.left_joint_path = kwags.get("left_joint_path", [])
         self.right_joint_path = kwags.get("right_joint_path", [])
@@ -313,9 +365,9 @@ class Base_Task(gym.Env):
         for direction_light in direction_lights:
             if self.random_light:
                 direction_light[1] = [
-                    np.random.rand(),
-                    np.random.rand(),
-                    np.random.rand(),
+                    self._env_rng.rand(),
+                    self._env_rng.rand(),
+                    self._env_rng.rand(),
                 ]
             self.direction_light_lst.append(
                 self.scene.add_directional_light(direction_light[0], direction_light[1], shadow=shadow))
@@ -324,7 +376,7 @@ class Base_Task(gym.Env):
         self.point_light_lst = []
         for point_light in point_lights:
             if self.random_light:
-                point_light[1] = [np.random.rand(), np.random.rand(), np.random.rand()]
+                point_light[1] = [self._env_rng.rand(), self._env_rng.rand(), self._env_rng.rand()]
             self.point_light_lst.append(self.scene.add_point_light(point_light[0], point_light[1], shadow=shadow))
 
         # initialize viewer with camera position and orientation
@@ -348,21 +400,21 @@ class Base_Task(gym.Env):
         table_height += self.table_z_bias
 
         if self.random_background:
-            texture_type = "seen" if not self.eval_mode else "unseen"
+            texture_type = resolve_background_texture_pool(self.background_texture_pool, self.eval_mode)
             directory_path = f"./assets/background_texture/{texture_type}"
             file_count = len(
                 [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])
 
             # wall_texture, table_texture = random.randint(0, file_count - 1), random.randint(0, file_count - 1)
-            wall_texture, table_texture = np.random.randint(0, file_count), np.random.randint(0, file_count)
+            wall_texture, table_texture = self._env_rng.randint(0, file_count), self._env_rng.randint(0, file_count)
 
             self.wall_texture, self.table_texture = (
                 f"{texture_type}/{wall_texture}",
                 f"{texture_type}/{table_texture}",
             )
-            if np.random.rand() <= self.clean_background_rate:
+            if self._env_rng.rand() <= self.clean_background_rate:
                 self.wall_texture = None
-            if np.random.rand() <= self.clean_background_rate:
+            if self._env_rng.rand() <= self.clean_background_rate:
                 self.table_texture = None
         else:
             self.wall_texture, self.table_texture = None, None
@@ -482,6 +534,7 @@ class Base_Task(gym.Env):
         self.cameras = Camera(
             bias=self.table_z_bias,
             random_head_camera_dis=self.random_head_camera_dis,
+            env_rng=self._env_rng,
             **kwags,
         )
         self.cameras.load_camera(self.scene)
@@ -495,13 +548,16 @@ class Base_Task(gym.Env):
         Update rendering to refresh the camera's RGBD information
         (rendering must be updated even when disabled, otherwise data cannot be collected).
         """
+        # Under `env_seed` these come off the env generator too, which is rebuilt per episode --
+        # so crazy-light mode replays the same color *sequence* in every episode of the run,
+        # not merely the same starting colors.
         if self.crazy_random_light:
             for renderColor in self.point_light_lst:
-                renderColor.set_color([np.random.rand(), np.random.rand(), np.random.rand()])
+                renderColor.set_color([self._env_rng.rand(), self._env_rng.rand(), self._env_rng.rand()])
             for renderColor in self.direction_light_lst:
-                renderColor.set_color([np.random.rand(), np.random.rand(), np.random.rand()])
+                renderColor.set_color([self._env_rng.rand(), self._env_rng.rand(), self._env_rng.rand()])
             now_ambient_light = self.scene.ambient_light
-            now_ambient_light = np.clip(np.array(now_ambient_light) + np.random.rand(3) * 0.2 - 0.1, 0, 1)
+            now_ambient_light = np.clip(np.array(now_ambient_light) + self._env_rng.rand(3) * 0.2 - 0.1, 0, 1)
             self.scene.set_ambient_light(now_ambient_light)
         self.cameras.update_wrist_camera(self.robot.left_camera.get_pose(), self.robot.right_camera.get_pose())
         self.scene.update_render()

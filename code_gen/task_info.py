@@ -1463,3 +1463,128 @@ INSERT_PEG_SOCKET = {
         },
     },
 }
+
+INSERT_PEG_SOCKET_ROUND = {
+    "task_name": "insert_peg_socket_round_med",
+    "task_description":
+    "Pick up the round peg standing on the table and insert it into the socket's round bore. \
+                        Both objects are on the same side of the table, so use one arm: if the peg's x coordinate \
+                        (dim 0) is greater than 0 use the right arm, else the left. Grasp the peg's upper contact \
+                        band (contact_point_id=[0,1,2,3]) so the fingers stay clear of the socket rim, lift it, then \
+                        align its functional point 0 (the tip) with the socket's functional point 0 (the mouth of the \
+                        bore, whose axis points INTO the hole) and drive it in with a NEGATIVE `dis`. Approach in two \
+                        stages -- a waypoint just above the mouth, then the insertion -- so the constrained descent is \
+                        short. The peg is a solid of revolution, so do NOT constrain its yaw: place with \
+                        constrain='free', which aligns the peg's axis with the bore's and imposes no rotation about \
+                        it. Open the gripper to release, then retract along the arm axis. \
+                        Note: this is `insert_peg_socket_med` with a round cross-section instead of a square one; \
+                        every other dimension is identical.",
+    "current_code": """
+                class gpt_insert_peg_socket_round_med(insert_peg_socket_round_med):
+                    def play_once(self):
+                        pass
+                """,
+    "actor_list": {
+        "self.peg": {
+            "name": "peg",
+            "description": "The 40 mm diameter x 120 mm round peg standing on the table, to be inserted.",
+            "modelname": "122_peg-round",
+        },
+        "self.socket": {
+            "name": "socket",
+            "description": "The static socket with a chamfered round blind bore; functional point 0 is the mouth.",
+            "modelname": "123_peg-socket-round",
+        },
+    },
+}
+
+PUT_BATTERY_SLOT = {
+    "task_name": "put_battery_slot",
+    "task_description":
+    "Pick up the battery standing on the table and insert it into the slot's round blind bore. \
+                        Both objects are on the same side of the table, so use one arm: if the battery's x \
+                        coordinate (dim 0) is greater than 0 use the right arm, else the left. Grasp the battery, \
+                        lift it, then align its functional point 0 (the base) with the slot's functional point 0 \
+                        (the mouth of the bore, whose axis points INTO the hole) and drive it in with a NEGATIVE \
+                        `dis`. Approach in two stages -- a waypoint just above the mouth, then the insertion -- so \
+                        the constrained descent is short. The battery is a solid of revolution, so do NOT constrain \
+                        its yaw: place with constrain='free'. Open the gripper to release, then retract along the \
+                        arm axis.",
+    "current_code": """
+                class gpt_put_battery_slot(put_battery_slot):
+                    def play_once(self):
+                        pass
+                """,
+    "actor_list": {
+        "self.battery": {
+            "name": "battery",
+            "description": "The 31 mm diameter x 97 mm cell standing on the table, to be inserted.",
+            "modelname": "061_battery",
+        },
+        "self.slot": {
+            "name": "125_battery-slot",
+            "description": "The static slot with a chamfered round blind bore; functional point 0 is the mouth.",
+            "modelname": "125_battery-slot",
+        },
+    },
+}
+
+PUT_BOOK_BOOKCASE = {
+    "task_name": "put_book_bookcase",
+    "task_description":
+    "Pick up the book standing on the table and stand it in the bookcase's centre bay. Both are on \
+                        the same side of the table, so use one arm: if the book's x coordinate (dim 0) is greater \
+                        than 0 use the right arm, else the left. Grasp the book by its TOP contact band \
+                        (contact_point_id=[2,3]) so the fingers stay clear of the bay's posts, lift it, then align \
+                        its functional point 0 (the bottom edge) with the bookcase's functional point 0 (the bay \
+                        floor, whose axis points DOWN the bay) and lower it in. The book has to go in edge-on, so \
+                        constrain='align' its +X onto the bay's depth direction. Release it a little above the floor \
+                        and let it drop the rest, then retract along the arm axis.",
+    "current_code": """
+                class gpt_put_book_bookcase(put_book_bookcase):
+                    def play_once(self):
+                        pass
+                """,
+    "actor_list": {
+        "self.book": {
+            "name": "043_book",
+            "description": "The 97 x 32 x 129 mm book standing on the table, to be shelved.",
+            "modelname": "043_book",
+        },
+        "self.bookcase": {
+            "name": "014_bookcase",
+            "description": "The static four-post bookcase; functional point 0 is the centre bay's floor.",
+            "modelname": "014_bookcase",
+        },
+    },
+}
+
+INSERT_KNIFE_COVER = {
+    "task_name": "insert_knife_cover",
+    "task_description":
+    "Pick up the knife lying on the table and slide it into the cover, which lies on its side with \
+                        its mouth facing the knife. Both are on the same side of the table, so use one arm: if the \
+                        knife's x coordinate (dim 0) is greater than 0 use the right arm, else the left. Grasp the \
+                        knife by its handle, lift it slightly, then align its functional point 1 (the blade tip, \
+                        whose axis runs out along the blade) with the cover's functional point 0 (the mouth, whose \
+                        axis points INTO the slot) and drive it in with a NEGATIVE `dis`. The blade is flat, so \
+                        constrain='align' its thickness onto the slot's narrow direction. Open the gripper to \
+                        release, then retract along the arm axis.",
+    "current_code": """
+                class gpt_insert_knife_cover(insert_knife_cover):
+                    def play_once(self):
+                        pass
+                """,
+    "actor_list": {
+        "self.knife": {
+            "name": "knife",
+            "description": "The 296 mm knife lying flat on the table; functional point 1 is the blade tip.",
+            "modelname": "034_knife",
+        },
+        "self.cover": {
+            "name": "124_knife-cover",
+            "description": "The static knife cover lying on its side; functional point 0 is the slot mouth.",
+            "modelname": "124_knife-cover",
+        },
+    },
+}

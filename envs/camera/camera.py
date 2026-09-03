@@ -75,8 +75,14 @@ except Exception as _pytorch3d_err:
 
 class Camera:
 
-    def __init__(self, bias=0, random_head_camera_dis=0, **kwags):
+    def __init__(self, bias=0, random_head_camera_dis=0, env_rng=None, **kwags):
         """ """
+        # Where the head-camera jitter is drawn from. `Base_Task` passes its `_env_rng`, which
+        # is a dedicated generator when the run sets `env_seed` (so the camera sits in the same
+        # place in every episode) and the plain `np.random` module otherwise -- identical draws
+        # to before in that case, including the two this makes unconditionally at
+        # `random_head_camera_dis: 0`.
+        self._env_rng = np.random if env_rng is None else env_rng
         self.pcd_crop = kwags.get("pcd_crop", False)
         self.pcd_down_sample_num = kwags.get("pcd_down_sample_num", 0)
         self.pcd_crop_bbox = kwags.get("bbox", [[-0.6, -0.35, 0.7401], [0.6, 0.35, 2]])
@@ -128,9 +134,9 @@ class Camera:
 
             camera_config = camera_args[camera_info["type"]]
             cam_pos = np.array(camera_info["position"])
-            vector = np.random.randn(3)
+            vector = self._env_rng.randn(3)
             random_dir = vector / np.linalg.norm(vector)
-            cam_pos = cam_pos + random_dir * np.random.uniform(low=0, high=random_head_camera_dis)
+            cam_pos = cam_pos + random_dir * self._env_rng.uniform(low=0, high=random_head_camera_dis)
             cam_forward = np.array(camera_info["forward"]) / np.linalg.norm(np.array(camera_info["forward"]))
             cam_left = np.array(camera_info["left"]) / np.linalg.norm(np.array(camera_info["left"]))
             up = np.cross(cam_forward, cam_left)

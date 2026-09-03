@@ -5,6 +5,20 @@ save_freq: 15
 embodiment:
 - aloha-agilex
 language_num: 100
+# Fixes the scene across every episode of a run. The wall/table texture, light colors, table
+# height and head-camera jitter below are then drawn from *this* seed rather than the episode's
+# own, so each episode renders the same environment while object poses keep varying with the
+# episode seed. `null` = the original behaviour, where the scene is redrawn per episode.
+# Cluttered-table objects follow the episode seed either way (they rejection-sample around the
+# task objects, which move).
+#
+# This is the ONLY place it is set: collection, eval and rollout collection all read this key
+# out of this file, so a policy is evaluated in the environment its demos were recorded in. No
+# driver has a flag that could drift from it. Setting it also pins the texture POOL to `seen/`
+# on both sides, overriding RoboTwin's seen/unseen split -- otherwise eval would draw a
+# held-out background and the same env_seed would not mean the same scene. Leave it null to
+# keep that split.
+env_seed: null
 domain_randomization:
   random_background: true
   cluttered_table: true
@@ -13,6 +27,16 @@ domain_randomization:
   random_table_height: 0.03
   random_light: true
   crazy_random_light_rate: 0.02
+  # Which pool `random_background` draws wall/table textures from
+  # (assets/background_texture/<pool>):
+  #   null    RoboTwin's held-out split -- `seen/` when collecting, `unseen/` under eval_mode,
+  #           so an eval tests generalisation to backgrounds the policy never trained on
+  #   seen    both sides draw from `seen/`
+  #   unseen  both sides draw from `unseen/`
+  # Naming a pool is what makes an eval render the SAME background as collection: with the same
+  # pool on both sides, one `env_seed` picks the same file. `env_seed` on its own does not do
+  # that -- it fixes which texture is drawn, not which directory it comes from.
+  background_texture_pool: null
 camera:
   head_camera_type: D435
   wrist_camera_type: D435
@@ -27,14 +51,6 @@ data_type:
   endpose: true
   qpos: true
   wrench: true
-  # Demo-retrieval proposals for a steering critic: the top-K demonstration frames most similar
-  # to the current observation contribute their action chunks (`action_proposals`) and the noise
-  # seeds that reproduce those chunks under this observation (`noise_proposals`). Unlike every
-  # flag above, these are produced by the policy rather than the sim -- configure which demo
-  # dataset they come from under `demo_retrieval` in policy/pi05/deploy_policy.yml. Consumed
-  # only by a critic, so both are ignored by a run that has none.
-  action_proposals: false
-  noise_proposals: false
   mesh_segmentation: false
   actor_segmentation: false
 pcd_down_sample_num: 1024

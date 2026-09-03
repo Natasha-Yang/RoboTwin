@@ -1,0 +1,22 @@
+{
+    "raw_description": "socket",
+    "seen": [
+        "gray socket",
+        "round socket",
+        "socket block",
+        "gray socket block",
+        "block with a round hole",
+        "gray block with a hole",
+        "round socket with a chamfered mouth",
+        "flat gray socket block",
+        "gray block with a circular bore",
+        "socket with a round opening",
+        "low gray block with a centered hole",
+        "gray fixture with a round hole"
+    ],
+    "unseen": [
+        "small gray socket",
+        "gray block with a recessed round hole",
+        "round-holed socket block"
+    ]
+}

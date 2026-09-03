@@ -3,6 +3,7 @@
 """
 #!/usr/bin/python3
 """
+import contextlib
 import json
 import sys
 import jax
@@ -50,7 +51,7 @@ PROPOSAL_MODALITIES = ("action_proposals", "noise_proposals")
 #
 # They are mutually exclusive by construction: a DSRL Q(s, w) cannot score an action chunk, so
 # it has nothing to guide or rank with, and `_init_critic` refuses the combination.
-CRITIC_TYPES = ("qmfm", "dsrl")
+CRITIC_TYPES = ("qmfm", "qmfm_iql", "dsrl")
 
 
 class PI0:
@@ -61,7 +62,7 @@ class PI0:
                  online_critic=False, train_critic_online=True,
                  critic_config=None, critic_seed=0, noise_warmup_chunks=0,
                  collect_critic_obs=False, collect_siglip=True,
-                 demo_proposals=(), demo_retrieval=None, task_name=None,
+                 demo_retrieval=None, task_name=None,
                  wrench_trace_len=None):
         self.train_config_name = train_config_name
         self.model_name = model_name
@@ -109,15 +110,16 @@ class PI0:
         # critic's own config once it exists (`_init_critic`).
         self._proposal_key_modalities = {}
 
-        # Demo retrieval (see openpi/policies/demo_retrieval.py). `demo_proposals` names which
-        # of the two proposal modalities the task config's `data_type` block turned on:
-        # `action_proposals` (the retrieved demo chunks) and/or `noise_proposals` (the seeds that
-        # map to them under the current observation). They are critic inputs and nothing else, so
-        # a run without a critic never builds the retriever -- there would be no consumer, and
-        # the inversion is the most expensive thing in the control step.
-        self.proposal_modalities = tuple(demo_proposals or ())
-        if unknown := sorted(set(self.proposal_modalities) - set(PROPOSAL_MODALITIES)):
-            raise ValueError(f"unknown proposal modalities {unknown}; expected {list(PROPOSAL_MODALITIES)}.")
+        # Demo retrieval (see openpi/policies/demo_retrieval.py). The two proposal entries --
+        # `action_proposals` (the retrieved demo chunks) and `noise_proposals` (the seeds that
+        # map to them under the current observation) -- are NOT observation modalities and are
+        # not switched by the task config's `data_type` block. Nothing in `get_obs` produces
+        # them and nothing but a critic consumes them: they are the mechanism by which
+        # everything else the critic encodes *queries* a bank of demonstrations. So the critic's
+        # own `encoder_modalities` is the only switch, exactly as it is for which cameras it
+        # reads -- naming one turns retrieval on, and a run with no critic never builds the
+        # retriever at all.
+        self.proposal_modalities = self._configured_proposals(critic_config)
         self.demo_retriever = None
         self._demo_retrieval_config = dict(demo_retrieval or {})
         self.task_name = task_name
@@ -148,6 +150,13 @@ class PI0:
         # values. It only makes sense against a `critic_ckpt` (see below).
         self.uses_online_critic = bool(online_critic)
         self.train_critic_online = bool(train_critic_online)
+        # The second half of that switch, and the one a *held-out evaluation* flips: whether the
+        # control steps being run are collected at all. `train_critic_online` is a property of
+        # the run and never moves; this goes False for the duration of a `frozen_for_eval` block
+        # so the driver's periodic held-out episodes (eval_interval in deploy_policy.yml) score
+        # the critic without also feeding it -- they are a measurement of the current critic, and
+        # a critic that trained on its own test set could not be compared across evaluations.
+        self._collect_transitions = True
         self.online_critic = None
         self.critic_action_dim = None
         # Which family that critic is, and therefore how it acts on the sampler (CRITIC_TYPES).
@@ -222,7 +231,7 @@ class PI0:
         self.wrench_trace_len = int(wrench_trace_len or pi0_step)
 
         if self.proposal_modalities and not self.uses_online_critic:
-            print(f"[pi_model] no critic this run -- ignoring data_type "
+            print(f"[pi_model] no critic this run -- ignoring encoder_modalities "
                   f"{list(self.proposal_modalities)} (nothing would consume the proposals)")
             self.proposal_modalities = ()
         if self.proposal_modalities:
@@ -240,9 +249,9 @@ class PI0:
         repo_id = cfg.pop("repo_id", None)
         if not repo_id:
             raise ValueError(
-                f"data_type {list(self.proposal_modalities)} needs a demo dataset: set "
-                f"`demo_retrieval.repo_id` in deploy_policy.yml to the LeRobot dataset the "
-                f"demonstrations come from."
+                f"the critic's encoder_modalities names {list(self.proposal_modalities)}, which "
+                f"needs a demo dataset: set `demo_retrieval.repo_id` in deploy_policy.yml to the "
+                f"LeRobot dataset the demonstrations come from."
             )
         if not self.task_name:
             raise ValueError("demo retrieval needs `task_name` to pick demonstrations of the right task.")
@@ -258,6 +267,10 @@ class PI0:
             # critic's `wrench.*` modality was built with -- i.e. this run's, not a second
             # setting inside the retrieval block (which may still override it deliberately).
             wrench_trace_len=cfg.pop("wrench_trace_len", self.wrench_trace_len),
+            # Only consulted when `sensor_modalities` is left unset: the recorded columns to
+            # load are then whichever ones this critic asks for, so a depth camera does not have
+            # to be named twice (once for the encoder, once to have it loaded).
+            critic_modalities=self._critic_wanted_modalities(),
             **cfg,
         )
         episodes = self.demo_retriever.episodes_for_task(self.task_name)
@@ -271,6 +284,54 @@ class PI0:
               + (f", inverted at num_steps={self.demo_retriever.num_steps} x "
                  f"{self.demo_retriever.num_inner_steps} fixed-point iterations"
                  if self.demo_retriever.invert else ", no inversion (action_proposals only)"))
+        print(f"[pi_model] demo rows can be keys for: "
+              f"{list(self.demo_retriever.cotrain_modalities)}")
+
+    def _critic_wanted_modalities(self) -> tuple[str, ...]:
+        """Every modality name this critic's config asks for, keys included.
+
+        The union of `encoder_modalities` (what it encodes at all, which is what a co-training
+        row must supply) and any explicit `key_modalities` on a cross-attending proposal spec
+        (what a retrieved row must supply). It is a superset on purpose -- the retriever
+        intersects it with the columns the demo dataset actually has.
+
+        Read from the config, so it is known before the critic is built; a warm start can still
+        override the architecture from its checkpoint, which `_init_critic` re-checks. A proposal
+        spec written as a plain `true` carries no `key_modalities`, and the critic's own default
+        for those is `siglip.*` + `state`, which every demo dataset serves anyway.
+        """
+        modalities = self._critic_config.get("encoder_modalities") or {}
+        if isinstance(modalities, dict):
+            names = [name for name, spec in modalities.items() if spec]
+            specs = [spec for spec in modalities.values() if isinstance(spec, dict)]
+        else:
+            names, specs = list(modalities), []
+        keys = [k for spec in specs for k in (spec.get("key_modalities") or ())]
+        return tuple(dict.fromkeys([*names, *keys]))
+
+    @staticmethod
+    def _configured_proposals(critic_config):
+        """Which of `PROPOSAL_MODALITIES` the critic's `encoder_modalities` asks for.
+
+        Read from the critic config rather than from the run's observation modalities, because a
+        proposal is not one: `envs/utils/obs_modalities.py` cannot produce it, so validating it
+        against what the sim offers would reject every run. The list is accepted as a mapping
+        (`{name: bool}`, how `cfgs/qmfm.yaml` writes it) or as a plain sequence of names.
+
+        Read from the *config* and not from the built critic because the retriever is opened up
+        front -- a bad `repo_id` should stop the run before an hour of rollouts, and the critic
+        does not exist until the first observation. The two can disagree in one case: a warm
+        start takes its architecture keys from the checkpoint, so `critic_ckpt` can override
+        `encoder_modalities`. `_init_critic` re-checks against the critic that was actually
+        built and turns retrieval back off if it does not read the proposals after all.
+        """
+        modalities = (critic_config or {}).get("encoder_modalities") or ()
+        enabled = (
+            [name for name, on in modalities.items() if on]
+            if isinstance(modalities, dict)
+            else list(modalities)
+        )
+        return tuple(name for name in PROPOSAL_MODALITIES if name in enabled)
 
     @staticmethod
     def _siglip_views(collect_siglip):
@@ -407,6 +468,23 @@ class PI0:
             for name in getattr(self.online_critic, "proposal_modalities", ())
             if name in self.proposal_modalities
         }
+        # A key has to be something a retrieved demo row can actually serve, which is a
+        # property of the demo dataset (its own columns, and which of them this run kept in
+        # `demo_retrieval.sensor_modalities`) -- so the critic side cannot check it and this is
+        # where it lands. At startup rather than at the first control step, because the whole
+        # point of opening the retriever up front is that a bad retrieval config should not cost
+        # an hour of rollouts.
+        servable = set(self.demo_retriever.key_modalities) if self.demo_retriever else set()
+        for name, modalities in self._proposal_key_modalities.items():
+            if missing := [m for m in modalities if m not in servable]:
+                raise ValueError(
+                    f"the critic cross-attends {name!r} with key_modalities {missing}, which a "
+                    f"demonstration from {self._demo_retrieval_config.get('repo_id')} cannot "
+                    f"serve. It can serve {sorted(servable)}. Either drop them from "
+                    f"`key_modalities` (they stay part of the attention *query*), add them to "
+                    f"`demo_retrieval.sensor_modalities` if the dataset has the columns, or "
+                    f"point `repo_id` at a demo dataset that records them."
+                )
         for name, modalities in self._proposal_key_modalities.items():
             for modality in modalities:
                 entry = f"{name}.keys.{modality}"
@@ -629,6 +707,60 @@ class PI0:
         progress = min(1.0, updates / float(self.guidance_ramp_updates))
         return self.guidance_scale_target * progress
 
+    @contextlib.contextmanager
+    def frozen_for_eval(self):
+        """Run rollouts that measure this policy without changing it.
+
+        Used by the driver's periodic held-out evaluation (`eval_interval` in
+        deploy_policy.yml), which re-runs a fixed set of `eval_seed` episodes every so often and
+        makes the resulting success rate the criterion for which critic checkpoint is kept. That
+        only means anything if the evaluation is a pure measurement, so for the duration of the
+        block:
+
+        * **no transition is stashed** -- the driver already skips `commit`/`train_step`, but the
+          stash happens inside `get_action`, so it needs its own switch (`_collect_transitions`).
+          A critic that trained on its own held-out episodes would make successive scores
+          incomparable, and would leak 10 episodes of the fixed evaluation set into the buffer
+          every interval.
+        * **the guidance scale is left exactly where the ramp has it.** Deliberately not the
+          `train_critic_online: false` path, which jumps guidance straight to the target: what is
+          being scored is the policy as it behaves *right now*, not as a later frozen run would.
+        * **the DSRL warmup budget and its RNG do not advance.** `_warmup_noise` draws (and
+          counts down) once per control step, so without this a run with `noise_warmup_chunks`
+          set would spend its warmup on evaluation episodes, and every run's latent sequence
+          would depend on how many evaluations had happened.
+        * **the debug recorders are switched off and their pending values cleared on the way
+          out**, since `QValueRecorder.record` / `BestOfNRecorder.record` consume whatever the
+          last `get_action` left -- a value from an evaluation episode would otherwise be logged
+          against the first control step of the next training episode.
+
+        What is deliberately *not* frozen is the DSRL actor's stochasticity: `noise_apply` samples
+        rather than taking the distribution's mode, exactly as jaxrl2 does in its own eval, so an
+        evaluation sees the same policy the rollouts do.
+        """
+        state = (self._collect_transitions, self._noise_warmup_left,
+                 self._noise_rng.bit_generator.state,
+                 self.record_q_values, self.record_demo_retrieval)
+        self._collect_transitions = False
+        self.record_q_values = False
+        self.record_demo_retrieval = False
+        if self.demo_retriever is not None:
+            self.demo_retriever.record_retrieval = False
+        try:
+            yield
+        finally:
+            (self._collect_transitions, self._noise_warmup_left,
+             self._noise_rng.bit_generator.state,
+             self.record_q_values, self.record_demo_retrieval) = state
+            if self.demo_retriever is not None:
+                self.demo_retriever.record_retrieval = self.record_demo_retrieval
+            # Anything the evaluation's last control step left behind. These are read-and-clear
+            # on the driver's side, so a leftover would be attributed to the wrong episode.
+            self.last_q_values = None
+            self.last_best_scores = None
+            self.last_best_index = None
+            self.last_demo_retrieval = None
+
     # set img_size
     def set_img_size(self, img_size):
         self.img_size = img_size
@@ -828,7 +960,7 @@ class PI0:
         # `encoder_modalities`, so an unused view costs the buffer nothing. A frozen critic
         # skips this entirely -- nothing would ever train on the transitions, and the buffer
         # is allocated lazily, so it never costs the run any memory.
-        if self.train_critic_online:
+        if self.train_critic_online and self._collect_transitions:
             self.online_critic.stash(critic_obs, critic_action)
         if self.record_q_values:
             self.last_q_values = self.online_critic.q_values(critic_obs, critic_action)

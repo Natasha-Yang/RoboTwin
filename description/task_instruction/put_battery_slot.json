@@ -1,0 +1,26 @@
+{
+    "full_description": "use appropriate arm to put the battery into the slot",
+    "schema": "{A} notifies the slot, {B} notifies the battery, {a} notifies the arm to grab the battery",
+    "preference": "num of words should not exceed 10",
+    "seen": [
+        "Put {B} into {A}",
+        "Insert {B} into {A}",
+        "Place {B} in {A} using {a}",
+        "Fit {B} into {A}",
+        "Drop {B} into {A} with {a}",
+        "Slide {B} into {A}",
+        "Seat {B} in {A}",
+        "Load {B} into {A}",
+        "Use {a} to insert {B} into {A}",
+        "Put {B} in {A} with {a}",
+        "Set {B} into {A}",
+        "Install {B} into {A}"
+    ],
+    "unseen": [
+        "Use {a} to put {B} into {A}",
+        "Insert {B} into {A} with {a}.",
+        "Place {B} into {A}.",
+        "Fit {B} into {A} using {a}.",
+        "Load {B} into {A} with {a}"
+    ]
+}

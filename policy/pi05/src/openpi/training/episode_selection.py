@@ -68,10 +68,13 @@ def select_episodes_per_task(repo_id: str, episodes_per_task: int, seed: int) ->
         else:
             instructions.append(ep_tasks[0].strip())
 
+    # No `task_hint` here on purpose: an `episodes_per_task` subset is taken over a whole
+    # multi-task dataset, so there is no single task to hint at. The eval-time retrieval path
+    # does have one -- the task under evaluation -- and passes it (`demo_retrieval`).
     ep_task_names = assign_episode_tasks(instructions)
 
     task_to_eps: dict[str, list[int]] = collections.defaultdict(list)
-    for ep_idx, task_name in zip(ep_indices, ep_task_names):
+    for ep_idx, task_name in zip(ep_indices, ep_task_names, strict=True):
         task_to_eps[task_name].append(ep_idx)
 
     rng = random.Random(seed)
@@ -97,20 +100,33 @@ def select_episodes_per_task(repo_id: str, episodes_per_task: int, seed: int) ->
     return selected, per_task
 
 
-def assign_episode_tasks(instructions: list[str | None]) -> list[str]:
+def assign_episode_tasks(instructions: list[str | None], task_hint: str | None = None) -> list[str]:
     """The RoboTwin task name of every episode, given their instructions in episode-index order.
 
     The module docstring explains how: regex-match the resolved instructions back to the
     templates in `description/task_instruction`, then use episode-index contiguity to settle the
-    ones several tasks could have produced. Shared with inference-time demo retrieval
+    ones several tasks could have produced.
+
+    `task_hint` settles the case contiguity cannot: sibling tasks whose language templates are
+    deliberately identical, like the three `insert_peg_socket_{loose,med,tight}` rungs, which no
+    instruction can tell apart. It is only applied when *every* matched episode could be that
+    task, so passing it against a multi-task dataset is a no-op rather than an override. It is
+    the caller's own task name -- at eval time the task being evaluated -- and never inferred
+    from the dataset's name, which was invisible in the banner and silently stopped working the
+    moment a dataset was renamed. Shared with inference-time demo retrieval
     (`openpi.policies.demo_retrieval`), which needs the same episode -> task map to pick
     demonstrations of the task being evaluated -- whatever instruction each of them happens to
     carry.
     """
-    return _assign_episodes_to_tasks(instructions, _task_matchers())
+    return _assign_episodes_to_tasks(instructions, _task_matchers(), task_hint=task_hint)
 
 
-def _assign_episodes_to_tasks(instructions: list[str | None], matchers: list[tuple[str, re.Pattern]]) -> list[str]:
+def _assign_episodes_to_tasks(
+    instructions: list[str | None],
+    matchers: list[tuple[str, re.Pattern]],
+    *,
+    task_hint: str | None = None,
+) -> list[str]:
     """Assign every episode (given in episode-index order) to a RoboTwin task name.
 
     Uses regex "anchors" (episodes matching exactly one task) to label contiguous blocks,
@@ -118,17 +134,43 @@ def _assign_episodes_to_tasks(instructions: list[str | None], matchers: list[tup
     remaining ties toward the nearer confidently-labelled side.
     """
     n = len(instructions)
+    task_names = {name for name, _ in matchers}
+    if task_hint is not None and task_hint not in task_names:
+        logging.warning("Ignoring unknown RoboTwin task hint %r.", task_hint)
+        task_hint = None
+
     # Candidate task set for each episode.
     candidates: list[set[str]] = []
     for ins in instructions:
         if ins is None:
             candidates.append(set())
         else:
-            candidates.append({name for name, rx in matchers if rx.match(ins)})
+            task_label = _instruction_task_label(ins, task_names)
+            if task_label is not None:
+                candidates.append({task_label})
+            else:
+                candidates.append({name for name, rx in matchers if rx.match(ins)})
+
+    # Single-task LeRobot repos are often named after the RoboTwin task itself. That name is
+    # the missing discriminator for sibling tasks whose language templates are intentionally
+    # identical (for example insert_peg_socket_{loose,med,tight}).
+    nonempty_candidates = [c for c in candidates if c]
+    if task_hint is not None and nonempty_candidates and all(task_hint in c for c in nonempty_candidates):
+        logging.info("Resolved %d episodes to RoboTwin task %r from the dataset repo_id.", n, task_hint)
+        return [task_hint] * n
 
     # Anchors: episodes whose instruction matches exactly one task.
     anchors = [(i, next(iter(c))) for i, c in enumerate(candidates) if len(c) == 1]
     if not anchors:
+        ambiguous = [(i, c) for i, c in enumerate(candidates) if c]
+        if ambiguous:
+            examples = ", ".join(f"episode {i}: {sorted(c)}" for i, c in ambiguous[:3])
+            raise ValueError(
+                "Could not resolve any dataset instruction to one unique RoboTwin task. "
+                "All matched instructions were ambiguous between multiple templates "
+                f"({examples}). If this is a single-task dataset, pass `task_hint` -- at eval "
+                "time that is the run's own task_name, which `demo_retrieval` passes for you."
+            )
         raise ValueError(
             "Could not match any dataset instruction to a task in description/task_instruction. "
             "The dataset instructions do not look like RoboTwin instructions, or the task "
@@ -149,7 +191,7 @@ def _assign_episodes_to_tasks(instructions: list[str | None], matchers: list[tup
         for i in range(a0, a1 + 1):
             assign[i] = name
     # Head before the first anchor and tail after the last inherit the nearest run.
-    for i in range(0, runs[0][1]):
+    for i in range(runs[0][1]):
         assign[i] = runs[0][0]
     for i in range(runs[-1][2] + 1, n):
         assign[i] = runs[-1][0]
@@ -168,7 +210,13 @@ def _assign_episodes_to_tasks(instructions: list[str | None], matchers: list[tup
             else:
                 assign[i] = left if (i - lo) < (hi - i) else right
 
-    return [a for a in assign]  # no None remains: every index was covered above
+    return list(assign)  # no None remains: every index was covered above
+
+
+def _instruction_task_label(instruction: str, task_names: set[str]) -> str | None:
+    """Accept datasets whose episode task is already stored as a RoboTwin task name."""
+    label = re.sub(r"[\s-]+", "_", instruction.strip().lower().rstrip("."))
+    return label if label in task_names else None
 
 
 @functools.lru_cache(maxsize=1)
@@ -204,8 +252,7 @@ def _task_matchers() -> list[tuple[str, re.Pattern]]:
         task_name = task_file.stem
         data = json.loads(task_file.read_text())
         for key in ("seen", "unseen"):
-            for template in data.get(key, []) or []:
-                matchers.append((task_name, build_rx(template)))
+            matchers.extend((task_name, build_rx(template)) for template in data.get(key, []) or [])
     if not matchers:
         raise FileNotFoundError(f"No task instruction templates found under {task_dir}.")
     return matchers
