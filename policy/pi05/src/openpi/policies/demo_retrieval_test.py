@@ -675,6 +675,41 @@ def test_cotrain_rows_reject_a_modality_no_demonstration_carries():
         retriever.cotrain_rows([0], horizon=50, modalities=("state", "wrench.left"))
 
 
+@requires_v21
+def test_a_config_only_retriever_encodes_everything_but_the_views():
+    """No weights: the transform's half of a row is identical, the tower's half says so.
+
+    A critic pretrained on demonstrations over the pose, the wrench and the recorded sensors
+    never runs the image tower, and restoring pi0.5's parameters for it is minutes of I/O and
+    several GB of device memory spent on weights nothing multiplies by (this is what
+    `multisensory_steering/demo_source.py` does offline). So a model *config* is accepted in
+    place of a model -- and then the state and the chunk, which come from the input transform
+    rather than from the network, have to be exactly what the loaded model produces.
+    """
+    config, model = _tiny_aloha_model()
+    loaded = _retriever(config, model)
+    light = _retriever(config, config)
+    assert loaded.encodes and not light.encodes
+    assert (light.action_horizon, light.action_dim) == (loaded.action_horizon, loaded.action_dim)
+    episodes = loaded.episodes_for_task("beat_block_hammer")[:1]
+
+    rows = light.cotrain_rows(episodes, horizon=60, modalities=("state",), state_dim=14)
+    expected = loaded.cotrain_rows(episodes, horizon=60, modalities=("state",), state_dim=14)
+
+    assert set(rows["obs"]) == {"state"}
+    np.testing.assert_array_equal(rows["obs"]["state"], expected["obs"]["state"])
+    np.testing.assert_array_equal(rows["action"], expected["action"])
+    np.testing.assert_array_equal(rows["frame_index"], expected["frame_index"])
+
+    # Everything that does run pi0.5 names the fix rather than failing inside jax.
+    for reach in (
+        lambda: light.cotrain_rows(episodes, horizon=60, modalities=("siglip.head", "state")),
+        lambda: light.select_bank("beat_block_hammer"),
+    ):
+        with pytest.raises(RuntimeError, match=r"model \*config\*"):
+            reach()
+
+
 # ---------------------------------------------------------------------------------------------
 # The contact wrench: stored one row per frame, observed as the previous chunk's trace
 # ---------------------------------------------------------------------------------------------
@@ -937,3 +972,60 @@ def test_cotrain_rows_reject_a_sensor_the_run_did_not_keep():
     episodes = retriever.episodes_for_task("beat_block_hammer")[:1]
     with pytest.raises(KeyError, match="sensor_modalities"):
         retriever.cotrain_rows(episodes, horizon=20, modalities=("state", "pointcloud"))
+
+
+@requires_multimodal
+def test_key_modalities_states_what_a_row_can_serve_before_a_bank_exists():
+    """`pi_model` checks a critic's `key_modalities` at startup, so it needs this bank-free."""
+    config, model = _tiny_aloha_model()
+
+    plain = _retriever(config, model, repo_id=MULTIMODAL_REPO)
+    assert set(plain.key_modalities) == {*demo_retrieval.SIGLIP_VIEWS, "state"}
+
+    rich = _retriever(
+        config, model, repo_id=MULTIMODAL_REPO, wrench_trace_len=4,
+        sensor_modalities=["depth.head", "pointcloud"],
+    )
+    assert set(rich.key_modalities) == {
+        *demo_retrieval.SIGLIP_VIEWS, "state", "depth.head", "pointcloud",
+        *(f"wrench.{k}" for k in rich.reader.wrench_keys),
+    }
+    # ... and it agrees with what critic_keys actually accepts once the bank is built.
+    rich.select_bank("beat_block_hammer")
+    keys = rich.critic_keys([0, 1], rich.key_modalities, state_dim=14)
+    assert set(keys) == set(rich.key_modalities)
+    assert keys["depth.head"].shape == (2, 240, 320)
+    assert keys[f"wrench.{rich.reader.wrench_keys[0]}"].shape == (2, 4, 6)
+
+
+@requires_multimodal
+def test_sensor_modalities_default_to_what_the_critic_asks_for():
+    """`null` means "load what the critic wants", intersected with what the dataset has."""
+    config, model = _tiny_aloha_model()
+    wanted = ("siglip.head", "state", "depth.head", "pointcloud", "images.third_view")
+
+    derived = _retriever(config, model, repo_id=MULTIMODAL_REPO, critic_modalities=wanted)
+    # The two the dataset has; `images.third_view` is dropped rather than raising, because a
+    # critic legitimately encodes modalities no demonstration carries.
+    assert derived.sensor_modalities == ("depth.head", "pointcloud")
+
+    # An explicit list still wins, for loading less than the critic could use.
+    fewer = _retriever(
+        config, model, repo_id=MULTIMODAL_REPO,
+        sensor_modalities=["depth.head"], critic_modalities=wanted,
+    )
+    assert fewer.sensor_modalities == ("depth.head",)
+    # ... and so does an explicit "none".
+    none = _retriever(config, model, repo_id=MULTIMODAL_REPO,
+                      sensor_modalities=[], critic_modalities=wanted)
+    assert none.sensor_modalities == ()
+
+
+@requires_v21
+def test_deriving_against_an_rgb_only_dataset_keeps_nothing_extra():
+    """The intersection is what stops a depth-encoding critic breaking every rgb-only run."""
+    config, model = _tiny_aloha_model()
+    r = _retriever(config, model, repo_id=V21_REPO,
+                   critic_modalities=("state", "depth.head", "wrench.left"))
+    assert r.sensor_modalities == ()
+    assert set(r.key_modalities) == {*demo_retrieval.SIGLIP_VIEWS, "state"}

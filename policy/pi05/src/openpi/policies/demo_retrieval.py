@@ -647,6 +647,16 @@ class DemoRetriever:
 
     Holds the (small) configuration, the reader, and a per-episode cache of encoded frames --
     encoding is the expensive part and an episode re-drawn later in the run is then free.
+
+    `model` may also be a model **config** (`BaseModelConfig`) rather than a loaded model. It
+    carries the two numbers this class needs from it -- `action_horizon` and `action_dim` --
+    but no weights, so the retriever can still do everything that goes through the *input
+    transform* alone: `cotrain_rows` for a critic whose modalities are the pose, the wrench and
+    the recorded sensors, i.e. everything except a `siglip.<view>`. Nothing that runs the image
+    tower or the action expert works there (`ensure_bank`, `propose`, `critic_keys` over a
+    view), and each says so rather than failing inside jax. The point is what it saves an
+    offline caller: restoring pi0.5's parameters is minutes of I/O and several GB of device
+    memory that a tower-free encoding never touches.
     """
 
     def __init__(
@@ -668,11 +678,17 @@ class DemoRetriever:
         invert: bool = True,
         wrench_trace_len: int | None = None,
         sensor_modalities=None,
+        critic_modalities=(),
         encode_batch_size: int = 16,
         debug_top_k: int = 3,
         seed: int = 0,
     ):
         self.model = model
+        # Whether this retriever has the *weights*, or only the shapes. A `BaseModelConfig` has
+        # `action_horizon` and `action_dim` and nothing else, which is enough for the input
+        # transform's half of this class and for `cotrain_rows` over the modalities a demo
+        # dataset serves directly -- see the class docstring.
+        self.encodes = isinstance(model, _model.BaseModel)
         self.input_transform = input_transform
         self.reader = LeRobotEpisodeReader(repo_id, root)
         self.repo_id = repo_id
@@ -694,12 +710,17 @@ class DemoRetriever:
         self.wrench_trace_len = int(wrench_trace_len) if wrench_trace_len else None
         # Recorded sensors to load alongside the model inputs, so they can be cross-attention
         # keys (`critic_keys`) and co-training columns (`cotrain_rows`) like `siglip.<view>`,
-        # `state` and `wrench.<key>` already are. Opt-in and named explicitly rather than
-        # "everything the dataset has", because unlike a SigLIP map these cannot be re-encoded
+        # `state` and `wrench.<key>` already are. Unlike a SigLIP map these cannot be re-encoded
         # from something smaller -- they are resident for every bank row, at ~0.23 MB a camera
-        # frame and ~0.15 MB a depth map. `None`/`()` keeps a run's cost exactly as it was;
-        # `True` takes everything the dataset offers.
-        self.sensor_modalities = self._resolve_sensors(sensor_modalities)
+        # frame and ~0.15 MB a depth map -- so which ones to load is a real choice.
+        #
+        # `None` derives it: whatever `critic_modalities` says the critic wants, intersected
+        # with what this dataset actually has. That intersection is the whole point -- a critic
+        # legitimately encodes modalities no demonstration carries (they stay part of the
+        # attention *query*), so asking for them here would fail every run against an rgb-only
+        # demo dataset. An explicit list overrides it, for loading less than the critic could
+        # use; `True` takes everything the dataset offers, `()` nothing.
+        self.sensor_modalities = self._resolve_sensors(sensor_modalities, critic_modalities)
         self.encode_batch_size = max(1, int(encode_batch_size))
         # How many matches the debug visualization shows. Independent of `top_k` -- the
         # distance over the whole bank comes back anyway, so showing more neighbours than the
@@ -721,6 +742,7 @@ class DemoRetriever:
             self._delta_fallback = _transforms.DeltaActions(NATIVE_DELTA_MASK)
             self.delta_dims = np.flatnonzero(NATIVE_DELTA_MASK)
         self.bank: DemoBank | None = None
+        self._episode_tasks: dict[str | None, list[str]] = {}
         # Debug visualization: keep a head-camera thumbnail per bank row and remember which rows
         # each control step retrieved, so the driver can draw the query frame beside the demo
         # frames it matched (`envs/utils/debug_vis.py::DemoRetrievalRecorder`). Off by default --
@@ -730,9 +752,33 @@ class DemoRetriever:
         self.last_distance: np.ndarray | None = None
         self._encoded: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
         # The un-pooled maps: the bank needs both forms and this is the one they both come from
-        # (`encode_episode` pools it for the distance).
-        self._embed = nnx_utils.module_jit(model.embed_observation_maps)
-        self._propose = nnx_utils.module_jit(model.propose_from_demos, static_argnames=_PROPOSE_STATIC)
+        # (`encode_episode` pools it for the distance). Both are None when `model` is a model
+        # config -- there are no weights to jit, and `_require_model` is what reports that to
+        # anything that reaches for one.
+        self._embed = None if not self.encodes else nnx_utils.module_jit(model.embed_observation_maps)
+        self._propose = (
+            None
+            if not self.encodes
+            else nnx_utils.module_jit(model.propose_from_demos, static_argnames=_PROPOSE_STATIC)
+        )
+
+    def _require_model(self, what: str) -> None:
+        """Fail with the fix when a weights-only operation is asked of a config-only retriever.
+
+        Everything that runs pi0.5 itself goes through here -- the image tower for a bank, for a
+        cross-attention key or for a `siglip.<view>` co-training column, and the action expert
+        for a proposal. A retriever built from a model config has none of that, and the caller
+        that built it chose to (it wanted the input transform), so the error names the choice
+        rather than the missing attribute.
+        """
+        if not self.encodes:
+            raise RuntimeError(
+                f"{what} runs pi0.5, but this DemoRetriever was built from a model *config* "
+                f"rather than a loaded model, so it has the input transform and no weights. "
+                f"Build it with a model restored from the checkpoint (see "
+                f"`policy_config.create_trained_policy`), or drop whatever asked for it -- for a "
+                f"critic training on demonstrations that is its `siglip.<view>` modalities."
+            )
 
     def _probe_action_space(self) -> np.ndarray:
         """Which action dims the policy's transform encodes *relative to the current pose*.
@@ -775,15 +821,19 @@ class DemoRetriever:
         moved = np.abs(encode(0.0) - encode(0.3)).max(axis=0)[:14] > 1e-6
         return np.flatnonzero(moved)
 
-    def _resolve_sensors(self, wanted) -> tuple[str, ...]:
+    def _resolve_sensors(self, wanted, critic_modalities=()) -> tuple[str, ...]:
         """Validate the configured sensor modalities against what this dataset actually has.
 
         Checked here rather than at first use so a typo, or a modality only the multimodal
         converter records, fails while the banner is still printing instead of an hour into the
-        rollouts. `True` means every sensor the dataset carries.
+        rollouts. `True` means every sensor the dataset carries; `None` derives the set from
+        `critic_modalities` (see `__init__`), which is intersected rather than validated,
+        because a critic encoding something no demonstration has is normal.
         """
         available = self.reader.sensor_columns
-        if wanted is None or wanted is False:
+        if wanted is None:
+            return tuple(name for name in available if name in set(critic_modalities))
+        if wanted is False:
             return ()
         if wanted is True:
             return tuple(available)
@@ -796,6 +846,25 @@ class DemoRetriever:
                 "demo dataset converted with those columns."
             )
         return tuple(name for name in available if name in wanted)
+
+    @property
+    def key_modalities(self) -> tuple[str, ...]:
+        """Every modality a retrieved demo row can serve as a cross-attention key.
+
+        Knowable before a bank exists -- it follows the dataset's schema and this run's config,
+        not the frames drawn for a particular task -- so `pi_model` can check a critic's
+        `key_modalities` against it at startup instead of at the first control step.
+
+        `critic_keys` is the authority and reports the same set from the bank it actually built;
+        this is that set stated up front. Anything outside it is either a column the dataset
+        does not have or one this run chose not to keep (`sensor_modalities`).
+        """
+        return (
+            *SIGLIP_VIEWS,
+            "state",
+            *(self.wrench_modalities if self.wrench_trace_len else ()),
+            *self.sensor_modalities,
+        )
 
     @property
     def wrench_modalities(self) -> tuple[str, ...]:
@@ -815,16 +884,29 @@ class DemoRetriever:
         """The shape of one proposal modality, before it is narrowed to embodiment dims."""
         return (self.top_k, self.action_horizon, self.action_dim)
 
-    @functools.cached_property
-    def episode_tasks(self) -> list[str]:
-        """Every demo episode's RoboTwin task name, in episode-index order."""
-        logger.info("Resolving %d demo episodes to RoboTwin tasks...", self.reader.num_episodes)
-        return episode_selection.assign_episode_tasks(self.reader.instructions())
+    def episode_tasks(self, task_hint: str | None = None) -> list[str]:
+        """Every demo episode's RoboTwin task name, in episode-index order.
+
+        `task_hint` is the task the caller is asking about -- the one under evaluation. It only
+        matters for a dataset whose episodes no instruction can tell apart, which for RoboTwin
+        means the `insert_peg_socket_{loose,med,tight}` rungs: they share the template "Insert
+        {B} into {A}.", so a dataset of one of them is otherwise unresolvable. Applied only when
+        every matched episode could be that task, so it is a no-op against a multi-task dataset
+        rather than a way to mislabel one. Cached per hint, since resolving is a regex pass over
+        every episode.
+        """
+        if task_hint not in self._episode_tasks:
+            logger.info("Resolving %d demo episodes to RoboTwin tasks...", self.reader.num_episodes)
+            self._episode_tasks[task_hint] = episode_selection.assign_episode_tasks(
+                self.reader.instructions(), task_hint=task_hint
+            )
+        return self._episode_tasks[task_hint]
 
     def episodes_for_task(self, task_name: str) -> list[int]:
-        matching = [i for i, name in enumerate(self.episode_tasks) if name == task_name]
+        tasks = self.episode_tasks(task_name)
+        matching = [i for i, name in enumerate(tasks) if name == task_name]
         if not matching:
-            available = sorted(set(self.episode_tasks))
+            available = sorted(set(tasks))
             raise ValueError(
                 f"demo dataset {self.repo_id!r} has no episodes of task {task_name!r}. " f"It covers: {available}."
             )
@@ -1084,6 +1166,7 @@ class DemoRetriever:
         row). Keeping the reduction inside the loop is what makes an episode's encoding cost
         bounded by `encode_batch_size` rather than by its length.
         """
+        self._require_model("encoding a camera view into SigLIP patch features")
         rows = len(jax.tree.leaves(obs)[0])
         for start in range(0, rows, self.encode_batch_size):
             group = jax.tree.map(
@@ -1148,6 +1231,7 @@ class DemoRetriever:
         pass of the action expert, so the pool is as wide as the caller is willing to pay for
         and no wider.
         """
+        self._require_model("retrieving proposals")
         if self.bank is None:
             raise RuntimeError("No demo bank yet; call ensure_bank(task_name) first.")
         # Copied first: the transforms may modify their input in place, and this is the same
@@ -1318,6 +1402,7 @@ class DemoRetriever:
         # Only the SigLIP views go through the tower; a pose, a wrench trace and a recorded
         # sensor are already arrays on the bank row.
         if views := [name for name in wanted if name in SIGLIP_VIEWS]:
+            self._require_model(f"building attention keys from {views}")
             group = jax.tree.map(lambda x: jnp.asarray(x[rows]), self.bank.obs)
             maps = self._embed(_model.Observation.from_dict(group))
             if missing := [view for view in views if view not in maps]:
@@ -1441,9 +1526,14 @@ class DemoRetriever:
                 + " Drop them from the critic's `encoder_modalities`, or co-train on a rollout "
                 "dataset instead."
             )
-        views = tuple(name for name in modalities if name in SIGLIP_VIEWS)
         wanted_wrench = tuple(name for name in modalities if name.startswith(WRENCH_MODALITY_PREFIX))
         wanted_sensors = tuple(name for name in modalities if name in self.sensor_modalities)
+        # A camera view goes through the image tower unless the dataset stores the feature map
+        # itself as a column, in which case it is read like any other recorded sensor. No
+        # converter writes one today -- a demo dataset holds frames, not features -- but the
+        # condition is what decides whether the tower is needed at all, and a caller that built
+        # this retriever from a model config (no weights) decided the same way.
+        views = tuple(name for name in modalities if name in SIGLIP_VIEWS and name not in wanted_sensors)
         horizon = int(horizon)
         if horizon < 1:
             raise ValueError(f"horizon must be >= 1 primitive step, got {horizon}.")
@@ -1455,7 +1545,10 @@ class DemoRetriever:
         for episode in episodes:
             frames = np.arange(0, self.reader.episode_length(episode), horizon)
             transformed = self._transform_frames(episode, frames, wrench_trace_len=horizon)
-            for group in self._tower_batches(transformed["obs"]):
+            # Skipped entirely when no view is wanted: the tower is by far the most expensive
+            # thing here, and a critic that encodes the pose, the wrench and the recorded
+            # sensors needs none of it (nor, then, the policy's weights at all).
+            for group in self._tower_batches(transformed["obs"]) if views else ():
                 if missing := [view for view in views if view not in group]:
                     raise ValueError(f"the policy does not expose {missing} to the critic.")
                 for view in views:

@@ -1,0 +1,26 @@
+{
+    "full_description": "use appropriate arm to put the book into the bookcase",
+    "schema": "{A} notifies the bookcase, {B} notifies the book, {a} notifies the arm to grab the book",
+    "preference": "num of words should not exceed 10",
+    "seen": [
+        "Put {B} into {A}",
+        "Place {B} in {A}",
+        "Shelve {B} in {A}",
+        "Slide {B} into {A} using {a}",
+        "Stand {B} in {A}",
+        "File {B} into {A}",
+        "Insert {B} into {A}",
+        "Put {B} on {A} with {a}",
+        "Use {a} to shelve {B} in {A}",
+        "Set {B} into {A}",
+        "Place {B} into {A} with {a}",
+        "Store {B} in {A}"
+    ],
+    "unseen": [
+        "Use {a} to put {B} into {A}",
+        "Shelve {B} in {A} with {a}.",
+        "Place {B} into {A}.",
+        "Stand {B} up in {A} using {a}.",
+        "Slide {B} into {A}."
+    ]
+}

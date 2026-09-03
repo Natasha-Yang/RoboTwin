@@ -14,6 +14,69 @@ from openpi.training import config as _config
 import openpi.transforms as transforms
 
 
+def _resolved_data_config(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path,
+    *,
+    norm_stats: dict[str, transforms.NormStats] | None = None,
+    robotwin_repo_id: str | None = None,
+) -> tuple[_config.DataConfig, dict[str, transforms.NormStats]]:
+    """The checkpoint's data config and the norm stats its transforms have to use.
+
+    Split out of `create_trained_policy` so a caller that wants only the *transforms* -- the
+    resize, the delta-action encoding, the normalization -- can have them without restoring the
+    model's parameters, which is minutes of I/O and a few GB of device memory. The norm stats
+    deliberately come from the checkpoint's own `assets/` rather than from the config's assets
+    dir: they are what that training run normalized with, and a policy (or an offline encoding
+    of the same data) using any other set is reading a different observation.
+    """
+    if norm_stats is not None:
+        return train_config.data.create(train_config.assets_dirs, train_config.model), norm_stats
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if robotwin_repo_id is not None:
+        data_config = dataclasses.replace(data_config, asset_id=robotwin_repo_id)
+    if data_config.asset_id is None:
+        raise ValueError("Asset id is required to load norm stats.")
+    return data_config, _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+
+
+def create_input_transform(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path | str,
+    *,
+    repack_transforms: transforms.Group | None = None,
+    default_prompt: str | None = None,
+    norm_stats: dict[str, transforms.NormStats] | None = None,
+    robotwin_repo_id: str | None = None,
+) -> transforms.DataTransformFn:
+    """A trained checkpoint's input transform alone, **without loading its weights**.
+
+    Exactly the chain `create_trained_policy` composes for `Policy._input_transform`, so what
+    comes out of this is the same model-space observation, the same normalized (and, for aloha,
+    delta-encoded) action chunk, and the same 224x224 camera views the policy itself would
+    produce -- the difference is only that no parameters are restored.
+
+    That matters for anything that turns a dataset into the policy's own input space but never
+    runs the network on it: `openpi.policies.demo_retrieval.DemoRetriever` built with a model
+    *config* rather than a model (a critic that trains on demonstrations but encodes no
+    `siglip.<view>` needs the transform and no tower), and the offline tooling around it.
+    """
+    checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    repack_transforms = repack_transforms or transforms.Group()
+    data_config, norm_stats = _resolved_data_config(
+        train_config, checkpoint_dir, norm_stats=norm_stats, robotwin_repo_id=robotwin_repo_id
+    )
+    return transforms.compose(
+        [
+            *repack_transforms.inputs,
+            transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ]
+    )
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -57,15 +120,11 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-    if norm_stats is None:
-        if robotwin_repo_id is not None:
-            data_config = dataclasses.replace(data_config, asset_id=robotwin_repo_id)
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    # The norm stats come from the checkpoint instead of the config assets dir to make sure that
+    # the policy is using the same normalization stats as the original training process.
+    data_config, norm_stats = _resolved_data_config(
+        train_config, checkpoint_dir, norm_stats=norm_stats, robotwin_repo_id=robotwin_repo_id
+    )
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

@@ -51,7 +51,7 @@ PROPOSAL_MODALITIES = ("action_proposals", "noise_proposals")
 #
 # They are mutually exclusive by construction: a DSRL Q(s, w) cannot score an action chunk, so
 # it has nothing to guide or rank with, and `_init_critic` refuses the combination.
-CRITIC_TYPES = ("qmfm", "dsrl")
+CRITIC_TYPES = ("qmfm", "qmfm_iql", "dsrl")
 
 
 class PI0:
@@ -62,7 +62,7 @@ class PI0:
                  online_critic=False, train_critic_online=True,
                  critic_config=None, critic_seed=0, noise_warmup_chunks=0,
                  collect_critic_obs=False, collect_siglip=True,
-                 demo_proposals=(), demo_retrieval=None, task_name=None,
+                 demo_retrieval=None, task_name=None,
                  wrench_trace_len=None):
         self.train_config_name = train_config_name
         self.model_name = model_name
@@ -110,15 +110,16 @@ class PI0:
         # critic's own config once it exists (`_init_critic`).
         self._proposal_key_modalities = {}
 
-        # Demo retrieval (see openpi/policies/demo_retrieval.py). `demo_proposals` names which
-        # of the two proposal modalities the task config's `data_type` block turned on:
-        # `action_proposals` (the retrieved demo chunks) and/or `noise_proposals` (the seeds that
-        # map to them under the current observation). They are critic inputs and nothing else, so
-        # a run without a critic never builds the retriever -- there would be no consumer, and
-        # the inversion is the most expensive thing in the control step.
-        self.proposal_modalities = tuple(demo_proposals or ())
-        if unknown := sorted(set(self.proposal_modalities) - set(PROPOSAL_MODALITIES)):
-            raise ValueError(f"unknown proposal modalities {unknown}; expected {list(PROPOSAL_MODALITIES)}.")
+        # Demo retrieval (see openpi/policies/demo_retrieval.py). The two proposal entries --
+        # `action_proposals` (the retrieved demo chunks) and `noise_proposals` (the seeds that
+        # map to them under the current observation) -- are NOT observation modalities and are
+        # not switched by the task config's `data_type` block. Nothing in `get_obs` produces
+        # them and nothing but a critic consumes them: they are the mechanism by which
+        # everything else the critic encodes *queries* a bank of demonstrations. So the critic's
+        # own `encoder_modalities` is the only switch, exactly as it is for which cameras it
+        # reads -- naming one turns retrieval on, and a run with no critic never builds the
+        # retriever at all.
+        self.proposal_modalities = self._configured_proposals(critic_config)
         self.demo_retriever = None
         self._demo_retrieval_config = dict(demo_retrieval or {})
         self.task_name = task_name
@@ -230,7 +231,7 @@ class PI0:
         self.wrench_trace_len = int(wrench_trace_len or pi0_step)
 
         if self.proposal_modalities and not self.uses_online_critic:
-            print(f"[pi_model] no critic this run -- ignoring data_type "
+            print(f"[pi_model] no critic this run -- ignoring encoder_modalities "
                   f"{list(self.proposal_modalities)} (nothing would consume the proposals)")
             self.proposal_modalities = ()
         if self.proposal_modalities:
@@ -248,9 +249,9 @@ class PI0:
         repo_id = cfg.pop("repo_id", None)
         if not repo_id:
             raise ValueError(
-                f"data_type {list(self.proposal_modalities)} needs a demo dataset: set "
-                f"`demo_retrieval.repo_id` in deploy_policy.yml to the LeRobot dataset the "
-                f"demonstrations come from."
+                f"the critic's encoder_modalities names {list(self.proposal_modalities)}, which "
+                f"needs a demo dataset: set `demo_retrieval.repo_id` in deploy_policy.yml to the "
+                f"LeRobot dataset the demonstrations come from."
             )
         if not self.task_name:
             raise ValueError("demo retrieval needs `task_name` to pick demonstrations of the right task.")
@@ -266,6 +267,10 @@ class PI0:
             # critic's `wrench.*` modality was built with -- i.e. this run's, not a second
             # setting inside the retrieval block (which may still override it deliberately).
             wrench_trace_len=cfg.pop("wrench_trace_len", self.wrench_trace_len),
+            # Only consulted when `sensor_modalities` is left unset: the recorded columns to
+            # load are then whichever ones this critic asks for, so a depth camera does not have
+            # to be named twice (once for the encoder, once to have it loaded).
+            critic_modalities=self._critic_wanted_modalities(),
             **cfg,
         )
         episodes = self.demo_retriever.episodes_for_task(self.task_name)
@@ -281,6 +286,52 @@ class PI0:
                  if self.demo_retriever.invert else ", no inversion (action_proposals only)"))
         print(f"[pi_model] demo rows can be keys for: "
               f"{list(self.demo_retriever.cotrain_modalities)}")
+
+    def _critic_wanted_modalities(self) -> tuple[str, ...]:
+        """Every modality name this critic's config asks for, keys included.
+
+        The union of `encoder_modalities` (what it encodes at all, which is what a co-training
+        row must supply) and any explicit `key_modalities` on a cross-attending proposal spec
+        (what a retrieved row must supply). It is a superset on purpose -- the retriever
+        intersects it with the columns the demo dataset actually has.
+
+        Read from the config, so it is known before the critic is built; a warm start can still
+        override the architecture from its checkpoint, which `_init_critic` re-checks. A proposal
+        spec written as a plain `true` carries no `key_modalities`, and the critic's own default
+        for those is `siglip.*` + `state`, which every demo dataset serves anyway.
+        """
+        modalities = self._critic_config.get("encoder_modalities") or {}
+        if isinstance(modalities, dict):
+            names = [name for name, spec in modalities.items() if spec]
+            specs = [spec for spec in modalities.values() if isinstance(spec, dict)]
+        else:
+            names, specs = list(modalities), []
+        keys = [k for spec in specs for k in (spec.get("key_modalities") or ())]
+        return tuple(dict.fromkeys([*names, *keys]))
+
+    @staticmethod
+    def _configured_proposals(critic_config):
+        """Which of `PROPOSAL_MODALITIES` the critic's `encoder_modalities` asks for.
+
+        Read from the critic config rather than from the run's observation modalities, because a
+        proposal is not one: `envs/utils/obs_modalities.py` cannot produce it, so validating it
+        against what the sim offers would reject every run. The list is accepted as a mapping
+        (`{name: bool}`, how `cfgs/qmfm.yaml` writes it) or as a plain sequence of names.
+
+        Read from the *config* and not from the built critic because the retriever is opened up
+        front -- a bad `repo_id` should stop the run before an hour of rollouts, and the critic
+        does not exist until the first observation. The two can disagree in one case: a warm
+        start takes its architecture keys from the checkpoint, so `critic_ckpt` can override
+        `encoder_modalities`. `_init_critic` re-checks against the critic that was actually
+        built and turns retrieval back off if it does not read the proposals after all.
+        """
+        modalities = (critic_config or {}).get("encoder_modalities") or ()
+        enabled = (
+            [name for name, on in modalities.items() if on]
+            if isinstance(modalities, dict)
+            else list(modalities)
+        )
+        return tuple(name for name in PROPOSAL_MODALITIES if name in enabled)
 
     @staticmethod
     def _siglip_views(collect_siglip):
@@ -417,6 +468,23 @@ class PI0:
             for name in getattr(self.online_critic, "proposal_modalities", ())
             if name in self.proposal_modalities
         }
+        # A key has to be something a retrieved demo row can actually serve, which is a
+        # property of the demo dataset (its own columns, and which of them this run kept in
+        # `demo_retrieval.sensor_modalities`) -- so the critic side cannot check it and this is
+        # where it lands. At startup rather than at the first control step, because the whole
+        # point of opening the retriever up front is that a bad retrieval config should not cost
+        # an hour of rollouts.
+        servable = set(self.demo_retriever.key_modalities) if self.demo_retriever else set()
+        for name, modalities in self._proposal_key_modalities.items():
+            if missing := [m for m in modalities if m not in servable]:
+                raise ValueError(
+                    f"the critic cross-attends {name!r} with key_modalities {missing}, which a "
+                    f"demonstration from {self._demo_retrieval_config.get('repo_id')} cannot "
+                    f"serve. It can serve {sorted(servable)}. Either drop them from "
+                    f"`key_modalities` (they stay part of the attention *query*), add them to "
+                    f"`demo_retrieval.sensor_modalities` if the dataset has the columns, or "
+                    f"point `repo_id` at a demo dataset that records them."
+                )
         for name, modalities in self._proposal_key_modalities.items():
             for modality in modalities:
                 entry = f"{name}.keys.{modality}"

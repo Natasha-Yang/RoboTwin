@@ -145,11 +145,6 @@ def get_model(usr_args):
     noise_warmup_chunks = int(usr_args.get("noise_warmup_chunks", 0) or 0)
     # Demo retrieval (openpi/policies/demo_retrieval.py). Which of the two proposal modalities
     # is on comes from the *task config's* `data_type` block, like every other modality --
-    # `script/eval_policy.py` forwards the two flags as `demo_proposals` because these are
-    # produced by the policy rather than by the sim, so they cannot ride in on the observation.
-    # `demo_retrieval` in deploy_policy.yml carries the rest (which dataset, how many demos,
-    # how many neighbours, how hard to invert). Both are inert without a critic to feed.
-    demo_proposals = tuple(name for name, on in (usr_args.get("demo_proposals") or {}).items() if on)
     demo_retrieval = dict(usr_args.get("demo_retrieval") or {})
     demo_retrieval.setdefault("seed", usr_args.get("seed", 0) or 0)
 
@@ -163,7 +158,7 @@ def get_model(usr_args):
                noise_warmup_chunks=noise_warmup_chunks,
                collect_critic_obs=usr_args.get("collect_critic_obs", False),
                collect_siglip=usr_args.get("collect_siglip", True),
-               demo_proposals=demo_proposals, demo_retrieval=demo_retrieval,
+               demo_retrieval=demo_retrieval,
                task_name=usr_args.get("task_name"),
                wrench_trace_len=usr_args.get("wrench_trace_len"))  # None -> pi0_step
 

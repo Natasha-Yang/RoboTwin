@@ -176,14 +176,34 @@ On the **login node**:
 bash script/_download_assets.sh   # downloads + unzips assets, then fixes paths
 ```
 
-**The peg-insertion socket is generated, not downloaded.** `assets/*` is gitignored, so the
-`121_peg-socket` mesh used by `insert_peg_socket_{loose,med,tight}` (§3.5) is produced by a
+**The peg-insertion assets are generated, not downloaded.** `assets/*` is gitignored, so the
+three meshes the peg-insertion tasks use (§3.5) — `121_peg-socket` (square bore),
+`122_peg-round` (round peg) and `123_peg-socket-round` (round bore) — are produced by one
 checked-in script rather than shipped. Run it once per clone / cluster, on a login node or
 anywhere — it needs no GPU:
 
 ```bash
 python script/gen_peg_socket_asset.py --verify
 ```
+
+One command writes all of them, and the task module raises at import if **any** is missing.
+
+A **second** generator does the same job for the four tasks in §3.6:
+
+```bash
+python script/gen_task_assets.py --verify
+```
+
+It both **generates** two receptacles nothing in the library provides (`124_knife-cover`,
+`125_battery-slot`) and **annotates, in place**, four shipped assets that are unusable as they
+stand. That second job is worth knowing about: **24 of the ~121 shipped assets carry only
+`{stable, center, extents}`** in their `model_data*.json` — no `scale`, no contact points, no
+functional points. That is not a soft failure. `create_actor` swallows the missing `scale` in a
+bare `except` (`envs/utils/create_actor.py:531`), leaves `scale` at its `(1,1,1)` default and
+sets `model_data=None`, so the asset loads at its **raw ~1.9 m size** and every
+`get_contact_point` / `get_functional_point` returns `None`. Three of the four tasks below
+depend on exactly such assets. Re-running `script/_download_assets.sh` restores the shipped
+files and reverts the annotation — re-run the generator afterwards.
 
 `--verify` loads each variant in a headless SAPIEN scene and asserts the geometry survived.
 That check is not optional paranoia: SAPIEN's actor builder swallows collision-shape cook
@@ -436,12 +456,13 @@ Two consequences worth knowing:
 - A config with `save_freq: null` has no frame cadence to stack against, so the wrench is left
   out rather than stored ragged.
 
-### 3.5 The peg-insertion ladder (`insert_peg_socket_{loose,med,tight}`)
+### 3.5 The peg-insertion tasks (`insert_peg_socket_*`)
 
-Three registered tasks added by this fork, and the only **clearance fit** in the task set —
+Four registered tasks added by this fork, and the only **clearance fits** in the task set —
 every shipped RoboTwin task is a pick-and-place, hang, press or stack, where contact force is
-incidental. Here it is the signal, which is what makes it the task to point a `wrench.*`
-critic at (§5a, §6.1).
+incidental. Here it is the signal, which is what makes them the tasks to point a `wrench.*`
+critic at (§5a, §6.1). Three are a square-peg difficulty ladder; the fourth is the round-peg
+counterpart of its middle rung (§3.5.1).
 
 One arm grasps a standing 40 x 40 x 120 mm peg (a `create_box` primitive, so its contact and
 functional points come for free) and inserts it into a static socket's chamfered square blind
@@ -524,6 +545,187 @@ So `loose` is effectively a **contact-free control condition** — at 6 mm clear
 touches the bore — while `tight` binds hard (one demo peaked at 97 N). A critic given only
 `wrench.{fl,fr}_link*` will mostly see grip preload; give it `wrench.{left,right}` too, or
 instead, if what you want is the interaction force.
+
+#### 3.5.1 The round rung (`insert_peg_socket_round_med`)
+
+A cylindrical peg in a round bore, and otherwise `insert_peg_socket_med` to the millimetre:
+same 120 mm peg length, same 40 mm width across the fit (the cylinder inscribes in the
+square), same 0.10 x 0.10 x 0.05 socket block, same 0.038 m bore depth, same 3.0 mm clearance
+per side, same 6 mm 45° lead-in, same spawn ranges, same expert, same grasp band. The
+cross-section of the fit is the only difference, so a difference in outcome is attributable to
+it. It is one task, not a ladder — the generator writes all three round rungs (`model_id`
+0/1/2, the same clearances), so adding `_round_loose` / `_round_tight` is one ten-line file
+each on the model of `envs/insert_peg_socket_round_med.py`.
+
+Two assets instead of one. A box gets contact and functional points from `create_box` for
+free; there is no such primitive for a cylinder (`create_cylinder` returns a bare `Entity`
+with no Actor data, and its long axis is X, not Z), so **`122_peg-round`** is a mesh whose
+`model_data0.json` reproduces the box's points exactly — the same two functional points at
+±60 mm and the same 8 contact points, 4 per band at the same azimuths and the same
+±0.7 · half-length. `contact_point_id=[0,1,2,3]` therefore means the same upper band on either
+peg and the two tasks grasp identically. A cylinder would happily take eight azimuths per
+band; matching the box is the deliberate choice, so the grasp phase is not a confound.
+
+**`123_peg-socket-round`** is the socket. An annulus is not convex, so its wall is cut into
+**32 angular wedges** (plus the floor: 33 convex pieces) rather than the square's four slabs.
+Each wedge is the convex hull of the same pentagon profile swept between two boundary rays, so
+its inner face is a **chord**, not an arc — the collision bore is really a regular 32-gon. The
+radii are scaled by `1/cos(π/32)` so the polygon **circumscribes** the nominal circle: the
+narrowest point of the bore is then exactly the nominal clearance and the faceting can only
+ever add room, at most **0.11 mm** — 3.7% of this rung's clearance, and far below the ~1.3 mm
+placement error the expert actually has. Wedge boundaries start at 45° so the outer square's
+corners land on them and each wedge meets exactly one square edge, which is what keeps the
+hull equal to the wedge instead of cutting a corner off. `--verify` asserts the fit directly:
+the bore must be clear at the nominal radius at every azimuth and solid 3 mm beyond it.
+
+**No yaw to get right**, and that is the substantive difference. The square task must rotate
+the peg onto one of the bore's four symmetry axes before descending; every yaw seats a
+cylinder, so the round task sets `place_constrain = "free"`, which aligns the peg's axis with
+the bore's by the minimal rotation and imposes nothing about rotation *around* it. That is the
+same argument that made the square peg offer four axes instead of one, taken to its limit, and
+it removes the `get_align_matrix` near-antiparallel discontinuity outright rather than merely
+steering around it. The clearance is also isotropic — a square peg in a square bore has 3.0 mm
+at the flats but 4.2 mm on the diagonal and can wedge on two corners; a round fit has 3.0 mm
+everywhere, which is the classical peg-in-hole geometry.
+
+Measured, and the two tasks are interchangeable where it matters:
+
+| | square med | round med |
+|---|---|---|
+| capture radius (peg released 5 mm above the mouth) | 8 mm | 8–10 mm |
+| expert yield, `demo_smoke` 10 episodes | 10/12 | 10/12 |
+| seeds the expert failed | 0, 1 | 0, 1 — **the same ones** |
+
+The shared failure set is the same grasp-phase plan failure the square ladder has, so eval's
+expert-feasibility gate selects the same seeds on both and success rates compare directly.
+
+**The wrench does not carry over, and this is the one thing to know before pointing a critic
+at it.** §3.5's rule — links are grip preload, arm sums are external contact — holds because
+two flat fingers on a flat face press in exact opposition and cancel in the sum. A cylinder
+has no face to align the fingers to: it settles wherever contact friction stops it, generally
+slightly off-centre, and the two normals come out **~14° from opposed**. Mid-carry, one demo:
+
+| | `fl_link7` | `fl_link8` | arm sum |
+|---|---|---|---|
+| square med | (−27.8, 5.1, 0.0) N | (27.8, −5.1, 0.0) N | **0.05 N** |
+| round med | (−21.6, 15.7, −0.3) N | (24.4, −10.0, 0.3) N | **6.4 N** |
+
+So the round task's `wrench.{left,right}` is **not** a near-zero-baseline external-contact
+channel: it sits on a flat ~6.4 N plateau for the whole carry, from grasp to release. It is
+still usable — the plateau is genuinely flat and remarkably episode-consistent (peak over 5
+demos: 6.42–6.73 N, σ 0.11 N, against the square rung's 0.52–9.02 N, which varies with whether
+that episode's peg caught a corner) — so external contact still reads as a deviation on top of
+it. But a critic cannot treat "arm sum ≈ 0" as "not touching anything", and the round task's
+absolute arm-sum numbers are not comparable with the square ladder's. `wrench/<link>` behaves
+as before: a ~27 N plateau that swamps the insertion.
+
+### 3.6 Four more receptacle tasks (dumbbell rack, bookcase, knife cover, battery slot)
+
+Added alongside the peg family, and sharing its shape: an object is grasped and put into (or
+onto) a static receptacle. Their assets come from `script/gen_task_assets.py` (§1.4), which
+must be run once per clone. **Not all four work** — the table says exactly where each stands,
+because a task that never succeeds is not a harmless no-op: the seed loop in `collect_data.py`
+is **uncapped**, so putting an unvalidated task into `collect_all_data.sh` /
+`submit_all_data.sh` spins forever rather than failing. Check the status column before adding
+one to a bulk run.
+
+| task | fit | assets | status |
+|---|---|---|---|
+| `put_battery_slot` | 31 mm cell in a 37 mm bore, **3.0 mm/side** | `061_battery/base1` (annotated) + `125_battery-slot` (generated) | **works** — clean insertions measured at 0.4 mm lateral, 39 mm of a 40 mm bore, uprightness 0.997. Yield needs raising (see below) |
+| `put_book_bookcase` | 32 mm book in a 44 mm bay, **6.0 mm/side** | `014_bookcase/base3` (annotated) + `043_book/base0` (rescaled, top-down grasp, bottom-edge point) | **works** — 4/8, seated to 1.7 mm with 0.8–2.9 mm lateral |
+| `insert_knife_cover` | 6.3 x 43.5 mm blade in a 10.3 x 47.5 mm slot, **2.0 mm/side** | `034_knife/base0` (rescaled, blade-tip point) + `124_knife-cover` (generated) | **0/6**, instruction JSON parked as `.json.disabled`. Assets verified; the expert does not plan and some seeds still eject the knife — see below |
+| `put_dumbbell_rack` | place-on | `052_dumbbell` + `013_dumbbell-rack/base0` (annotated) | **0/4 — blocked on the asset**, see below. Its instruction JSON is parked as `.json.disabled` so `collect_all_data.sh` does not sweep it up |
+
+All three insertions reuse the peg family's two idioms verbatim, for the reasons
+`envs/_peg_insertion_base.py` documents: a **hand-built two-stage constrained descent**
+(`place_actor` emits bare `Action(arm, "move", …)` with no `constraint_pose`, and the planner
+is free to bow the path by more than the clearance), and an explicit **`align_axis` list** so
+`get_align_matrix` never reaches its `‖v1 × v2‖ < 1e-6` branch, where it silently returns
+identity.
+
+**`put_battery_slot` yield, and what the failures are.** Against the peg family's ~75% this
+is low, but the successes are unambiguous: fully seated (39 mm of a 40 mm bore), lateral under
+half a millimetre, uprightness 0.997. Almost every failure is the **final constrained
+descent**, and it fails in a very specific state — the cell already hanging over the mouth
+aligned to **0.2 mm**, gripper closed, and curobo simply will not plan the last 43 mm with the
+orientation pinned. Things tried and measured: removing the `constraint_pose` on that leg
+(no better — the failure just moves later), shortening it via `NEAR_INSERT_DIS` (6 mm vs
+15 mm, no better), and narrowing the cell's `xlim` (helps the *grasp* failures, not this).
+What is left is the receptacle's y: the peg family puts its socket at **positive** y and the
+identical descent plans there, so that is what the slot now uses.
+
+**The reach trap, which cost both of the tasks that failed to plan.** `get_grasp_pose` stands
+the end-effector **0.12 m** back from the contact point along the approach direction
+(`_base_task.py:1200`), and `pre_grasp_dis` adds to that. So a *side* grasp of an object near
+the edge of its spawn range puts the pre-grasp pose ~0.2 m further out again — around
+|x| = 0.45 m for a book at x = −0.26, well outside the arm's reach — and the grasp fails to
+plan on every seed while the goal pose itself is perfectly reachable in isolation. Two fixes,
+both used here: annotate a **top-down** grasp instead (what took `put_book_bookcase` from 0/8
+to 4/8), or narrow the object's `xlim` (`put_battery_slot` is at ±0.22, not the peg family's
+±0.26). The same trap has a second form on the *place* side: a receptacle at **positive** y
+(away from the robot) was unplannable to carry an object out to, while the identical goal was
+reachable from the home pose — the shipped receptacle tasks all put theirs at negative y
+(`place_object_stand` uses `[-0.15, -0.1]`), and matching that fixed it.
+
+**`check_stable` does not catch an object that is launched.** It settles the scene and then
+flags only a **quaternion** change over the last samples (`_base_task.py:228-256`) — position
+drift is never checked. So a spawn pose that intersects the table produces an object PhysX
+ejects at high speed with its orientation intact, and the episode proceeds normally with the
+object metres away. Measured while debugging `insert_knife_cover`: a wrong spawn quaternion
+stood the 192 mm knife on end at a height meant for its 6 mm half-thickness, and it came to
+rest **42 m** from the table without a single warning. If a task fails in a way that makes no
+sense, print the actor's world position first. (The specific trap there: `[0.5, 0.5, 0.5, 0.5]`
+and `[0.5, -0.5, -0.5, -0.5]` are the two 120° rotations about (1,1,1) and they cycle the axes
+in *opposite* directions.)
+
+**One annotation bug worth remembering**, because it will recur with any objaverse-derived
+asset: the battery's long axis is its local **+Y**, not +Z. These assets are modelled +Y up —
+which is why every task spawns them with `qpos=[0.707, 0.707, 0, 0]` — so an uprightness test
+written as `get_face_prod(q, [0,0,1], [0,0,1])` reads ~0 for a *perfectly upright* object and
+rejects every success. It has to be `[0,1,0]`. Insertions were seating perfectly and scoring
+as failures until that was fixed.
+
+**`insert_knife_cover` is one of the two that do not work.** Its assets are fine and its
+spawn is now sane, but most seeds fail to plan and some still eject the knife. The cause most
+likely left is that the knife is 192 mm long while the spawn's separation test compares only
+actor **origins** at 0.15 m, so a knife pointing at the cover can still spawn intersecting it
+— a length-aware test and a wider gap are the next things to try. It is the hardest of the
+four geometrically: a long thin object going into a receptacle that has to lie on its side so
+the knife never needs re-orienting.
+
+**`put_dumbbell_rack` is the other, and there the blocker is the asset itself.** A
+dumbbell was dropped onto the rack over a 132-pose grid (both orientations, full width and
+depth, two drop heights): exactly **6** poses came to rest on it, all six the same
+configuration — bar perpendicular to the rack, straddling both rails, at a single depth
+offset. Everything else ends on the floor. `013_dumbbell-rack`'s tiers are narrow inclined
+ridges, not shelves (`base1`'s top rail is a **9 mm knife edge** at usable scale), so the
+target is a line rather than a surface. The expert does reach the cradle — the dumbbell has
+been observed at cradle height mid-episode — but releasing flush interpenetrates the rack and
+ejects the dumbbell off the table, while releasing above it lands off the line. Remaining
+options: a deeper cradle (another variant, or scaling the rack up so the ridge spacing exceeds
+the weight diameter), or a success criterion that does not require the dumbbell to stay put.
+
+**Not added: "use a shovel to flip a flat item."** `082_smallshovel` is annotated and usable,
+but the task is a different *class* from anything in this repo and nothing in the expert API
+expresses it. Three things stand in the way, in order of how hard they are to move:
+
+1. **The whole framework is prehensile and quasi-static.** All 50 shipped tasks are grasp →
+   move → place/press. The single tool-use precedent, `beat_block_hammer`, scores success by
+   **proximity + contact** (`abs(hammer_fp − block_fp) < 0.02` and `check_actors_contact`) —
+   never by a physical outcome of the strike. There is no primitive that expresses "scoop" or
+   "flip"; `grasp_actor` / `place_actor` / `move_by_displacement` are waypoint calls.
+2. **The blade cannot get under a flat item.** Measured on the *collision* mesh (what physics
+   sees, after convex decomposition rounds the edge): the leading edge is **8.2–12.1 mm**
+   thick across the three variants. An item lying flush on the table presents a zero gap, and
+   PhysX's default 0.01 m contact offset is the same order as the blade itself.
+3. **Replay.** `collect_data.py:252` asserts `check_success()` again on the replay pass, and a
+   dynamic flip is the least reproducible thing to re-execute.
+
+It becomes tractable if the task is redefined — a chamfered or raised item the blade can wedge
+under, or a `beat_block_hammer`-style proximity score instead of a physical flip — but that is
+a different task from the one asked for, so it was left out rather than quietly substituted.
+
+---
 
 ---
 
@@ -1255,8 +1457,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
 | `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-primitive-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
 | `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
-| `action_proposals` | task config `data_type.action_proposals` (§5b) | `(top_k, 50, 14)` |
-| `noise_proposals` | task config `data_type.noise_proposals` (§5b) | `(top_k, 50, 14)` |
+| `action_proposals` | not a sensor: naming it in `encoder_modalities` turns retrieval on (§5b) | `(top_k, 50, 14)` |
+| `noise_proposals` | the same, and pays for the flow inversion (§5b) | `(top_k, 50, 14)` |
 
 The names are the §7a dataset columns minus their `observation.` prefix, so a critic trained
 offline on those columns lines up with what it sees online. `envs/utils/obs_modalities.py`
@@ -1283,12 +1485,15 @@ Three things to keep in mind:
   the *following* chunk's trace instead — see §7a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§7a); a critic configured for `wrench.*` against a config
   that has it off — or naming a link this embodiment does not have — fails at startup.
-- **The proposal modalities are retrieved, not sensed.** `action_proposals` /
-  `noise_proposals` come from a bank of demonstrations rather than from the sim (§5b), so they
-  are the two `data_type` flags nothing in `get_obs` produces — `script/eval_policy.py` forwards
-  them to `deploy_policy.py::get_model` and `pi_model.py` fills them in per control step. They
-  are also the only modalities a rollout dataset does **not** carry, so a critic that uses them
-  cannot (yet) be pretrained offline.
+- **The proposal modalities are not modalities.** `action_proposals` / `noise_proposals` come
+  from a bank of demonstrations rather than from the sim (§5b), and they are not something a
+  run either has or lacks: they are the *mechanism* by which everything else the critic encodes
+  queries that bank. So they are **not** `data_type` flags and are not validated against what
+  the sim offers — nothing in `get_obs` produces them, so that check would reject every run.
+  Naming one in the critic's `encoder_modalities` is the whole switch; `pi_model.py` reads that
+  list, opens the retriever at startup and fills the proposals in per control step. They are
+  also the only entries a rollout dataset does **not** carry, so a critic that uses them cannot
+  (yet) be pretrained offline.
 - **Modalities are an architecture key.** They go into the checkpoint, and a warm start rebuilds
   the same encoder stack; changing the list makes an existing critic checkpoint refuse to load
   (loudly, leaf by leaf). Offline pretraining takes the same names — `multisensory_steering`'s
@@ -1304,10 +1509,10 @@ Two more critic modalities, and the only ones that do not come from this episode
 the noise seeds that would make the sampler reproduce them here.
 
 ```yaml
-# task_config/<config>.yml — the switches, both default false
-data_type:
+# the critic config (cfgs/qmfm.yaml) — naming either one IS the switch
+encoder_modalities:
   action_proposals: true    # the retrieved demo chunks
-  noise_proposals: true     # the seeds that map to them (pays for the flow inversion)
+  noise_proposals: false    # the seeds that map to them (pays for the flow inversion)
 ```
 ```yaml
 # policy/pi05/deploy_policy.yml — where they come from
@@ -1366,8 +1571,13 @@ each column to the modality name the *live* observation uses, so a retrieved dem
 serve its own `depth.head`, `pointcloud` or raw `images.<cam>` under exactly the name the critic
 encodes the query with. Which ones exist follows the converter: the rgb-only pipeline writes
 three camera views and nothing else, the multimodal one adds `depth.<cam>`, `pointcloud`, the
-`wrench.*` columns and a fourth `front` camera (which this fork's `get_obs` has no counterpart
-for, so it stays `images.front` rather than being guessed into `images.third_view`).
+`wrench.*` columns and a fourth `front` camera. That last one **does** have a live counterpart:
+`aloha-agilex`'s `static_camera_list` declares a `front_camera` (a low, near-horizontal view
+from the front of the table) alongside `head_camera`, so the sim's own observation carries
+`images.front` / `depth.front` and the demo column pairs with it under the same name. It is not
+the observer camera — that is a different camera again, and reaches a critic as
+`images.third_view` — which is why the mapping passes an unrecognized camera through under its
+own name rather than guessing it into `third_view`.
 
 | modality | where a demo row's copy comes from |
 |---|---|
@@ -1376,13 +1586,31 @@ for, so it stays `images.front` rather than being guessed into `images.third_vie
 | `wrench.<key>` | windowed out of the dataset's per-frame rows at `wrench_trace_len` |
 | `depth.<cam>`, `pointcloud`, `images.<cam>`, … | the dataset column, cast to the dtype the sim hands the critic |
 
-The last row is **opt-in**, via `demo_retrieval.sensor_modalities` in `deploy_policy.yml`
-(`null` keeps none — the behaviour before the key existed; `true` keeps everything the dataset
-has). Opt-in because unlike a SigLIP map these cannot be re-encoded from something smaller: a
-depth map *is* the key, so it has to be resident for every bank row, and the cost scales with
-`num_demos` × episode length rather than with `top_k` — ~0.23 MB a camera frame, ~0.15 MB a
-depth map, ~24 KB a point cloud. The bank banner prints the total, and a name the dataset does
-not have is refused when the retriever is built rather than an hour into the rollouts.
+**Which of them a critic actually keys on is `key_modalities`**, in the proposal spec of the
+critic's own config. Any modality the critic encodes may be one, as long as the demo dataset can
+serve it — checked at startup (`PI0._init_critic` against `DemoRetriever.key_modalities`) rather
+than at the first control step. The *default* is every `siglip.*` and `state` entry, and stays
+that narrow because it has to hold for an rgb-only demo dataset too; widen it deliberately. The
+cost is per candidate per transition, obs and next_obs, so at `top_k: 3` a `wrench.<link>` is
+~1.4 KB/transition and a `depth.<cam>` is ~1.8 MB — ~9 GB at `buffer_size: 5000`. The wrench is
+nearly free; a depth camera is a `buffer_size` decision.
+
+The last row is loaded on demand, governed by `demo_retrieval.sensor_modalities` in
+`deploy_policy.yml`. The default (`null`) **derives** it — load whatever the critic asks for,
+i.e. its `encoder_modalities` plus any explicit `key_modalities`, intersected with the columns
+the dataset actually has — so a modality is named once, in the critic config, and not again
+here. That intersection is load-bearing: a critic legitimately encodes modalities no
+demonstration carries (they stay part of the attention *query*), so asking for them would break
+every run against an rgb-only demo dataset. An explicit list overrides it, for loading **less**
+than the critic could use; `[]` loads none and `true` loads everything the dataset has.
+
+It is a knob at all because unlike a SigLIP map these cannot be re-encoded from something
+smaller: a depth map *is* the key, so it has to be resident for every bank row, and the cost
+scales with `num_demos` × episode length rather than with `top_k` — ~0.23 MB a camera frame,
+~0.15 MB a depth map, ~24 KB a point cloud. That is a different axis from `key_modalities`,
+which scales with `top_k` × `buffer_size`. The bank banner prints the total, and a name the
+dataset does not have is refused when the retriever is built rather than an hour into the
+rollouts.
 
 **Shape agreement is the thing to check.** A demo row has to be the same array the sim hands the
 critic online, and only the dtype is normalized here. The rgb-only demo datasets store 480×640
@@ -1553,9 +1781,15 @@ whole run rather than per episode. Encoded episodes are additionally cached by i
 explicit re-draw landing on the same demonstration costs nothing; the cache tops out at a couple
 of MB per demo episode in host RAM.
 
-Nothing is built unless a critic exists **and** its `encoder_modalities` actually names one of
-the two: a run that turns the flags on without the critic side prints that it is turning
-retrieval back off rather than paying for output nobody reads.
+Nothing is built unless a critic exists **and** its `encoder_modalities` names one of the two —
+which since 2026-09-01 is the same statement, because that list is now the only switch. There
+used to be a second, in the task config's `data_type` block, and a run had to set both; a
+proposal is not a sensor, so validating it against what `get_obs` produces rejected every run
+that asked for one. The flags are gone from every task config and from
+`eval_policy.py` / `deploy_policy.py`; `PI0._configured_proposals` reads the critic config
+instead. The one case where the two can still disagree is a warm start, since a checkpoint's
+architecture keys override the config's: `_init_critic` re-checks against the critic actually
+built and turns retrieval back off, printing why, rather than paying for output nobody reads.
 
 `Pi0.invert_actions` is the general method underneath (`pi0.py`, tested in
 `pi0_invert_test.py`): given a clean chunk it recovers the exact noise `sample_actions` would
@@ -2200,6 +2434,8 @@ cd .. && bash .claude/hooks/sync-conversations.sh pull && bash .claude/hooks/syn
 ```bash
 # --- setup (login node) ---
 source setup_env.sh                     # every session/job
+python script/gen_peg_socket_asset.py --verify   # peg-insertion meshes (once per clone)
+python script/gen_task_assets.py --verify        # ditto for the sec 3.6 tasks
 
 # --- claude state sync (login node) ---  (or run the /sync-claude skill)
 bash .claude/hooks/sync-conversations.sh sync   # transcripts: bidirectional pull+push

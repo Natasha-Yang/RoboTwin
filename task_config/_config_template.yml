@@ -51,14 +51,6 @@ data_type:
   endpose: true
   qpos: true
   wrench: true
-  # Demo-retrieval proposals for a steering critic: the top-K demonstration frames most similar
-  # to the current observation contribute their action chunks (`action_proposals`) and the noise
-  # seeds that reproduce those chunks under this observation (`noise_proposals`). Unlike every
-  # flag above, these are produced by the policy rather than the sim -- configure which demo
-  # dataset they come from under `demo_retrieval` in policy/pi05/deploy_policy.yml. Consumed
-  # only by a critic, so both are ignored by a run that has none.
-  action_proposals: false
-  noise_proposals: false
   mesh_segmentation: false
   actor_segmentation: false
 pcd_down_sample_num: 1024
