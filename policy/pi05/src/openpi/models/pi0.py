@@ -464,7 +464,7 @@ class Pi0(_model.BaseModel):
         guidance_scale: float | at.Float[at.Array, ""] | None = 0.0,
         best_of_n: int = 1,
         return_critic_obs: bool = False,
-        critic_action_dim: int | None = None,
+        critic_state_dim: int | None = None,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
         """Sample an action chunk via flow-matching denoising.
 
@@ -537,13 +537,12 @@ class Pi0(_model.BaseModel):
         ``return_critic_obs`` returns that same aux dict from the **unguided** sampler, so
         rollout-dataset collection records critic training data (model-space state and action
         chunk, the SigLIP patch maps, and the noise the chunk came from) in exactly the space
-        the guided path scores. Both the returned ``critic_action`` (the full-horizon chunk,
-        still *normalized*) and ``critic_obs_state`` are narrowed to ``critic_action_dim``
-        embodiment dims -- i.e. ``(action_horizon, 14)`` and ``(14,)`` for aloha, versus the
-        unnormalized chunk ``Policy.infer``'s output transform produces. ``sample_noise`` is
-        **not** narrowed (see ``critic_aux``): every one of the padded ``action_dim`` noise dims
-        feeds ``action_in_proj`` and shapes the embodiment dims that come out, so dropping the
-        tail would leave a seed that no longer reproduces the chunk.
+        the guided path scores. The returned ``critic_action`` is the whole normalized
+        ``(action_horizon, action_dim)`` chunk -- the padded dims included, since that is what the
+        critic scores -- versus the unnormalized, embodiment-width chunk ``Policy.infer``'s output
+        transform produces. Only ``critic_obs_state`` is narrowed, to ``critic_state_dim``, i.e.
+        ``(14,)`` for aloha: the state's padding normalizes to constant zero and would be dead
+        weights in the critic.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -611,12 +610,22 @@ class Pi0(_model.BaseModel):
             """Run one denoising forward pass and return the action-expert features (pre-projection)."""
             return self._action_expert_features(suffix_obs, kv_cache, prefix_mask, prefix_len, x_t, time)
 
-        # The critic works in *embodiment* dims, not the model's padded `action_dim`: AlohaInputs
-        # zero-pads 14 -> 32 on the way in, for both the state and the action chunk, and those
-        # trailing dims normalize to constant zero, so feeding them to the critic only widens its
-        # input with dead weights. `critic_action_dim` is the unpadded width (14 for aloha
-        # agilex, taken from the sim's own joint vector); None keeps the full padded tensors.
-        critic_ad = self.action_dim if critic_action_dim is None else int(critic_action_dim)
+        # The critic scores the WHOLE `(action_horizon, action_dim)` chunk -- every dim the
+        # sampler denoises, padding included. There is deliberately no option to narrow it to the
+        # embodiment's own dims: those trailing dims decode to nothing, but they are not inert
+        # input. All `action_dim` dims of a row go through `action_in_proj` into that row's
+        # action token, and the action tokens attend to each other bidirectionally, so the tail
+        # moves the dims that *are* decoded -- measured on a trained checkpoint at t=0.6,
+        # perturbing one row's padded dims by 1.0 moves that row's velocity in the embodiment
+        # dims by 0.038 and the other 49 rows' by 0.008. Narrowing the critic did not stop the
+        # guidance touching them either (`x1 = x_t - t*v(x_t)` differentiates through the
+        # velocity field, putting ~17% of ||grad|| on the tail); it only meant the critic had no
+        # opinion about what it was already steering.
+        #
+        # The **state** is a different matter and is narrowed, by `critic_state_dim`: its padding
+        # normalizes to constant zero and stays that way, so those dims could only be dead
+        # weights. `None` leaves it at the model's full width.
+        critic_sd = self.action_dim if critic_state_dim is None else int(critic_state_dim)
 
         def critic_observation():
             """The `{modality: array}` observation the Value critic conditions on.
@@ -626,16 +635,15 @@ class Pi0(_model.BaseModel):
             embed_prefix discards, reshaped to the 16x16 patch grid the CNN encoder expects, and
             named `siglip.head` / `siglip.left_wrist` / `siglip.right_wrist` (SIGLIP_MODALITIES)
             -- plus `siglip_tokens`, the same prefix pass's LLM hidden state pooled over its
-            tokens (VLM_PREFIX_MODALITY), and the model-space (normalized) state, narrowed to the
-            same `critic_ad` embodiment dims as the action chunk below. `critic_obs_extra` adds
-            the sim's own sensor modalities on top.
+            tokens (VLM_PREFIX_MODALITY), and the model-space (normalized) state, narrowed to
+            `critic_sd`. `critic_obs_extra` adds the sim's own sensor modalities on top.
 
             All views are offered whatever the critic ends up reading: they are already computed
             (the prefix needs them), and which ones are actually encoded is the critic's own
             configuration. The ones it ignores cost nothing here -- they are dead code inside the
             guidance gradient -- only the round trip in `aux`.
             """
-            state = observation.state.astype(jnp.float32)[..., :critic_ad]
+            state = observation.state.astype(jnp.float32)[..., :critic_sd]
             siglip = {
                 SIGLIP_MODALITIES[name]: einops.rearrange(
                     encoded.astype(jnp.float32), "b (h w) c -> b h w c", h=16, w=16
@@ -649,10 +657,6 @@ class Pi0(_model.BaseModel):
                 "state": state,
                 **(critic_obs_extra or {}),
             }
-
-        def critic_action_view(actions):
-            """The normalized `(b, action_horizon, critic_ad)` chunk the critic is scored on."""
-            return actions[..., :critic_ad]
 
         def critic_aux(critic_obs, x_0, seed=None):
             """What the caller gets back: the model-produced modalities plus the scored chunk.
@@ -675,7 +679,7 @@ class Pi0(_model.BaseModel):
                 # as its own column rather than as another `siglip.<view>`.
                 "critic_obs_siglip_tokens": critic_obs[VLM_PREFIX_MODALITY],
                 "critic_obs_state": critic_obs["state"],
-                "critic_action": critic_action_view(x_0),
+                "critic_action": x_0,
                 # The `(b, action_horizon, action_dim)` chunk the flow was actually integrated
                 # from: the sampler's own Gaussian draw, unless the caller supplied one or an
                 # actor chose it. Everything else here is a function of the observation and
@@ -684,11 +688,7 @@ class Pi0(_model.BaseModel):
                 # `invert_actions` recovers it -- `num_steps * (1 + fp_per_step)` action-expert
                 # passes, and only for the unguided sampler. Rollout collection records it as the
                 # dataset's `action.noise`, which is the action of a noise-space agent's MDP
-                # (DSRL, sec 5c). Kept at the model's padded `action_dim` rather than narrowed to
-                # `critic_action_dim` like the chunk above: the trailing dims of an *action*
-                # normalize to constant zero, but every dim of a *noise* goes through
-                # `action_in_proj` and shapes the embodiment dims that come out, so a narrowed
-                # seed would no longer reproduce its chunk.
+                # (DSRL, sec 5c). At the model's full `action_dim`, like the chunk above.
                 "sample_noise": noise if seed is None else seed,
                 # The same latent in the *actor's* own parameterization, when one chose it --
                 # `noise_horizon` rows, or the factors of a low-rank product, which `expand_noise`
@@ -738,7 +738,7 @@ class Pi0(_model.BaseModel):
 
             def score(x_0):
                 """mean_k Q for every candidate chunk -- `(sample_batch,)`."""
-                chunk = critic_action_view(x_0).reshape(x_0.shape[0], -1)
+                chunk = x_0.reshape(x_0.shape[0], -1)
                 return critic_apply(critic_params, critic_obs_n, chunk).mean(axis=0)
 
             def pick_best(x_0):
@@ -791,9 +791,11 @@ class Pi0(_model.BaseModel):
 
                 def value_fn(a):
                     # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
-                    # Only the embodiment dims are scored, so the padded tail gets zero gradient.
-                    chunk = critic_action_view(x1_estimate(a))
-                    qs = critic_apply(critic_params, critic_obs_n, chunk.reshape(a.shape[0], -1))
+                    # The critic scores every dim of the chunk, so the gradient is over the whole
+                    # `(action_horizon, action_dim)` tensor and the padded dims are steered on
+                    # their own terms rather than only as a side effect of moving the others.
+                    qs = critic_apply(critic_params, critic_obs_n,
+                                      x1_estimate(a).reshape(a.shape[0], -1))
                     return qs.mean(axis=0).sum()
 
                 grad = jax.grad(value_fn)(x_t).astype(v_t.dtype)

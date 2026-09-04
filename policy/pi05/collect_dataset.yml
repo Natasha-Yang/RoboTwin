@@ -51,10 +51,13 @@ hub_private: true
 resume: true
 
 # Also record the policy's model-space view of each step as `observation.state.model` /
-# `action.model` (the normalized state and full action chunk, both in the embodiment's own dims
-# with the model's zero padding stripped). Critics meant to steer inside `Pi0.sample_actions`
-# must be trained on these, not on the raw `observation.state` / `action` columns -- point the
-# offline trainer's state_col / action_col at them.
+# `action.model`: the normalized state in the embodiment's own dims (its zero padding
+# normalizes to constant zero, so it is stripped -- (14,) for aloha agilex) and the normalized
+# full action chunk at the model's padded width, (50, 32), which is what a critic steering
+# inside `Pi0.sample_actions` scores. Such critics must be trained on these, not on the raw
+# `observation.state` / `action` columns -- point the offline trainer's state_col / action_col
+# at them. A dataset collected before 2026-09-04 has a (50, 14) `action.model` and will be
+# refused at startup (`action_dim_flat` 700 vs 1600).
 #
 # `action.noise` rides along with them: the flow-matching latent the action expert denoised each
 # chunk from, (action_horizon, action_dim) at the model's *padded* width (50, 32). That is the

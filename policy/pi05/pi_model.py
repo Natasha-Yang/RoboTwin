@@ -175,7 +175,11 @@ class PI0:
         # a critic that trained on its own test set could not be compared across evaluations.
         self._collect_transitions = True
         self.online_critic = None
+        # Both set on the first observation, when the embodiment's own width is known
+        # (`_init_critic`); `critic_state_dim is None` is that latch. The action is always the
+        # model's full padded `action_dim` -- see `_init_critic` for why there is no option here.
         self.critic_action_dim = None
+        self.critic_state_dim = None
         # Which family that critic is, and therefore how it acts on the sampler (CRITIC_TYPES).
         # It is a critic-side choice, so it arrives in the critic config like every other one.
         self.critic_type = str((critic_config or {}).get("critic_type") or "qmfm")
@@ -371,12 +375,20 @@ class PI0:
         ``state`` is ``observation["joint_action"]["vector"]`` -- the sim's own joint vector
         (both arms plus grippers), so its width is exactly the number of dims the embodiment
         acts in. The model itself works in a padded ``action_dim`` (32); AlohaInputs zero-pads
-        14 -> 32 (state as well as actions) and those trailing dims normalize to constant zero,
-        so feeding them to the critic would only widen it with dead weights. Both the state and
-        the action chunk it sees are therefore narrowed back to this width. Called once, from
-        update_observation_window.
+        14 -> 32 (state as well as actions), and the two paddings are treated differently.
+
+        The **state**'s padding normalizes to constant zero and stays there, so the critic's
+        state is narrowed back to this width -- those dims could only be dead weights.
+
+        The **action**'s padding is kept: the critic scores the whole `(action_horizon,
+        action_dim)` chunk the sampler denoises. Those dims decode to nothing, but they are not
+        inert -- all of them feed `action_in_proj` and the action tokens attend to each other, so
+        the tail moves the dims that are decoded, and the guidance gradient reached it anyway
+        through `x1 = x_t - t*v(x_t)`. Scoring them is what gives the critic an opinion about
+        what it was already steering. Called once, from update_observation_window.
         """
-        self.critic_action_dim = int(np.shape(state)[-1])
+        self.critic_state_dim = int(np.shape(state)[-1])
+        self.critic_action_dim = int(self.model_config.action_dim)
         horizon = int(self.model_config.action_horizon)
         chunk = f"{horizon}x{self.critic_action_dim}"
 
@@ -384,7 +396,7 @@ class PI0:
             if self.collect_critic_obs:
                 self.policy._sample_kwargs.update({
                     "return_critic_obs": True,
-                    "critic_action_dim": self.critic_action_dim,
+                    "critic_state_dim": self.critic_state_dim,
                 })
                 siglip = (f"with SigLIP patch features: {', '.join(self.collect_siglip)}"
                           if self.collect_siglip else "no SigLIP")
@@ -407,7 +419,7 @@ class PI0:
         # State is the model-space state narrowed back to the embodiment's own dims, exactly as
         # the sampler emits it (Pi0.sample_actions::critic_observation) and as the collected
         # `observation.state.model` column stores it -- not the padded action_dim.
-        cc["state_dim"] = self.critic_action_dim
+        cc["state_dim"] = self.critic_state_dim
         # What the critic's Q takes as its *action*, which is what distinguishes the two
         # families. For qmfm it is the chunk the sampler produces, in embodiment dims. For DSRL
         # it is the latent that chunk was denoised from, and that lives in the model's own
@@ -445,7 +457,7 @@ class PI0:
             # hidden state pooled over its tokens, i.e. every camera *and* the prompt in one
             # vector -- FlowDAgger's own steering feature (`Pi0.pool_prefix_tokens`).
             VLM_PREFIX_MODALITY: (cc["vlm_prefix_dim"],),
-            "state": (self.critic_action_dim,),
+            "state": (self.critic_state_dim,),
             **{key: tuple(np.shape(value)) for key, value in self.critic_obs_extra.items()},
         }
         self.online_critic = load_critic(cc, self._critic_ckpt)
@@ -535,15 +547,17 @@ class PI0:
                       f"{cc['noise_action_dim']} noise chunk pi0.5 denoises from")
             fix = ("Only a DSRL checkpoint of the same embodiment and `noise_horizon` fits.")
         else:
-            scored = f"the {chunk} normalized action chunk"
+            scored = (f"the {chunk} normalized action chunk, at the model's full action_dim")
             fix = ("Collect a rollout dataset with collect_critic_obs and train on the "
-                   "observation.state.model / action.model columns.")
+                   "observation.state.model / action.model columns. A critic trained against "
+                   "the embodiment's own action dims does not fit: this steers all "
+                   f"{self.critic_action_dim} of them.")
         for key in ("action_dim_flat", "state_dim"):
             got, want = int(self.online_critic.config[key]), int(cc[key])
             if got != want:
                 raise ValueError(
                     f"critic checkpoint {self._critic_ckpt!r} was trained with {key}={got}, but "
-                    f"this run feeds {key}={want} (state is the {self.critic_action_dim}-dim "
+                    f"this run feeds {key}={want} (state is the {self.critic_state_dim}-dim "
                     f"model state; the action is {scored}). {fix}"
                 )
 
@@ -627,7 +641,7 @@ class PI0:
             "guidance_scale": (jnp.asarray(0.0, dtype=jnp.float32)
                                if self.guidance_scale_target != 0.0 else None),
             "best_of_n": self.best_of_n,
-            "critic_action_dim": self.critic_action_dim,
+            "critic_state_dim": self.critic_state_dim,
         })
         if not self.train_critic_online:
             ramp = "no ramp (frozen critic), "
@@ -665,7 +679,7 @@ class PI0:
         """
         self.policy._sample_kwargs.update({
             "noise_apply": self.online_critic.noise_apply,
-            "critic_action_dim": self.critic_action_dim,
+            "critic_state_dim": self.critic_state_dim,
             "return_critic_obs": True,
         })
         noise_h, noise_d = self.online_critic.action_chunk_shape
@@ -866,7 +880,7 @@ class PI0:
         """
         if critic_obs is not None:
             self.critic_obs_extra = critic_obs
-        if self.critic_action_dim is None:
+        if self.critic_state_dim is None:
             # First observation of the run: the embodiment's action width is now known, and so
             # is the set of sensor modalities the task config produces.
             self._init_critic(state)
@@ -921,10 +935,10 @@ class PI0:
     def _refresh_demo_proposals(self):
         """Retrieve this control step's demo proposals into the critic's extra observation.
 
-        Narrowed to `critic_action_dim` on the way in, exactly as the sampler narrows the chunk
-        it scores: the model pads both to `action_dim` (32) and those trailing dims are constant
-        zero for aloha, so a proposal keeps only the embodiment's own dims and lines up
-        term-for-term with the action the critic is judging.
+        A proposal is the same kind of object as the action the critic is judging, so the two
+        line up term for term: `propose_from_demos` already returns `action_dim`-padded chunks,
+        which is exactly the width the critic scores, and the slice below is a no-op kept so the
+        two widths are visibly tied together rather than coincidentally equal.
 
         Costs one image tower + prefix pass on top of the sampler's own, plus -- when
         `noise_proposals` is on -- `num_steps * (1 + fp_per_step)` action-expert passes at batch
@@ -963,7 +977,7 @@ class PI0:
             self.online_critic.attach_demo_retrieval(self.demo_retriever)
             self._offline_retrieval_bank = self.demo_retriever.bank
         wanted = sorted({m for ms in self._proposal_key_modalities.values() for m in ms})
-        keys = self.demo_retriever.critic_keys(rows, wanted, state_dim=self.critic_action_dim)
+        keys = self.demo_retriever.critic_keys(rows, wanted, state_dim=self.critic_state_dim)
         for name, modalities in self._proposal_key_modalities.items():
             for modality in modalities:
                 entry = f"{name}.keys.{modality}"
@@ -1072,10 +1086,10 @@ class PI0:
     def _stash_critic_obs(self, out):
         """Keep the last control step's model-space critic view for dataset collection.
 
-        ``critic_obs_state`` (critic_action_dim,) is the normalized model state and
-        ``critic_action`` (action_horizon, critic_action_dim) the normalized chunk, both in
-        embodiment dims -- the tensors the critic is scored on. ``out["actions"]`` is the same
-        chunk after the output transform has unnormalized it.
+        ``critic_obs_state`` (critic_state_dim,) is the normalized model state in the
+        embodiment's own dims, and ``critic_action`` (action_horizon, action_dim) the normalized
+        chunk at the model's full padded width -- the tensors the critic is scored on.
+        ``out["actions"]`` is the same chunk after the output transform has unnormalized it.
 
         ``critic_obs_siglip_tokens`` is the pooled 2048-d VLM prefix (`siglip_tokens`), stored
         as its own column under that name.

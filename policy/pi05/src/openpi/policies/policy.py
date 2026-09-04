@@ -73,7 +73,7 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(
                 model.sample_actions,
                 static_argnames=("return_features", "critic_apply", "noise_apply",
-                                 "return_critic_obs", "critic_action_dim", "best_of_n"),
+                                 "return_critic_obs", "critic_state_dim", "best_of_n"),
             )
             if hasattr(model, "get_prefix_rep"):
                 self._get_prefix_rep = nnx_utils.module_jit(model.get_prefix_rep)

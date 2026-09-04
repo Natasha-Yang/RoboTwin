@@ -17,7 +17,8 @@ from openpi.models import pi0_config
 from openpi.models.pi0 import hold_noise
 from openpi.shared import nnx_utils
 
-_STATIC = ("critic_apply", "noise_apply", "return_critic_obs", "critic_action_dim", "best_of_n")
+_STATIC = ("critic_apply", "noise_apply", "return_critic_obs", "critic_state_dim",
+           "best_of_n")
 
 
 @pytest.fixture(scope="module")
@@ -39,13 +40,14 @@ def test_sample_noise_reproduces_the_chunk(tiny):
     config, sample = tiny
     obs = config.fake_obs(batch_size=2)
 
-    actions, aux = sample(jax.random.key(0), obs, return_critic_obs=True, critic_action_dim=6)
+    actions, aux = sample(jax.random.key(0), obs, return_critic_obs=True, critic_state_dim=6)
 
-    # Full padded width, not the 6 embodiment dims the chunk and state are narrowed to: the
-    # trailing noise dims are live inputs to `action_in_proj`, so a narrowed seed would not
-    # reproduce anything.
+    # Both at the model's full padded width -- the critic scores every dim of the chunk, and the
+    # trailing noise dims are live inputs to `action_in_proj` anyway, so a narrowed seed would
+    # not reproduce anything. Only the state is narrowed to the embodiment's 6.
     assert aux["sample_noise"].shape == (2, config.action_horizon, config.action_dim)
-    assert aux["critic_action"].shape == (2, config.action_horizon, 6)
+    assert aux["critic_action"].shape == (2, config.action_horizon, config.action_dim)
+    assert aux["critic_obs_state"].shape == (2, 6)
     np.testing.assert_allclose(
         sample(jax.random.key(1), obs, noise=aux["sample_noise"]), actions, atol=1e-6
     )

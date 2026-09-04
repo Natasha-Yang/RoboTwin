@@ -1444,14 +1444,44 @@ additionally off `model.train_critic_online` (`_trains_online_critic`), which �
 critic object — is known before the first observation.
 
 **The critic must be trained in pi0.5's model space.** `Pi0.sample_actions` scores the chunk
-it is sampling, *before* the output transform runs: **normalized** state `(14,)` and a
-**normalized** action chunk `(50, 14)` → flat `700`. The `14` is `critic_action_dim` — the
-model pads *both* state and actions to `action_dim=32`, but the trailing dims are constant
-zero for aloha, so the padding is stripped back off and only the embodiment's own dims reach
-the critic (`state_dim=14`, not 32).
+it is sampling, *before* the output transform runs: **normalized** state `(14,)` and the
+**normalized** action chunk `(50, 32)` → flat `1600`.
 
-`critic_action_dim` is the width of `observation["joint_action"]["vector"]` (both arms plus
-grippers), so it follows the embodiment automatically. Nothing knows that width until the sim
+The model pads *both* the state and the actions to `action_dim=32`, and the two paddings are
+treated differently — this is the one asymmetry to keep in mind:
+
+| | width the critic sees | why |
+|---|---|---|
+| state | **14** — `observation["joint_action"]["vector"]`, so it follows the embodiment | its padding normalizes to constant zero and stays there; those dims could only be dead weights |
+| action chunk | **50 × 32** — every dim the sampler denoises | the padding is *not* inert (below) |
+
+**On this branch the critic always steers the whole chunk. There is no option to narrow it to
+the embodiment's 14 dims** — no config key, and `Pi0.sample_actions` no longer takes one.
+
+Those trailing 18 dims decode to nothing, but they are **not inert input**. All 32 dims of a row
+go through `action_in_proj` into that row's action token, and the suffix attention mask over the
+50 action tokens is **all-True** — full bidirectional, not causal — so the tail moves the dims
+that *are* decoded. Measured on `pi05_base_aloha_lora_clean_50x25` @ 15000 at t=0.6, mean |Δv|
+over the embodiment dims from perturbing one row of `x_t` by 1.0:
+
+| perturbed | that row's own `v[:14]` | the other 49 rows' `v[:14]` |
+|---|---|---|
+| control (nothing) | 0.00000 | 0.00000 |
+| row's **padded** dims 14:32 | 0.03816 | 0.00840 |
+| row's dims 0:14 | 1.56396 | 0.02105 |
+
+Narrowing the critic never stopped the guidance touching them, either: `x1 = x_t − t·v(x_t)` is
+differentiated *through* the velocity field, so ~17% of ‖∇‖₂ landed on the tail regardless
+(exactly zero only at t = 0). It only meant the critic had no opinion about what it was already
+steering. Scoring the full chunk gives it one.
+
+**This is a breaking change for anything made before it.** `action_dim_flat` is an architecture
+key checked at startup, so every critic checkpoint trained at 700 is refused, and a rollout
+dataset whose `action.model` column is `(50, 14)` cannot train a critic for this branch —
+recollect it (§7). The cost on the critic's side is ~900 value-head inputs that are pure noise at
+every t > 0.
+
+Nothing knows the embodiment's width until the sim
 produces its first observation, so `PI0` builds the critic lazily in `_init_critic`, called
 from the first `update_observation_window` — `model.online_critic` is `None` until then.
 Anything needing to know *before* a rollout starts (e.g. whether to open a W&B run) must read
@@ -2113,7 +2143,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `observation.state` | raw env qpos | `(14,)` |
 | `action` | raw robot, unnormalized by the output transform | `(50, 14)` |
 | `observation.state.model` | **normalized** model state, embodiment dims | `(14,)` |
-| `action.model` | **normalized**, embodiment dims | `(50, 14)` |
+| `action.model` | **normalized**, at the model's full padded width — what the critic scores (§5a) | `(50, 32)` |
 | `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
 | `siglip_tokens` | the VLM prefix pooled over its tokens, fp16 — the `siglip_tokens` modality (§6.2) | `(2048,)` |
@@ -2121,11 +2151,12 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `observation.wrench.<arm>` | the same, summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
 
-Each raw column and its `.model` counterpart have the same width and hold the same quantity in
-different spaces: the raw ones have been unnormalized by the output transform, the `.model` ones
-have not. Neither carries the model's internal zero padding to `action_dim=32` — it is stripped
-before the tensors leave the sampler, so `state_dim` is `14`, not `32`. `action.noise` is the
-one exception, and deliberately so (see below). Only `pi0_step` of the
+Each raw column and its `.model` counterpart hold the same quantity in different spaces: the raw
+ones have been unnormalized by the output transform, the `.model` ones have not. The **state**'s
+internal zero padding to `action_dim=32` is stripped before the tensors leave the sampler, so
+`state_dim` is `14`; `action.model` and `action.noise` both keep it, because that is the width
+the critic scores and the sampler denoises (§5a). Datasets collected before 2026-09-04 hold a
+`(50, 14)` `action.model` and cannot train a critic for this branch. Only `pi0_step` of the
 50 chunk steps are actually executed before the next inference call; the whole chunk is recorded
 because that is what the sampler scores.
 

@@ -470,10 +470,11 @@ def build_features(record):
         "success": datasets.Value("bool"),
         "task": datasets.Value("string"),
     })
-    # Present only when the policy exposes them (pi05 with collect_critic_obs). The state and
-    # the chunk are *normalized* and in embodiment dims, with the model's zero padding stripped
-    # back off: state is (critic_action_dim,) and the chunk is the full-horizon sample
-    # (action_horizon, critic_action_dim) -- e.g. (14,) and (50, 14) for aloha agilex.
+    # Present only when the policy exposes them (pi05 with collect_critic_obs). Both are
+    # *normalized*, but they are not the same width. The state has the model's zero padding
+    # stripped back off, since it normalizes to constant zero -- (14,) for aloha agilex. The
+    # chunk keeps it, at the model's full (action_horizon, action_dim) -- (50, 32) -- because
+    # that is what the critic scores and steers (see pi_model.PI0._init_critic).
     if "action.model" in record:
         features["observation.state.model"] = datasets.Sequence(datasets.Value("float32"))
         features["action.model"] = datasets.Sequence(datasets.Sequence(datasets.Value("float32")))

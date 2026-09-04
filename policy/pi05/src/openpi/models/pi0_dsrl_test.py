@@ -16,7 +16,8 @@ from openpi.models import pi0_config
 from openpi.models.pi0 import SIGLIP_MODALITIES, hold_noise
 from openpi.shared import nnx_utils
 
-_STATIC = ("critic_apply", "noise_apply", "return_critic_obs", "critic_action_dim", "best_of_n")
+_STATIC = ("critic_apply", "noise_apply", "return_critic_obs", "critic_state_dim",
+           "best_of_n")
 
 
 @pytest.fixture(scope="module")
@@ -80,7 +81,7 @@ def test_actor_sees_the_observation_the_critic_scores(tiny):
         jax.random.key(0), obs,
         noise_apply=noise_apply, actor_params=None,
         critic_obs_extra={"wrench.left": jnp.zeros((1, 10, 6))},
-        critic_action_dim=6,
+        critic_state_dim=6,
         return_critic_obs=True,
     )
     # The SigLIP map per camera view, the model-space state narrowed to the embodiment's dims,
