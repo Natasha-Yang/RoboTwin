@@ -384,7 +384,10 @@ def collect_rollouts(usr_args, start=None):
                 # sampler's own image tower -- what the critic conditions on, keyed by the same
                 # `siglip.<view>` names it uses online. Kept as numpy arrays (Array2D columns,
                 # see build_features) rather than nested lists: at 256x1152 per view per row,
-                # `.tolist()` would cost ~24 MB of Python floats a view a step.
+                # `.tolist()` would cost ~24 MB of Python floats a view a step. The same dict
+                # also carries `siglip_tokens`, the pooled VLM prefix -- one vector for the
+                # whole observation rather than one map per view, and the feature FlowDAgger
+                # steers on (`Pi0.pool_prefix_tokens`).
                 record.update(critic_obs.get("siglip", {}))
 
             frame_records.append(record)
@@ -479,14 +482,19 @@ def build_features(record):
         # nested Sequence for the same reason the SigLIP columns are.
         noise = np.asarray(record["action.noise"])
         features["action.noise"] = datasets.Array2D(shape=noise.shape, dtype=str(noise.dtype))
-    # Per-camera SigLIP patch features (collect_siglip): the same (256, 1152) columns
-    # `multisensory_steering.create_dataset siglip` used to add in a second pass, produced here
-    # by the sampler's own image tower. Array2D keeps them compact fixed-shape ndarray columns
-    # instead of nested-list Sequences, which is what makes storing them inline affordable.
+    # Everything the policy hands over under a `siglip*` name. The per-camera patch features
+    # (collect_siglip) are the same (256, 1152) columns `multisensory_steering.create_dataset
+    # siglip` used to add in a second pass, produced here by the sampler's own image tower;
+    # Array2D keeps them compact fixed-shape ndarray columns instead of nested-list Sequences,
+    # which is what makes storing them inline affordable. `siglip_tokens` -- the pooled VLM
+    # prefix, one vector for the whole observation -- is 1-D and so a plain Sequence. Typed off
+    # the value's own rank rather than off the name, so a new pooled feature needs nothing here.
     for key, value in record.items():
-        if key.startswith("siglip."):
+        if key.startswith("siglip"):
             value = np.asarray(value)
-            features[key] = datasets.Array2D(shape=value.shape, dtype=str(value.dtype))
+            features[key] = (datasets.Sequence(datasets.Value(str(value.dtype)))
+                             if value.ndim == 1
+                             else datasets.Array2D(shape=value.shape, dtype=str(value.dtype)))
     # Everything the task config's data_type block added (depth / segmentation / pointcloud /
     # third view / endpose), typed from the value itself.
     for key, value in record.items():

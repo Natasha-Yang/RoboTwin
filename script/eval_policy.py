@@ -484,18 +484,17 @@ def snapshot_config(src_path, values, dst_dir):
 # control steps, so waiting for the boundary can put hundreds of updates at risk. That is
 # deliberate and harmless: a resume replays the interrupted episode's seed against a critic that
 # already saw part of it, which duplicates a little training data but loses none of it. Only the
-# `critic_updates` field of the state file goes stale as a result, and nothing reads it back --
-# the ramp is measured from `critic_ramp_baseline` against the checkpoint's own counter, which
-# is correct precisely because those updates really did happen.
+# `critic_updates` field of the state file goes stale as a result, and nothing reads it back.
 #
 # What is *not* checkpointed is the replay buffer -- gigabytes, mostly SigLIP features (see
 # CLAUDE.md §5a) -- so a resumed critic keeps its weights and optimizer but refills its buffer
 # from empty, and runs no TD update until `start_training` transitions are back in it.
 #
-# The guidance ramp carries across the break too: `critic_ramp_baseline` records the update
-# count the ramp is measured from, and is handed back to the policy on resume. Without it the
-# resumed run reloads its own critic as an ordinary `critic_ckpt`, re-bases the ramp at that
-# checkpoint's counter, and comes back at guidance 0 to climb the whole ramp again.
+# The guidance ramp carries across the break too: it is counted in *episodes of this run*
+# (`guidance_ramp_episodes`) from the critic's first TD update, so its clock is `test_num` --
+# restored below -- and its origin is `guidance_ramp_start_episode`, which is not recoverable
+# from the critic checkpoint and so is recorded here. The resumed run then comes back at the
+# guidance it had reached rather than climbing the ramp again.
 
 RESUME_STATE = "resume_state.json"
 EPISODE_CSV = "_episode_results.csv"
@@ -745,26 +744,21 @@ def main(usr_args):
         # the LR schedule from the top of warmup (see OnlineValueCritic._adopt_pending_optimizer).
         critic_ckpt = save_dir / CRITIC_CKPT
         if critic_ckpt.exists():
-            # The guidance ramp is measured from the update count the run started at, and a
-            # warm start normally re-bases it at the checkpoint's counter. Here the checkpoint
-            # IS this run's own critic, so re-basing would zero the ramp and make a run that had
-            # already ramped to full guidance crawl back up from 0. Hand the original baseline
-            # back instead. (Only meaningful with the critic actually reloaded, hence in here:
-            # applying it to a critic starting at 0 updates would pin guidance at 0 instead.)
-            baseline = resume_state.get("critic_ramp_baseline")
-            if baseline is None and not usr_args.get("critic_ckpt"):
-                # State files written before 2026-08-08 have no such key. A run that trained
-                # its critic from scratch ramped from 0 updates, so that is exactly its
-                # baseline; one that warm-started from an offline critic cannot be
-                # reconstructed and keeps the old (restart-the-ramp) behavior.
-                baseline = 0
-            if baseline is not None:
-                usr_args["critic_ramp_baseline"] = int(baseline)
             usr_args["critic_ckpt"] = str(critic_ckpt)
             usr_args["restore_optimizer"] = True
+            # The ramp's clock is `test_num`, restored below and fed in per episode
+            # (`set_episodes_done`). What it cannot recompute is where the ramp *started*: the
+            # checkpoint says how many updates the critic has done, not which episode its first
+            # one landed in -- and on resume every update is already behind it, so a fresh
+            # latch would restart the ramp. Hand the original start episode back. Absent in
+            # state files written before 2026-09-03, in which case the ramp restarts at this
+            # run's first update.
+            ramp_start = resume_state.get("guidance_ramp_start_episode")
+            if ramp_start is not None:
+                usr_args["guidance_ramp_start_episode"] = int(ramp_start)
             print(f"\033[93m[resume] critic + optimizer from {critic_ckpt}"
-                  + (f", guidance ramp from update {baseline}" if baseline is not None
-                     else ", guidance ramp restarts (pre-2026-08-08 state file)") + "\033[0m")
+                  + (f", guidance ramp from episode {ramp_start}" if ramp_start is not None
+                     else ", guidance ramp restarts at the next TD update") + "\033[0m")
             print("\033[93m[resume] the replay buffer is not checkpointed -- it refills from "
                   "empty before TD updates restart\033[0m")
 
@@ -1495,6 +1489,14 @@ def eval_policy(task_name,
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         set_episode_instruction(TASK_ENV, args["task_name"], episode_info, instruction_type, test_num)
+        # The guidance ramp's clock (`guidance_ramp_episodes`): episodes of this run that have
+        # finished, so one episode is steered by one constant scale. Set here rather than
+        # counted by the policy because only this loop knows what an episode of the run is --
+        # a seed the expert check rejected never ran, and a held-out evaluation episode
+        # (`eval_interval`) is a measurement of the run rather than a part of it. `test_num` is
+        # restored from resume_state.json, so a resumed run continues its ramp.
+        if hasattr(model, "set_episodes_done"):
+            model.set_episodes_done(TASK_ENV.test_num)
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -1714,11 +1716,10 @@ def eval_policy(task_name,
             "suc_test_seed_list": suc_test_seed_list,
             "numpy_random_state": numpy_random_state(),
             "critic_updates": int(online_critic.num_updates) if online_critic is not None else 0,
-            # The update count this run's guidance ramp is measured from -- 0 for a critic
-            # trained from scratch here, the checkpoint's lifetime count for one warm-started
-            # from `critic_ckpt`. Restored on resume so the ramp continues rather than
-            # restarting against the run's own checkpoint (see the resume block in `main`).
-            "critic_ramp_baseline": int(getattr(model, "critic_ramp_baseline", 0)),
+            # The episode this run's guidance ramp started counting from -- the one the critic's
+            # first TD update landed in, None until that happens. Restored on resume so the ramp
+            # continues rather than restarting (see the resume block in `main`).
+            "guidance_ramp_start_episode": getattr(model, "guidance_ramp_start_episode", None),
             # The bar `online_value_critic_best.pkl` currently holds, and what it is a bar on,
             # so a resumed run keeps comparing against it rather than replacing it with its own
             # first episode. `best_success_rate_ma` is the name the same field had before the

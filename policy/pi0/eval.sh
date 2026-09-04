@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25 # ensure GPU < 24G
 
 policy_name=pi0
 task_name=${1}

@@ -9,7 +9,7 @@ language_num: 100
 # Same scene in every episode of the run (textures/lights/table height/camera jitter drawn from
 # this seed instead of the episode's); null = redraw per episode. Set here and nowhere else, so
 # collection and eval share it. See _config_template.yml.
-env_seed: null
+env_seed: 6
 domain_randomization:
   random_background: true
   cluttered_table: true
@@ -18,6 +18,9 @@ domain_randomization:
   random_table_height: 0.03
   random_light: true
   crazy_random_light_rate: 0.02
+  # Texture pool for `random_background`: null = RoboTwin's split (seen collecting / unseen at
+  # eval), or `seen` / `unseen` to use one on both sides. See _config_template.yml.
+  background_texture_pool: null
 camera:
   head_camera_type: D435
   wrist_camera_type: D435
@@ -27,19 +30,11 @@ data_type:
   rgb: true
   third_view: false
   depth: false
-  pointcloud: false
+  pointcloud: true
   observer: false
   endpose: true
   qpos: true
   wrench: true
-  # Demo-retrieval proposals for a steering critic: the top-K demonstration frames most similar
-  # to the current observation contribute their action chunks (`action_proposals`) and the noise
-  # seeds that reproduce those chunks under this observation (`noise_proposals`). Unlike every
-  # flag above, these are produced by the policy rather than the sim -- configure which demo
-  # dataset they come from under `demo_retrieval` in policy/pi05/deploy_policy.yml. Consumed
-  # only by a critic, so both are ignored by a run that has none.
-  action_proposals: false
-  noise_proposals: false
   mesh_segmentation: false
   actor_segmentation: false
 pcd_down_sample_num: 1024

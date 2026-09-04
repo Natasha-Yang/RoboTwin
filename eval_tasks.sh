@@ -13,7 +13,7 @@
 # Usage:
 #   bash eval_tasks.sh <task_config> <train_config_name> <model_name> [seed]
 #                      [--tasks t1,t2,...] [--per-job N]
-#                      [--guidance-scale S] [--guidance-ramp-updates N]
+#                      [--guidance-scale S] [--guidance-ramp-episodes N]
 #                      [--train-online true|false]
 #                      [--time HH:MM:SS] [--cpus N] [--mem 48G]
 #                      [--exclude n1,n2,...] [--dry-run]
@@ -42,7 +42,7 @@
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
 #        --tasks beat_block_hammer,lift_pot
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
-#        --tasks beat_block_hammer --guidance-scale 0.3 --guidance-ramp-updates 256
+#        --tasks beat_block_hammer --guidance-scale 0.3 --guidance-ramp-episodes 10
 #   bash eval_tasks.sh demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 \
 #        --tasks stack_blocks_three --exclude rg12501
 
@@ -53,7 +53,7 @@ shopt -s nullglob
 seed=0
 per_job=1
 guidance_scale=""        # empty -> eval.sh falls through to deploy_policy.yml
-guidance_ramp_updates=""
+guidance_ramp_episodes=""
 train_online=""
 time_limit=${EVAL_TIME:-12:00:00}   # test_num: 100 successful episodes is long;
                                     # robotwin_gpu.sh's 3h default is not enough
@@ -87,8 +87,8 @@ while (( $# )); do
         --per-job=*)              per_job=${arg#--per-job=} ;;
         --guidance-scale)         need_value --guidance-scale $#; shift; guidance_scale=$1 ;;
         --guidance-scale=*)       guidance_scale=${arg#--guidance-scale=} ;;
-        --guidance-ramp-updates)  need_value --guidance-ramp-updates $#; shift; guidance_ramp_updates=$1 ;;
-        --guidance-ramp-updates=*) guidance_ramp_updates=${arg#--guidance-ramp-updates=} ;;
+        --guidance-ramp-episodes)  need_value --guidance-ramp-episodes $#; shift; guidance_ramp_episodes=$1 ;;
+        --guidance-ramp-episodes=*) guidance_ramp_episodes=${arg#--guidance-ramp-episodes=} ;;
         --train-online)           need_value --train-online $#; shift; train_online=$1 ;;
         --train-online=*)         train_online=${arg#--train-online=} ;;
         --time)                   need_value --time $#; shift; time_limit=$1 ;;
@@ -122,7 +122,7 @@ done
 if [[ -z "$model_name" ]]; then
     echo "Usage: bash eval_tasks.sh <task_config> <train_config_name> <model_name> [seed]" \
          "[--tasks t1,t2,...] [--per-job N] [--guidance-scale S]" \
-         "[--guidance-ramp-updates N] [--train-online true|false]" \
+         "[--guidance-ramp-episodes N] [--train-online true|false]" \
          "[--time HH:MM:SS] [--cpus N] [--mem 48G]" \
          "[--exclude n1,n2,...] [--dry-run]" >&2
     exit 1
@@ -174,7 +174,7 @@ num_jobs=$(( (task_count + per_job - 1) / per_job ))
 echo "Submitting ${num_jobs} eval job(s) for ${task_count} task(s):" \
      "config=${task_config} train_config=${train_config_name} model=${model_name} seed=${seed}"
 [[ -n "$guidance_scale"         ]] && echo "  guidance_scale=${guidance_scale}"
-[[ -n "$guidance_ramp_updates"  ]] && echo "  guidance_ramp_updates=${guidance_ramp_updates}"
+[[ -n "$guidance_ramp_episodes" ]] && echo "  guidance_ramp_episodes=${guidance_ramp_episodes}"
 [[ -n "$train_online"           ]] && echo "  train_online=${train_online}"
 [[ -n "$exclude"                ]] && echo "  exclude=${exclude}"
 
@@ -220,7 +220,7 @@ for (( i = 0; i < task_count; i += per_job )); do
         cluster/robotwin_gpu.sh
         bash -c "$job_body" eval-job
         "$task_config" "$train_config_name" "$model_name" "$seed"
-        "$guidance_scale" "$guidance_ramp_updates" "$train_online"
+        "$guidance_scale" "$guidance_ramp_episodes" "$train_online"
         "${chunk[@]}"
     )
 

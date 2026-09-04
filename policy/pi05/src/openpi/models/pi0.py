@@ -32,6 +32,42 @@ SIGLIP_MODALITIES = {
 SIGLIP_VIEWS = tuple(SIGLIP_MODALITIES.values())
 
 
+# One more model-produced modality, and the only one that is not per view: the VLM prefix
+# representation mean-pooled over its tokens, `paligemma_variant`'s LLM width wide (2048 for
+# gemma_2b). This is exactly the feature FlowDAgger steers on (`get_prefix_rep`, and
+# `multisensory_steering/flowdagger/robotwin.py::_steering_observation`), which is the point of
+# offering it: a QMFM or DSRL critic can be pointed at the same representation FlowDAgger's
+# policy reads, instead of at the raw 1152-d patch maps.
+#
+# It is *not* a `siglip.<view>` at a different width. Those are the image tower's own
+# pre-projection patch features, one map per camera; this is the LLM's hidden state over the
+# whole prefix -- every camera's tokens *and* the tokenized prompt, after the prefix forward
+# pass -- collapsed to a single vector. Views are not separable in it, and the language
+# conditioning is part of it. The name follows what the columns and configs call it.
+VLM_PREFIX_MODALITY = "siglip_tokens"
+
+
+def vlm_prefix_dim(config) -> int:
+    """Width of `VLM_PREFIX_MODALITY` for a model config, without building the model.
+
+    `pi_model.PI0` has to declare the critic's `obs_shapes` before the first sampler call, so it
+    cannot read the width off a tensor.
+    """
+    return int(_gemma.get_config(config.paligemma_variant).width)
+
+
+def pool_prefix_tokens(prefix_hidden: at.Array) -> at.Float[at.Array, "b emb"]:
+    """Reduce the prefix hidden state to one vector per observation: the mean over its tokens.
+
+    Deliberately the *unmasked* mean, matching FlowDAgger's `_steering_observation`
+    (``hidden_state.mean(axis=1)``) token for token. The prompt is padded to a fixed length, so
+    a handful of masked positions are averaged in; that is a property of the feature FlowDAgger
+    trains on, and making this one masked would give the critic a different vector than the one
+    it is meant to share. `_prefix_pass` returns `prefix_mask` alongside if that ever changes.
+    """
+    return jnp.mean(prefix_hidden.astype(jnp.float32), axis=-2)
+
+
 def _relative_l2(dot: at.Array, query_sq: at.Array, bank_sq: at.Array) -> at.Array:
     """``||q - b|| / ||q||``, from the expanded ``||q||^2 + ||b||^2 - 2 q.b``.
 
@@ -265,33 +301,40 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    def _prefix_pass(self, obs: _model.Observation) -> tuple[list, at.Bool[at.Array, "b p"], int, dict[str, at.Array]]:
+    def _prefix_pass(
+        self, obs: _model.Observation
+    ) -> tuple[list, at.Bool[at.Array, "b p"], int, dict[str, at.Array], at.Float[at.Array, "b p emb"]]:
         """Run the image tower and the prefix forward once, and return the KV cache it fills.
 
         The prefix depends on neither ``x_t`` nor the timestep, so every denoising path pays for
         it exactly once per call and the per-step suffix passes just attend to this cache. Also
         returns the tower's raw patch features (see ``embed_images``), which the critic
-        conditions on, and the prefix length ``_action_expert_features`` checks its mask against.
+        conditions on, the prefix length ``_action_expert_features`` checks its mask against, and
+        the prefix **hidden state** the LLM produced on the way to filling that cache -- the
+        2048-d per-token representation `pool_prefix_tokens` reduces to the `siglip_tokens`
+        modality. That last one is free: it is the forward pass's own first output, which this
+        used to throw away and `get_prefix_rep` used to recompute.
         """
         image_tokens, image_encoded = self.embed_images(obs)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(obs, image_tokens=image_tokens)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
-        return kv_cache, prefix_mask, prefix_tokens.shape[1], image_encoded
+        (prefix_hidden, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return kv_cache, prefix_mask, prefix_tokens.shape[1], image_encoded, prefix_hidden
 
     def get_prefix_rep(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b p emb"], at.Bool[at.Array, "b p"]]:
-        """Return the pi0.5 VLM prefix hidden state used by FlowDAgger's encoder."""
+        """Return the pi0.5 VLM prefix hidden state used by FlowDAgger's encoder.
+
+        The same tensor the sampler's own prefix pass produces, so FlowDAgger's steering feature
+        and the critic's `siglip_tokens` modality are the one quantity by construction rather
+        than by two matching transcriptions of it.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
-        image_tokens, _ = self.embed_images(observation)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, image_tokens=image_tokens)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_hidden, _), _ = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-        )
+        _, prefix_mask, _, _, prefix_hidden = self._prefix_pass(observation)
         return prefix_hidden, prefix_mask
 
     def _action_expert_features(
@@ -441,11 +484,12 @@ class Pi0(_model.BaseModel):
         action)`` is the JAX apply of the QMFM ``Value`` ensemble (``multisensory_steering``); ``params``
         is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
         traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
-        static arg. Returns ``(actions, {"critic_obs_siglip", "critic_obs_state",
-        "critic_action", "sample_noise"})`` for online replay-buffer collection, where
-        ``critic_obs_siglip`` is itself a ``{modality: patch map}`` dict, one entry per camera
-        view, and ``sample_noise`` is the ``(b, action_horizon, action_dim)`` latent the
-        returned chunk was denoised from. This path takes precedence over ``return_features``.
+        static arg. Returns ``(actions, {"critic_obs_siglip", "critic_obs_siglip_tokens",
+        "critic_obs_state", "critic_action", "sample_noise"})`` for online replay-buffer
+        collection, where ``critic_obs_siglip`` is itself a ``{modality: patch map}`` dict, one
+        entry per camera view, ``critic_obs_siglip_tokens`` is the pooled VLM prefix ``(b, emb)``
+        and ``sample_noise`` is the ``(b, action_horizon, action_dim)`` latent the returned chunk
+        was denoised from. This path takes precedence over ``return_features``.
 
         ``best_of_n > 1`` draws that many candidate chunks from independent noise and returns
         the one the critic scores highest (``mean_k Q``, the same aggregation the guidance
@@ -462,9 +506,10 @@ class Pi0(_model.BaseModel):
         and only the KV cache and the denoising loop scale with N. ``best_of_n`` is static:
         changing it recompiles.
 
-        ``obs`` is a ``{modality: array}`` dict. This model produces the state and one SigLIP
-        map per camera view itself -- ``"state"``, ``"siglip.head"``, ``"siglip.left_wrist"``,
-        ``"siglip.right_wrist"`` (see ``critic_observation``) -- and anything else the critic
+        ``obs`` is a ``{modality: array}`` dict. This model produces the state, one SigLIP
+        map per camera view and the pooled VLM prefix itself -- ``"state"``, ``"siglip.head"``,
+        ``"siglip.left_wrist"``, ``"siglip.right_wrist"``, ``"siglip_tokens"`` (see
+        ``critic_observation``) -- and anything else the critic
         conditions on comes from outside the model, through ``critic_obs_extra``: the sensor
         modalities the sim observation carries (depth maps, point cloud, contact wrench; see
         ``envs/utils/obs_modalities.py``), already **batched** and already narrowed to the keys
@@ -547,7 +592,7 @@ class Pi0(_model.BaseModel):
         # first fill KV cache with a forward pass of the prefix. The image tower runs here (once
         # per camera view) and its raw patch features are what the critic sees, so they are taken
         # from this pass rather than re-encoding a frame further down.
-        kv_cache, prefix_mask, prefix_len, image_encoded = self._prefix_pass(observation)
+        kv_cache, prefix_mask, prefix_len, image_encoded, prefix_hidden = self._prefix_pass(observation)
 
         # Best-of-N replicates the *conditioning*, not the work that produced it: the tower and
         # the prefix pass above ran once at batch `batch_size`, and only the cache they filled is
@@ -580,9 +625,10 @@ class Pi0(_model.BaseModel):
             it was given -- the raw `aux["encoded"]` (1152-d) the prefix pass above computed and
             embed_prefix discards, reshaped to the 16x16 patch grid the CNN encoder expects, and
             named `siglip.head` / `siglip.left_wrist` / `siglip.right_wrist` (SIGLIP_MODALITIES)
-            -- plus the model-space (normalized) state, narrowed to the same `critic_ad`
-            embodiment dims as the action chunk below. `critic_obs_extra` adds the sim's own
-            sensor modalities on top.
+            -- plus `siglip_tokens`, the same prefix pass's LLM hidden state pooled over its
+            tokens (VLM_PREFIX_MODALITY), and the model-space (normalized) state, narrowed to the
+            same `critic_ad` embodiment dims as the action chunk below. `critic_obs_extra` adds
+            the sim's own sensor modalities on top.
 
             All views are offered whatever the critic ends up reading: they are already computed
             (the prefix needs them), and which ones are actually encoded is the critic's own
@@ -597,7 +643,12 @@ class Pi0(_model.BaseModel):
                 for name, encoded in image_encoded.items()
                 if name in SIGLIP_MODALITIES
             }
-            return {**siglip, "state": state, **(critic_obs_extra or {})}
+            return {
+                **siglip,
+                VLM_PREFIX_MODALITY: pool_prefix_tokens(prefix_hidden),
+                "state": state,
+                **(critic_obs_extra or {}),
+            }
 
         def critic_action_view(actions):
             """The normalized `(b, action_horizon, critic_ad)` chunk the critic is scored on."""
@@ -618,6 +669,11 @@ class Pi0(_model.BaseModel):
                 "critic_obs_siglip": {
                     name: critic_obs[name] for name in SIGLIP_MODALITIES.values() if name in critic_obs
                 },
+                # The pooled VLM prefix (VLM_PREFIX_MODALITY), kept out of the dict above
+                # because it is not one of the per-view patch maps: it is a single (b, emb)
+                # vector for the whole observation, prompt included, and the collector stores it
+                # as its own column rather than as another `siglip.<view>`.
+                "critic_obs_siglip_tokens": critic_obs[VLM_PREFIX_MODALITY],
                 "critic_obs_state": critic_obs["state"],
                 "critic_action": critic_action_view(x_0),
                 # The `(b, action_horizon, action_dim)` chunk the flow was actually integrated
@@ -836,7 +892,7 @@ class Pi0(_model.BaseModel):
                 f"actions has shape {actions.shape}, expected {expected}. `invert_actions` takes the "
                 f"sampler's own normalized, action_dim-padded chunk."
             )
-        kv_cache, prefix_mask, prefix_len, _ = self._prefix_pass(observation)
+        kv_cache, prefix_mask, prefix_len, _, _ = self._prefix_pass(observation)
         noise = self._invert_from_prefix(
             observation,
             kv_cache,
@@ -1012,7 +1068,7 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
         batch = observation.state.shape[0]
 
-        kv_cache, prefix_mask, prefix_len, image_encoded = self._prefix_pass(observation)
+        kv_cache, prefix_mask, prefix_len, image_encoded, _ = self._prefix_pass(observation)
         pooled = pool_siglip(image_encoded)
         if missing := [view for view in views if view not in pooled]:
             raise ValueError(f"observation has no {missing} view(s); it carries {sorted(pooled)}.")

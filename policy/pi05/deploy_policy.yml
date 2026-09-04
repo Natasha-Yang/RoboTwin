@@ -26,10 +26,16 @@ pi0_step: 10
 # a checkpoint warm-started from `critic_ckpt`, and any rollout dataset it was pretrained on, has
 # to have been made with this same value. It also caps the env's in-memory log (~240 B per
 # configured wrench modality per transition at 10, stored twice) and nothing else.
+#
+# It is the same width the *demonstrations* are reassembled to. A multimodal demo dataset stores
+# one averaged row per frame, and a demo frame is one primitive step, so the trace a demo row
+# observes is the `wrench_trace_len` rows ending at it -- what the previous chunk covered. That
+# is how a `wrench.*` modality reaches a critic co-training on demonstrations (`offline_mix`
+# with `dataset.kind: demo`) or cross-attending retrieved ones (`demo_retrieval` below).
 wrench_trace_len: 10
 
 # Number of successful eval episodes to run.
-test_num: 300
+test_num: 100
 
 # ===== Periodic held-out evaluation (the best-checkpoint criterion) =====
 # Every `eval_interval` completed episodes, the run pauses and re-plays a FIXED set of
@@ -61,8 +67,8 @@ test_num: 300
 # choose the seeds) every `eval_interval` episodes, so at 10/20 the run is ~50% longer. Set
 # `eval_interval: 0` to turn it off, in which case the best checkpoint falls back to
 # `success_rate_ma` over the training episodes exactly as before.
-eval_interval: 20
-eval_episodes: 10
+eval_interval: 0
+eval_episodes: 25
 # Where the held-out seed search starts. This is an ACTUAL seed, not a `seed`-style block index:
 # the run's own episodes start at `100000 * (1 + seed)` and walk upward from there, one seed per
 # candidate (so more than one per episode -- the expert gate rejects some).
@@ -115,20 +121,35 @@ resume:
 #   nonzero -> an ensemble `Value` critic (multisensory_steering) is trained ONLINE by TD
 #              during the eval rollouts and steers the frozen pi0.5 flow sampler via QMFM
 #              denoised-estimate gradient guidance (see `Pi0.sample_actions`).
-# Guidance starts at 0 and ramps linearly to `guidance_scale` over `guidance_ramp_updates` TD
-# updates *of this run* (0 = jump to the target after the first update). A critic warm-started
-# from `critic_ckpt` ramps in the same way -- its restored update counter does not count. A
-# *resumed* run is the same run, though, so it carries on from the ramp position it stopped at
-# (`critic_ramp_baseline` in resume_state.json) instead of climbing the ramp a second time.
-# Both are overridable as eval.sh's 7th / 8th positional args.
+# Guidance starts at 0 and ramps linearly to `guidance_scale` over `guidance_ramp_episodes`
+# episodes, counted from the critic's FIRST TD UPDATE of this run (0 = no ramp, the target from
+# the first chunk). Not from the run's first episode: before that update the replay buffer is
+# still filling towards `start_training` and the critic has learned nothing, so guidance stays
+# at 0 however long that takes. n episodes after the update's own episode the scale is
+# `n / guidance_ramp_episodes` of the target, so the ramp is done exactly
+# `guidance_ramp_episodes` episodes after it started -- one constant scale per episode.
+# A critic warm-started from `critic_ckpt` ramps in the same way: its restored update counter
+# is not this run's first update. A *resumed* run is the same run, though, so it carries on
+# from the ramp position it stopped at (its clock is the run's own episode counter and its
+# origin is `guidance_ramp_start_episode`, both restored from resume_state.json) instead of
+# climbing the ramp a second time. Episodes that do not count: a seed the expert check rejected
+# never ran, and a held-out evaluation episode (`eval_interval`) is a measurement of the run
+# rather than a part of it. Both keys are overridable as eval.sh's 7th / 8th positional args.
+#
+# The ramp is only for a critic whose values are still moving, which is the only thing there is
+# to ease into. With no critic at all, with a frozen one (`train_online: false`), or at
+# `guidance_ramp_episodes: 0`, `guidance_scale` is in force exactly as written from the first
+# chunk. (With no critic that is what the run *reports*, not a way to steer without one -- the
+# sampler is the plain pi0.5 one, and nothing reads the number.)
 #
 # Whether that critic also *learns* here is `train_online` in the `critic_config_path` file
 # below, with `freeze_encoder` next to it for the half-way point (keep the checkpoint's
 # observation encoder, keep training the value head). `train_online: false` freezes the critic
 # at `critic_ckpt` entirely: it still steers, but nothing is stashed into the replay buffer and
-# no TD update runs, so guidance sits at `guidance_scale` from the first chunk (there are no
-# updates to ramp against) and `guidance_ramp_updates` is ignored. Overridable as eval.sh's 9th
-# positional arg, or by setting `train_online` here -- this file wins over the included one.
+# no TD update runs, so guidance sits at `guidance_scale` from the first chunk (its values
+# never move, so there is nothing to ease into) and `guidance_ramp_episodes` is ignored.
+# Overridable as eval.sh's 9th positional arg, or by setting `train_online` here -- this file
+# wins over the included one.
 #
 # `best_of_n` is the second way the critic can act on sampling, independent of the gradient
 # guidance:
@@ -144,8 +165,8 @@ resume:
 # Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
 # denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
 best_of_n: 1
-guidance_scale: 0.05
-guidance_ramp_updates: 500
+guidance_scale: 0
+guidance_ramp_episodes: 10
 # The reward the run scores itself with -- what `commit()` feeds the online critic, what the
 # W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
 #   true  -> 1.0 on the step that first reaches success, plus the task's own shaped progress
@@ -153,15 +174,16 @@ guidance_ramp_updates: 500
 #   false -> sparse: 1.0 on success, 0.0 everywhere else, even for a task that defines shaping.
 # Unlike the keys above this also applies to the unguided baseline. eval.sh's 10th positional
 # arg overrides it.
-use_step_reward: false
+use_step_reward: true
 # Optional package-owned online adaptation runner. The referenced YAML must define
 # `runner: python.module:function`; null keeps the normal evaluation loop.
 adaptation_config_path: null
 # ===== Demo retrieval (action_proposals / noise_proposals) =====
 # Which demonstrations the two proposal modalities are retrieved from, and how. Whether they are
-# produced at all is the *task config's* `data_type.action_proposals` / `data_type.noise_proposals`
-# (both default false) -- this block only says where they come from, and is ignored when neither
-# flag is set or when no critic is running to consume them.
+# produced at all is the *critic's* `encoder_modalities`: `action_proposals` / `noise_proposals`
+# are not sensors and have no task-config flag, so naming one there is the whole switch. This
+# block only says where they come from, and is ignored when the critic names neither or when no
+# critic is running to consume them.
 #
 # Once per run (on the first episode): `num_demos` episodes of the task under evaluation are
 # drawn at random from `repo_id` (matched by RoboTwin *task*, not by instruction string -- one
@@ -179,7 +201,7 @@ adaptation_config_path: null
 demo_retrieval:
   # The LeRobot dataset the demonstrations come from -- normally the one the policy was
   # fine-tuned on, so a retrieved chunk is something the policy could plausibly produce.
-  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  repo_id:
   # Where that dataset lives; null = $HF_LEROBOT_HOME/<repo_id>.
   root: null
   # Demonstrations drawn for the run (once, not per episode), and neighbours retrieved per
@@ -188,7 +210,7 @@ demo_retrieval:
   # chunk costs an action-expert pass, which is why the pool is not the whole bank -- and the
   # critic cross-attends them to decide what the value actually rests on. A critic that pools
   # the set instead gets exactly these `top_k` and no say in it.
-  num_demos: 1
+  num_demos: 5
   top_k: 3
   # Camera views the similarity is averaged over; null = all three the policy sees.
   views: null
@@ -196,25 +218,35 @@ demo_retrieval:
   # averaged with EQUAL weight, so adding one dilutes the others: `siglip` expands to one term
   # per camera view (three by default) and `state` adds a fourth on the robot's pose in the
   # model's normalized space. null = both; `[siglip]` is vision only. `siglip` is required.
-  # (Contact wrench would be the natural third signal but no demo dataset carries it -- the
-  # RoboTwin collection pipeline computes it live and never persists it.)
+  # (Contact wrench is not a signal here even for a demo dataset that carries the columns: a
+  # trace is NaN-padded at an episode's start and an L2 over NaN is NaN. It still reaches the
+  # critic as a `wrench.*` key modality on the retrieved rows -- see `wrench_trace_len` above.)
   signals: null
   # Recorded sensors to keep per bank row, on top of the camera views, the pose and the contact
   # wrench. These are what lets **any** modality a demo dataset carries be a cross-attention key
   # (`critic_keys`) or a co-training column (`cotrain_rows`), not just `siglip.<view>` /
-  # `state` / `wrench.<key>`: name them here and a retrieved demo frame serves its own
-  # `depth.head`, `pointcloud`, raw `images.<cam>`, ... under the same modality names the live
-  # observation uses.
+  # `state` / `wrench.<key>`: a retrieved demo frame then serves its own `depth.head`,
+  # `pointcloud`, raw `images.<cam>`, ... under the same modality names the live observation
+  # uses.
   #
-  # Which ones exist follows the dataset, and it is checked at startup: the rgb-only converter
-  # writes three camera views, the multimodal one adds `depth.<cam>`, `pointcloud` and a fourth
-  # `front` camera. `null` (or []) keeps none, which is exactly the behaviour before this key
-  # existed; `true` keeps everything the dataset has.
+  #   null (default)  derive it: load whatever the critic asks for -- its `encoder_modalities`
+  #                   plus any explicit `key_modalities` -- intersected with the columns this
+  #                   dataset actually has. So naming `depth.head` in the critic config is
+  #                   enough; it does not have to be repeated here. The intersection is what
+  #                   stops a depth-encoding critic breaking every run against an rgb-only demo
+  #                   dataset: a modality no demonstration carries stays part of the attention
+  #                   *query* and is simply not loaded.
+  #   a list          load exactly these, for loading LESS than the critic could use (a depth
+  #                   camera it encodes but does not key on is pure resident memory).
+  #   []              load none.
+  #   true            load everything the dataset has, keyed on or not.
   #
-  # Opt-in because unlike a SigLIP map these cannot be re-encoded from something smaller -- they
-  # are resident for every bank row (~0.23 MB a camera frame, ~0.15 MB a depth map, ~24 KB a
-  # point cloud), so the cost scales with `num_demos` x episode length, not with `top_k`. The
-  # bank banner prints the total.
+  # Worth setting deliberately because unlike a SigLIP map these cannot be re-encoded from
+  # something smaller -- they are resident for every bank row (~0.23 MB a camera frame, ~0.15 MB
+  # a depth map, ~24 KB a point cloud), so the cost scales with `num_demos` x episode length,
+  # not with `top_k`. The bank banner prints the total. That is a different axis from the
+  # replay buffer's, which scales with `top_k` x `buffer_size` and is what `key_modalities`
+  # governs.
   #
   # A shape mismatch is the thing to watch: a demo frame has to be the same array the sim hands
   # the critic online. The rgb-only demo datasets store 480x640 frames against the sim's
@@ -265,4 +297,4 @@ critic_ckpt:
 #                              score an action chunk).
 #
 # Swap it here, or per run as eval.sh's 12th positional argument.
-critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm.yaml
+critic_config_path: # /home/natasha/multisensory-steering/cfgs/dsrl_low_rank.yaml

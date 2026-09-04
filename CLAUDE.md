@@ -913,18 +913,18 @@ Or directly on an `salloc`'d GPU node:
 ```bash
 cd policy/pi05
 bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
-             [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n] \
+             [guidance_scale] [guidance_ramp_episodes] [train_online] [use_step_reward] [best_of_n] \
              [critic_config_path]
 # baseline (no critic guidance)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
 # online critic-guided
-bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 10
 # ... with the shaped step reward off (sparse success reward only)
-bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256 "" false
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 10 "" false
 # best-of-8 selection with no gradient guidance
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0 "" "" "" 8
 # both: every candidate steered, the best steered chunk executed
-bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 256 "" "" 8
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 0.3 10 "" "" 8
 # DSRL: the sampler is untouched and a SAC actor picks the noise it denoises from (§5c)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0 \
              "" "" "" "" "" /home/natasha/multisensory-steering/cfgs/dsrl.yaml
@@ -988,7 +988,7 @@ the same directory, since it rewrites its own `resume_state.json` every episode 
 | `test_num`, `suc`, `chunk_count` | `resume_state.json` | counters the guidance ramp and MA windows key off |
 | episode rows + MA windows | `_episode_results.csv` | reloaded so the averages continue across the break |
 | critic params, target, **Adam state, LR schedule position** | `online_value_critic.pkl` | see below |
-| guidance ramp position | `critic_ramp_baseline` in `resume_state.json` | see below |
+| guidance ramp position | `test_num` + `guidance_ramp_start_episode` in `resume_state.json` | see below |
 | best-checkpoint bar | `best_score` in `resume_state.json` | otherwise the resumed run's first episode overwrites a better `online_value_critic_best.pkl` (§5a) |
 | held-out seed set | `holdout_seeds` in `resume_state.json` | re-searching costs an expert rollout per rejected seed, and a different set would not be comparable with the scores already in `_holdout_results.csv` (§5a.1) |
 | W&B run | `wandb_run_id` → `resume="allow"` | keeps the critic curves one continuous series |
@@ -1002,21 +1002,18 @@ schedule again. The state is checked against the optimizer actually built (`clip
 `freeze_encoder` change its tree) and dropped with a message rather than crashing if it no
 longer fits; checkpoints written before this load exactly as they did.
 
-The **guidance ramp** had the same shape of bug one level up. A resume points `critic_ckpt` at
-the run's own `online_value_critic.pkl`, and `PI0._init_critic` re-bases the ramp at whatever
-update count a checkpoint restores (§5a — deliberate for an offline critic, so a warm start eases
-in like a fresh one). Applied to a run's own checkpoint that means the ramp restarts: a run that
-had reached full `guidance_scale` comes back at **0** and climbs the whole
-`guidance_ramp_updates` again. So `resume_state.json` now carries `critic_ramp_baseline` — the
-count *that* run's ramp was measured from (0 when its critic was trained from scratch here) — and
-`eval_policy.py` hands it back through `deploy_policy.py` as `PI0(critic_ramp_baseline=...)`,
-which uses it instead of re-deriving one. The startup banner prints where the ramp resumes. It is
-not a user-facing config key: nothing but the resume path sets it, and it is applied only when
-the critic checkpoint is actually reloaded (against a critic starting at 0 updates it would pin
-guidance at 0 instead). State files written before 2026-08-08 have no such key: a run whose
-critic trained from scratch is reconstructed exactly (its baseline was 0), one that warm-started
-from an offline `critic_ckpt` cannot be, and keeps the old restart-the-ramp behavior with a
-printed note.
+The **guidance ramp** is counted in **episodes since the critic's first TD update** (§5a), and
+both halves of that survive the break. The clock is the driver's own `test_num`, restored from
+`resume_state.json` like every other counter and pushed into the policy at the top of each
+episode (`PI0.set_episodes_done`). The origin — which episode that first update landed in —
+cannot be recomputed: the checkpoint records how many updates the critic has done, not when, and
+on resume they are all behind it, so a fresh latch would restart the ramp. So
+`resume_state.json` carries `guidance_ramp_start_episode`, and `eval_policy.py` hands it back
+through `deploy_policy.py` as `PI0(guidance_ramp_start_episode=...)`. A run that had reached full
+`guidance_scale` therefore comes back at it, and the startup banner prints how far into the ramp
+it resumes. Until 2026-09-03 the ramp counted TD updates and the same job was done by
+`critic_ramp_baseline`; that key is gone, and a state file carrying it is ignored (its ramp
+restarts at the resumed run's next TD update).
 
 **Not** restored: the replay buffer (gigabytes of SigLIP features, §5a), so a resumed critic
 keeps its weights and optimizer but refills the buffer from empty and runs no TD update until
@@ -1031,7 +1028,7 @@ that print are exactly the ones the expert check accepted. `script/resume_state_
 <slurm_log> <run_dir>` parses them back into a `resume_state.json` (and reconstructs
 `_episode_results.csv`), after which `resume` continues the run normally. Run it once the job has
 actually exited, and only for a run with **no critic** — a critic's weights are not in any log, so
-the reconstructed `chunk_count`/`critic_updates`/`critic_ramp_baseline` are zeros, true only when
+the reconstructed `chunk_count`/`critic_updates` are zeros, true only when
 `guidance_scale` was 0 and `best_of_n` 1. Two of the columns are inexact and neither is load-bearing:
 `num_steps` is the last step the episode printed, and `reward` is recovered by inverting the printed
 moving average (`r_n = S_n - S_{n-1} + r_{n-window}`), which accumulates the print's 3-decimal
@@ -1197,7 +1194,7 @@ mutually exclusive with both keys below.)
 
 | Key | Off | On |
 |---|---|---|
-| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_episodes` episodes counted from the critic's first TD update (default 10; `0` = no ramp) |
 | `best_of_n` (11th arg) | `1` | `n` candidate chunks are drawn per control step and the highest-Q one is executed |
 
 Both off is the plain pi0.5 baseline — no critic is built, no replay collection, no TD updates,
@@ -1216,7 +1213,7 @@ The two knobs compose but are not the same thing. Guidance moves a *single* samp
 and can walk it off the policy's own distribution if the critic is wrong there; best-of-N only ever
 returns something the frozen pi0.5 sampler drew on its own, so a bad critic costs it nothing beyond
 the wasted compute — with an untrained critic it degrades to picking a candidate at random, which is
-exactly the baseline. That is why guidance needs `guidance_ramp_updates` and best-of-N needs no ramp.
+exactly the baseline. That is why guidance needs `guidance_ramp_episodes` and best-of-N needs no ramp.
 
 Cost is `n` denoising loops, not `n` policy calls: the candidates ride along as extra batch elements,
 replicated **after** the SigLIP tower and the prefix pass, so those still run once per control step
@@ -1240,7 +1237,7 @@ a critic is running:
 | Key | Default | Behavior |
 |---|---|---|
 | `train_online: true` | ✔ | as above — transitions are stashed into the replay buffer after every control step, TD updates run, `save_critic` writes the result (see the checkpointing note below) |
-| `train_online: false` | | the critic is **frozen** at `critic_ckpt`: it still steers the sampler, but nothing is stashed, no TD update runs, and the ramp is skipped (guidance sits at `guidance_scale` from the first chunk, since there are no updates to count). W&B still opens and logs the eval metrics |
+| `train_online: false` | | the critic is **frozen** at `critic_ckpt`: it still steers the sampler, but nothing is stashed, no TD update runs, and the ramp is skipped (guidance sits at `guidance_scale` from the first chunk — the critic's values never move, so there is nothing to ease into). W&B still opens and logs the eval metrics |
 | `freeze_encoder: true` | | the half-way point: TD still runs, but only on the value head — the observation encoder (`MultiModalEncoder`, or the legacy single SigLIP CNN) keeps the checkpoint's weights |
 
 Freezing is for warm starts. `train_online: false` evaluates an offline-trained critic as-is,
@@ -1259,8 +1256,8 @@ Under `save_critic`, that critic is written to `online_value_critic.pkl` in the 
 **after every episode**, not once at the end — a 100-episode guided eval is many hours, and
 losing all of its TD training to a SLURM time limit is the expensive failure. There is one file
 per run, overwritten each time, so nothing accumulates; to resume, point the next run's
-`critic_ckpt` at it (the checkpoint carries `num_updates`, so the guidance ramp picks up where
-it left off — `PI0.scheduled_guidance_scale` still counts only *this* run's updates, §6.2).
+`critic_ckpt` at it (the next run's ramp then starts over, since it counts that run's own
+episodes — `PI0.scheduled_guidance_scale`, §6.2).
 `script/eval_policy.py::save_critic_atomically` pickles into a sibling `.tmp` and renames it
 into position, so a kill mid-write leaves the previous complete checkpoint rather than a
 truncated one — writing in place at this rate would otherwise make the interrupt this is meant
@@ -1275,8 +1272,8 @@ every update since the last episode boundary. The cadence counts the critic's ow
 *ahead* of `resume_state.json` rather than behind it: a resume then replays the interrupted
 episode's seed against a critic that already saw part of that episode, which duplicates a little
 training data and loses none. Only the state file's `critic_updates` field goes stale, and
-nothing reads it back — the guidance ramp is measured from `critic_ramp_baseline` against the
-checkpoint's own counter, which is right precisely because those updates did happen.
+nothing reads it back — the guidance ramp is counted in episodes, off the state file's own
+`test_num` and `guidance_ramp_start_episode`.
 
 **Two files, not one.** `online_value_critic.pkl` is the run's *state* — whatever the last
 episode left, which is what a resume must pick up — but online TD on a few thousand correlated
@@ -1400,11 +1397,38 @@ encoder just converges it to the same frozen weights. Unlike `encoder_modalities
 an architecture key — it changes no shapes, so the config's value wins over a checkpoint's and
 either setting loads either checkpoint.
 
-The ramp counts TD updates **performed in this run**. A critic warm-started from `critic_ckpt`
-restores the checkpoint's lifetime `num_updates` (an offline-trained one is in the hundreds), so
-using that counter directly would read as "ramp already finished" and apply full guidance from
-the first chunk; `PI0.scheduled_guidance_scale` subtracts the value at load time instead. W&B's
-`critic/update` still reports the lifetime count.
+The ramp is measured in **episodes**, not TD updates, and starts at the critic's **first TD
+update of this run**. Two separate choices:
+
+- **It starts at the first update**, not at the run's first episode, because until then the
+  replay buffer is still filling towards `start_training` and the critic has learned nothing —
+  there is nothing to ease into yet, and how many episodes that takes is not something you set.
+  Guidance is 0 for however long it lasts. A critic warm-started from `critic_ckpt` ramps in
+  exactly like one trained from scratch: its restored lifetime `num_updates` (in the hundreds
+  for an offline-trained one) is not this run's first update — `_critic_updates_at_start` is
+  what that is measured against. W&B's `critic/update` still reports the lifetime count.
+- **It is counted in episodes** so that how far it has come is legible from the episode number
+  in the log, does not move with `train_freq` or with how many control steps an episode happened
+  to take, and one episode is steered by one constant scale rather than by a value drifting
+  within it. `n` episodes after the one the first update landed in, the scale is
+  `n / guidance_ramp_episodes` of the target — so the ramp finishes exactly
+  `guidance_ramp_episodes` episodes after it started.
+
+The ramp applies only to a critic that is still learning. With no critic at all, with a frozen
+one (`train_online: false`), or at `guidance_ramp_episodes: 0`, `guidance_scale` is in force
+exactly as configured from the first chunk — there is nothing to ease into. (With no critic that
+is what the run *reports*; the sampler is the plain pi0.5 one and nothing consumes the number.
+The two agree in any case, since a nonzero `guidance_scale` is itself what builds a critic.)
+
+The clock is the eval driver's own completed-episode counter, pushed in per episode
+(`PI0.set_episodes_done`), because only that loop knows what an episode of the run is: a seed the
+expert check rejected never ran, and a held-out evaluation episode (§5a.1) is a measurement of
+the run rather than a part of it. A driver that never pushes a count falls back to counting the
+policy's own episode resets, so an alternative rollout loop still ramps rather than sitting at
+guidance 0 forever; `frozen_for_eval` puts the clock back on the way out either way. The origin
+is latched on the first read that sees an update of this run, and — unlike the clock, which is
+`test_num` — is not recoverable afterwards, so it is the one thing about the ramp
+`resume_state.json` carries (`guidance_ramp_start_episode`).
 
 `guidance_scale` and `best_of_n` default to whatever `deploy_policy.yml` says; the positional args
 only override them (pass `0` and `1` to force the baseline). The critic's own hyperparameters are **not** in
@@ -1450,6 +1474,7 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | Modality | Source | Shape |
 |---|---|---|
 | `siglip.{head,left_wrist,right_wrist}` | pi0.5's own image tower, inside `sample_actions` | `(16, 16, 1152)` each |
+| `siglip_tokens` | the VLM **prefix** hidden state pooled over its tokens, from the same prefix pass — FlowDAgger's own steering feature | `(2048,)` |
 | `state` | normalized model state, embodiment dims | `(14,)` |
 | `images.{head,left_wrist,right_wrist}` | task config `data_type.rgb` | `(240, 320, 3)` uint8 |
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
@@ -1471,6 +1496,22 @@ task config does not enable raises at startup, listing what *is* available.
 
 Three things to keep in mind:
 
+- **`siglip_tokens` is not a `siglip.<view>` at a different width.** The `siglip.*` maps are the
+  image tower's raw pre-projection patch features, one 1152-d map per camera. `siglip_tokens` is
+  the **LLM's** hidden state over the whole prefix — every camera's projected image tokens *and*
+  the tokenized prompt — mean-pooled to one `paligemma_variant`-width vector (2048 for pi0.5's
+  gemma_2b). Individual views are not separable in it and the language conditioning is part of
+  it. It is exactly what `Pi0.get_prefix_rep` returns pooled, i.e. the feature FlowDAgger's
+  steering policy conditions on (`multisensory_steering/flowdagger/robotwin.py::_steering_observation`),
+  which is the point of offering it: a QMFM or DSRL critic can be pointed at the same
+  representation FlowDAgger reads instead of at the raw patch maps. It is free in compute (the
+  prefix forward pass produces it whether or not anything reads it — `_prefix_pass` used to throw
+  it away) and ~4 KB/transition in the replay buffer against a map's ~1.15 MB. It is offered by
+  the model, not by the sim, so it has no `data_type` flag; naming it in the critic's
+  `encoder_modalities` is the whole switch, and it takes a `vector` encoder with a 256-wide
+  bottleneck (`MODALITY_DEFAULTS`), matching FlowDAgger's own `latent_dim`. The one thing it does
+  **not** reach is a demo bank: `DemoRetriever` cannot serve it as a `key_modality` or a
+  co-training row (§5b, §5d) without a prefix pass per demo frame.
 - **All three SigLIP views come free, but only in compute.** The image tower already runs once
   per camera to build the prefix, so `Pi0.embed_images` keeps its raw `aux["encoded"]` for every
   view and `embed_prefix` reuses the tokens — the wrist maps cost no extra tower pass, and the
@@ -1935,6 +1976,7 @@ why the load is deferred: `OnlineValueCritic` cannot do it itself, so it records
 | action | ✔ the `(50, 14)` normalized delta chunk | the policy's training target at that frame |
 | `wrench.<key>` | ✔ `(wrench_trace_len, 6)`, **multimodal demo datasets only** | windowed out of the dataset's own per-frame rows (§5b) |
 | `depth.<cam>`, `pointcloud`, raw `images.<cam>`, … | ✔ **if the dataset has the column and the run kept it** | the column itself, cast to the dtype the sim hands the critic (§5b) |
+| `siglip_tokens` | ✘ | the tower pass above gives the patch maps; the pooled VLM prefix would need a full prefix forward per demo row |
 | privileged task state | ✘ | nothing persists it through the demo pipeline |
 
 The ✔ on the third row is conditional twice over, and both conditions are checked at startup
@@ -2074,6 +2116,7 @@ Each row is one policy call (one action chunk), in two different spaces:
 | `action.model` | **normalized**, embodiment dims | `(50, 14)` |
 | `action.noise` | the flow-matching latent that chunk was denoised from, **padded** dims | `(50, 32)` |
 | `siglip.{head,left_wrist,right_wrist}` | per-camera SigLIP patch features, fp16 | `(256, 1152)` each |
+| `siglip_tokens` | the VLM prefix pooled over its tokens, fp16 — the `siglip_tokens` modality (§6.2) | `(2048,)` |
 | `observation.wrench.<link>` | world-frame contact wrench per end-effector link, one row per primitive step (that step's physics steps averaged) | `(wrench_trace_len, 6)` each, i.e. `(pi0_step, 6)` |
 | `observation.wrench.<arm>` | the same, summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `reward` | reward earned by this row's own chunk | scalar |
@@ -2125,6 +2168,13 @@ Three things make it unlike every other column:
 
 `policy/pi05/src/openpi/models/pi0_sample_noise_test.py` pins the property the column rests on:
 feeding `sample_noise` back in as `noise=` reproduces the chunk it came with.
+
+`siglip_tokens` rides along with `collect_critic_obs` for the same reason `action.noise` does:
+it is ~4 KB/row against the 576 KB a single SigLIP view costs, so it is not worth a switch of its
+own, and — like the noise, and unlike the patch maps — a later pass over the dataset could not
+add it without re-running the policy's prefix pass on every frame. It is written under the
+modality's own name (no `observation.` prefix, matching the `siglip.<view>` columns), as a plain
+1-D sequence rather than an `Array2D`. Datasets collected before 2026-09-04 do not have it.
 
 The `siglip.*` columns are the visual thing the critic conditions on, and are written **during
 collection** (`collect_siglip`) from `critic_obs_siglip` — the exact patch maps

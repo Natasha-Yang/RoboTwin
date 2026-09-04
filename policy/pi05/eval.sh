@@ -6,8 +6,8 @@
 #   nonzero  an ensemble QMFM `Value` critic steers the frozen pi0.5 flow sampler
 #            (multisensory_steering + Pi0.sample_actions), warm-started from `critic_ckpt`
 #            and kept training by TD during the rollouts. Guidance ramps
-#            0 -> guidance_scale over this run's first `guidance_ramp_updates` TD updates,
-#            warm-started or not.
+#            0 -> guidance_scale over `guidance_ramp_episodes` episodes, counted from the
+#            critic's first TD update of this run, warm-started or not.
 # `best_of_n` (11th arg) is the other way the critic can act on sampling: N candidate chunks are
 # drawn per control step and the highest-Q one is executed. It composes with `guidance_scale`
 # (each candidate is steered, then the best steered chunk wins) and also works on its own --
@@ -31,7 +31,7 @@
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
 # Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
 # `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
-export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
+export QMFM_ROOT="${QMFM_ROOT:-/home/natasha/QMFM}"
 # Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
 # wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
 # `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
@@ -50,7 +50,7 @@ gpu_id=${6}
 # pass `0` as guidance_scale and `1` as best_of_n to force the plain pi0.5 baseline.
 overrides=()
 [ -n "${7}" ] && overrides+=(--guidance_scale "${7}")          # target QMFM steering_coeff
-[ -n "${8}" ] && overrides+=(--guidance_ramp_updates "${8}")   # TD updates to ramp 0 -> target
+[ -n "${8}" ] && overrides+=(--guidance_ramp_episodes "${8}")  # episodes to ramp 0 -> target
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step

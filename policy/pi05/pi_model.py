@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi.models import model as _model
-from openpi.models.pi0 import SIGLIP_MODALITIES
+from openpi.models.pi0 import SIGLIP_MODALITIES, VLM_PREFIX_MODALITY, vlm_prefix_dim
 from openpi.policies import aloha_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import download
@@ -58,7 +58,7 @@ class PI0:
 
     def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step,
                  critic_ckpt=None, guidance_scale=0.0, best_of_n=1,
-                 guidance_ramp_updates=0, critic_ramp_baseline=None,
+                 guidance_ramp_episodes=10, guidance_ramp_start_episode=None,
                  online_critic=False, train_critic_online=True,
                  critic_config=None, critic_seed=0, noise_warmup_chunks=0,
                  collect_critic_obs=False, collect_siglip=True,
@@ -68,7 +68,24 @@ class PI0:
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
         self.guidance_scale_target = float(guidance_scale)
-        self.guidance_ramp_updates = max(0, int(guidance_ramp_updates))
+        self.guidance_ramp_episodes = max(0, int(guidance_ramp_episodes))
+        # Episodes of this run that have finished, i.e. the ramp's clock. Only the eval driver
+        # knows what counts as one -- a seed the expert check rejected never runs, and a
+        # held-out evaluation episode (`eval_interval`) is a measurement rather than an episode
+        # of the run -- so it is pushed in by `set_episodes_done` rather than counted here.
+        # A driver that never pushes one falls back to counting episode boundaries (see
+        # `reset_obsrvationwindows`), so the ramp still advances instead of pinning guidance
+        # at 0 for the whole run.
+        self._episodes_done = 0
+        self._episode_resets = 0
+        self._episodes_pushed = False
+        # The episode the ramp starts counting from: the one the critic's first TD update of
+        # this run landed in. None until that update happens (guidance is 0 until then -- the
+        # critic has learned nothing yet, and the replay buffer is still filling towards
+        # `start_training`). Latched in `scheduled_guidance_scale`; handed back by the eval
+        # driver on resume, since which episode it was is not recoverable from the checkpoint.
+        self._ramp_start_episode = (None if guidance_ramp_start_episode is None
+                                    else int(guidance_ramp_start_episode))
         self.current_guidance_scale = 0.0
         # Best-of-N: draw this many candidate chunks per control step and execute the one the
         # critic scores highest (`Pi0.sample_actions`). Independent of the gradient guidance --
@@ -182,19 +199,12 @@ class PI0:
         self._noise_rng = np.random.default_rng(critic_seed)
         # Sensor modalities from the sim observation (depth / point cloud / contact wrench --
         # see envs/utils/obs_modalities.py), handed in by deploy_policy.eval. The model itself
-        # only produces `state` and a `siglip.<view>` map per camera; everything else the critic
-        # conditions on arrives this way. Populated only when a critic is actually running.
+        # only produces `state`, a `siglip.<view>` map per camera and the pooled VLM prefix
+        # (`siglip_tokens`); everything else the critic conditions on arrives this way.
+        # Populated only when a critic is actually running.
         self.critic_obs_extra = {}
         self._critic_extra_shapes = {}
         self._critic_updates_at_start = 0
-        # Where the ramp counts from, when the caller knows better than "wherever the
-        # checkpoint left off". Only `script/eval_policy.py` resuming an interrupted run does:
-        # it reloads that run's *own* critic as `critic_ckpt`, so re-basing at the restored
-        # counter would restart the ramp at 0 and re-ramp a critic the run had already ramped
-        # in. It passes the interrupted run's own baseline back instead. None = derive it from
-        # the checkpoint, which is right for every other warm start.
-        self._critic_ramp_baseline = (None if critic_ramp_baseline is None
-                                      else int(critic_ramp_baseline))
         self._critic_ckpt = critic_ckpt
         self._critic_config = dict(critic_config or {})
         self._critic_config["seed"] = critic_seed
@@ -416,16 +426,25 @@ class PI0:
             cc["action_dim_flat"] = horizon * self.critic_action_dim
         cc["siglip_channels"] = 1152
         cc["siglip_grid"] = 16
+        # Width of the pooled VLM prefix modality (`siglip_tokens`), read off the model config
+        # rather than a tensor: the critic's shapes have to be declared before the first
+        # sampler call. 2048 for pi0.5's gemma_2b prefix expert.
+        cc["vlm_prefix_dim"] = vlm_prefix_dim(self.model_config)
         # Everything the critic *may* condition on this run: the modalities the sampler produces
-        # itself -- the state and one SigLIP patch map per camera the policy is given, the wrist
-        # views as well as the head -- plus whichever sensors the task config's `data_type`
-        # turned on (they are in `critic_obs_extra` because the first observation has already
-        # been handed in). Which of them it actually uses is decided downstream, by the critic's
+        # itself -- the state, one SigLIP patch map per camera the policy is given (the wrist
+        # views as well as the head), and the pooled VLM prefix -- plus whichever sensors the
+        # task config's `data_type` turned on (they are in `critic_obs_extra` because the first
+        # observation has already been handed in). Which of them it actually uses is decided
+        # downstream, by the critic's
         # own `encoder_modalities` config -- this side just declares what is on offer, and the
         # critic raises if it was configured for something the sim is not producing.
         siglip_shape = (cc["siglip_grid"], cc["siglip_grid"], cc["siglip_channels"])
         cc["obs_shapes"] = {
             **{view: siglip_shape for view in SIGLIP_MODALITIES.values()},
+            # The one model-produced modality that is not per view: the prefix pass's LLM
+            # hidden state pooled over its tokens, i.e. every camera *and* the prompt in one
+            # vector -- FlowDAgger's own steering feature (`Pi0.pool_prefix_tokens`).
+            VLM_PREFIX_MODALITY: (cc["vlm_prefix_dim"],),
             "state": (self.critic_action_dim,),
             **{key: tuple(np.shape(value)) for key, value in self.critic_obs_extra.items()},
         }
@@ -500,15 +519,10 @@ class PI0:
             for key in self.online_critic.buffer_keys
             if key in self.critic_obs_extra
         }
-        # A warm-started critic restores its lifetime update counter from the checkpoint (an
-        # offline-trained one is in the hundreds/thousands), so the ramp has to be measured
-        # against where *this* run started -- otherwise it reads as already finished and
-        # guidance jumps to the target on the very first chunk. The exception is a *resumed*
-        # run, whose checkpoint is its own earlier self: it hands its original baseline back
-        # (`critic_ramp_baseline`) so the ramp picks up where the interruption left it.
-        self._critic_updates_at_start = (int(self.online_critic.num_updates)
-                                         if self._critic_ramp_baseline is None
-                                         else self._critic_ramp_baseline)
+        # A warm-started critic restores the checkpoint's lifetime `num_updates` (an
+        # offline-trained one is in the hundreds), so "has this run trained the critic yet" --
+        # what starts the ramp -- has to be measured against where this run picked it up.
+        self._critic_updates_at_start = int(self.online_critic.num_updates)
 
         # A checkpoint's architecture keys override the caller's, so a critic whose shapes do not
         # match (wrong embodiment, wrong action horizon) loads "successfully" and then fails with
@@ -617,15 +631,16 @@ class PI0:
         })
         if not self.train_critic_online:
             ramp = "no ramp (frozen critic), "
-        elif self._critic_ramp_baseline is None:
-            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (from this run's first "
-                    f"TD update), ")
+        elif self._ramp_start_episode is None:
+            ramp = (f"guidance_ramp_episodes={self.guidance_ramp_episodes} (from this run's "
+                    f"first TD update), ")
         else:
-            # Resumed run: the ramp is already partway along, so say where it comes back at
-            # rather than implying it starts here.
-            ramp = (f"guidance_ramp_updates={self.guidance_ramp_updates} (resumed at update "
-                    f"{int(self.online_critic.num_updates) - self._critic_updates_at_start} of "
-                    f"the ramp -> guidance {self.scheduled_guidance_scale():.4g}), ")
+            # Resumed run whose ramp had already started: say where it comes back at rather
+            # than implying it starts here.
+            ramp = (f"guidance_ramp_episodes={self.guidance_ramp_episodes} (started episode "
+                    f"{self._ramp_start_episode}, resumed "
+                    f"{self._episodes_done - self._ramp_start_episode} episode(s) in "
+                    f"-> guidance {self.scheduled_guidance_scale():.4g}), ")
         if self.guidance_scale_target == 0.0:
             # Best-of-N only: the sampler is the plain pi0.5 one and the critic never enters a
             # gradient, it only ranks. Say so, rather than printing a guidance target of 0.
@@ -670,41 +685,93 @@ class PI0:
     def _critic_mode(self):
         return "trained online by TD" if self.train_critic_online else "FROZEN (no TD updates)"
 
-    @property
-    def critic_ramp_baseline(self):
-        """The lifetime update count the guidance ramp is measured from.
+    def set_episodes_done(self, episodes):
+        """Tell the policy how many episodes of this run have finished. The ramp's clock.
 
-        Written into `resume_state.json` by the eval driver and handed back on resume, so the
-        ramp survives an interruption. 0 until the critic is built (see `_init_critic`).
+        Called by `script/eval_policy.py` at the top of every training episode with its own
+        completed-episode count (`TASK_ENV.test_num`). That counter is restored from
+        `resume_state.json`, so a resumed run comes back at the ramp position it stopped at
+        without the ramp needing any state of its own -- and the episodes it does not count
+        (a seed the expert check rejected, a held-out evaluation episode) are exactly the ones
+        that should not move the guidance either.
+
+        Calling this once takes the clock over from the reset-counting fallback in
+        `reset_obsrvationwindows` for the rest of the run, so the two cannot fight.
         """
-        return self._critic_updates_at_start
+        self._episodes_pushed = True
+        self._episodes_done = max(0, int(episodes))
+
+    @property
+    def episodes_done(self):
+        return self._episodes_done
+
+    @property
+    def guidance_ramp_start_episode(self):
+        """The episode the guidance ramp started counting from, or None if it has not started.
+
+        Written into `resume_state.json` by the eval driver and handed back on resume: the
+        critic checkpoint carries how many updates it has done but not which episode the first
+        one landed in, so this is the one piece of the ramp that cannot be recomputed.
+        """
+        return self._ramp_start_episode
 
     def scheduled_guidance_scale(self):
-        """Guidance ramps 0 -> target over the first `guidance_ramp_updates` TD updates.
+        """Guidance ramps 0 -> target over `guidance_ramp_episodes` episodes.
 
-        Counted from the start of this run, so a critic warm-started from `critic_ckpt` ramps
-        in exactly like one trained from scratch: its values are trained on a different
-        (offline) state distribution, so easing the sampler into them is worth doing even
-        though the network is not random.
+        The clock starts at the critic's **first TD update of this run**, not at the run's
+        first episode: before that the replay buffer is still filling towards `start_training`
+        and the critic has learned nothing, so there is no reason to steer by it and guidance
+        stays at 0. From the episode that first update lands in, `n` episodes later is
+        `n / guidance_ramp_episodes` of the target, and the ramp is done exactly
+        `guidance_ramp_episodes` episodes after it started.
 
-        A frozen critic (`train_critic_online: false`) has no TD updates to count -- the ramp
-        would pin guidance at 0 for the entire run -- so it guides at the target from the first
-        chunk. Its values never move either, so there is nothing to ease into.
+        The unit is episodes rather than TD updates so that the schedule is in the unit a run
+        is actually measured in: how far the ramp has come is legible from the episode number
+        in the log, it does not depend on `train_freq` or on how many control steps an episode
+        happened to take, and every episode is steered by one constant scale rather than by a
+        value that drifts within it. `guidance_ramp_episodes: 0` is no ramp at all -- the
+        target from the first chunk.
 
-        "This run" spans an interruption: a resumed run is the same run, and is handed the
-        original's baseline (`critic_ramp_baseline`), so the ramp continues from where it
-        stopped instead of dropping back to 0 for another `guidance_ramp_updates`.
+        A critic warm-started from `critic_ckpt` ramps in exactly like one trained from
+        scratch: its values are trained on a different (offline) state distribution, so easing
+        the sampler into them is worth doing even though the network is not random. Its
+        restored lifetime `num_updates` does not count as this run's first update
+        (`_critic_updates_at_start`).
+
+        The ramp exists to ease the sampler into a critic whose values are still moving, so it
+        applies to exactly that case. Everything else reports the configured `guidance_scale`
+        as it stands, from the first chunk:
+
+        * **no critic** -- there is nothing to ramp in. Note this is not a way to get guidance
+          without one: with no critic the sampler is the plain pi0.5 one and nothing consumes
+          the number. It is what the run is configured to steer at, which is what the printouts
+          and the W&B curve should say. (In practice the two agree anyway: a nonzero
+          `guidance_scale` builds a critic, so the target here is 0.0 unless the critic simply
+          has not been built yet -- it is constructed lazily on the first observation.)
+        * **a frozen critic** (`train_online: false`) -- its values never move, so there is
+          nothing to ease into.
+        * **`guidance_ramp_episodes: 0`** -- the ramp switched off explicitly.
+
+        "This run" spans an interruption: the driver restores its episode counter from
+        `resume_state.json` and hands both it (`set_episodes_done`) and the episode the ramp
+        started at (`guidance_ramp_start_episode`) back, so a resumed run continues the ramp
+        instead of climbing it a second time.
         """
-        if self.online_critic is None:
-            return 0.0
-        if not self.train_critic_online:
+        if (self.online_critic is None
+                or not self.train_critic_online
+                or self.guidance_ramp_episodes <= 0):
             return self.guidance_scale_target
-        updates = self.online_critic.num_updates - self._critic_updates_at_start
-        if updates <= 0:
-            return 0.0
-        if self.guidance_ramp_updates <= 0:
-            return self.guidance_scale_target
-        progress = min(1.0, updates / float(self.guidance_ramp_updates))
+        if self._ramp_start_episode is None:
+            if self.online_critic.num_updates <= self._critic_updates_at_start:
+                return 0.0
+            # First TD update of this run: the ramp starts here. Latched on read because the
+            # updates are run by the driver, not by the policy -- this is called once per
+            # control step, so it is seen within one step of happening. A held-out evaluation
+            # cannot latch it wrongly: no update runs during one, and `_episodes_done` does not
+            # move, so the value it would latch is the one the training loop latches anyway.
+            self._ramp_start_episode = self._episodes_done
+        elapsed = max(0, self._episodes_done - self._ramp_start_episode)
+        progress = min(1.0, elapsed / float(self.guidance_ramp_episodes))
         return self.guidance_scale_target * progress
 
     @contextlib.contextmanager
@@ -725,6 +792,10 @@ class PI0:
         * **the guidance scale is left exactly where the ramp has it.** Deliberately not the
           `train_critic_online: false` path, which jumps guidance straight to the target: what is
           being scored is the policy as it behaves *right now*, not as a later frozen run would.
+        * **the guidance ramp's clock does not advance.** An evaluation episode is a
+          measurement of the run rather than an episode of it, so the ramp is put back where it
+          was on the way out -- which also covers the reset-counting fallback in
+          `reset_obsrvationwindows`, since a held-out rollout resets the policy like any other.
         * **the DSRL warmup budget and its RNG do not advance.** `_warmup_noise` draws (and
           counts down) once per control step, so without this a run with `noise_warmup_chunks`
           set would spend its warmup on evaluation episodes, and every run's latent sequence
@@ -740,7 +811,8 @@ class PI0:
         """
         state = (self._collect_transitions, self._noise_warmup_left,
                  self._noise_rng.bit_generator.state,
-                 self.record_q_values, self.record_demo_retrieval)
+                 self.record_q_values, self.record_demo_retrieval,
+                 self._episodes_done, self._episode_resets)
         self._collect_transitions = False
         self.record_q_values = False
         self.record_demo_retrieval = False
@@ -751,7 +823,8 @@ class PI0:
         finally:
             (self._collect_transitions, self._noise_warmup_left,
              self._noise_rng.bit_generator.state,
-             self.record_q_values, self.record_demo_retrieval) = state
+             self.record_q_values, self.record_demo_retrieval,
+             self._episodes_done, self._episode_resets) = state
             if self.demo_retriever is not None:
                 self.demo_retriever.record_retrieval = self.record_demo_retrieval
             # Anything the evaluation's last control step left behind. These are read-and-clear
@@ -941,7 +1014,16 @@ class PI0:
             noise=(None if warmup_noise is None
                    else self.online_critic.expand_noise(warmup_noise)[None]),
         )
-        critic_obs = {**out["critic_obs_siglip"], "state": out["critic_obs_state"], **extra}
+        # Everything the critic may read, under its modality name: the per-view patch maps, the
+        # pooled VLM prefix (`siglip_tokens`, reported separately because it is one vector for
+        # the whole observation rather than one map per view), the model-space state, and the
+        # sim's own sensors. `stash` keeps only the subset this critic was configured for.
+        critic_obs = {
+            **out["critic_obs_siglip"],
+            VLM_PREFIX_MODALITY: out["critic_obs_siglip_tokens"],
+            "state": out["critic_obs_state"],
+            **extra,
+        }
         if self.best_of_n > 1:
             # Which of the N candidates was executed, and what the critic scored all of them
             # at. `critic_action` below is already the winner, so everything downstream --
@@ -995,6 +1077,9 @@ class PI0:
         embodiment dims -- the tensors the critic is scored on. ``out["actions"]`` is the same
         chunk after the output transform has unnormalized it.
 
+        ``critic_obs_siglip_tokens`` is the pooled 2048-d VLM prefix (`siglip_tokens`), stored
+        as its own column under that name.
+
         ``critic_obs_siglip`` holds the SigLIP patch maps the critic's CNN encoders read, one
         per camera view, as produced by ``Pi0.sample_actions``' own image tower -- so recording
         them here makes the separate ``multisensory_steering.create_dataset siglip`` pass
@@ -1023,8 +1108,24 @@ class PI0:
             for view in self.collect_siglip
             if view in maps
         }
+        # The pooled VLM prefix, one (vlm_prefix_dim,) fp16 vector for the whole observation.
+        # Unconditional like `noise` rather than gated on `collect_siglip`: it is not one of the
+        # per-view maps and, at 4 KB/row against a map's 576 KB, cheap enough that a dataset
+        # should always be able to train a `siglip_tokens` critic offline.
+        if "critic_obs_siglip_tokens" in out:
+            self.last_critic_obs["siglip"][VLM_PREFIX_MODALITY] = np.asarray(
+                out["critic_obs_siglip_tokens"], dtype=np.float16
+            )
 
     def reset_obsrvationwindows(self):
         self.instruction = None
         self.observation_window = None
+        # One reset per rollout, at its start, so `resets - 1` is the number of episodes behind
+        # this one. Only the fallback for a driver that does not push the count itself; the eval
+        # driver does (`set_episodes_done`), and its count is the authoritative one -- it knows
+        # about resumes, and about held-out episodes, which this cannot distinguish (they are
+        # undone by `frozen_for_eval` instead).
+        self._episode_resets += 1
+        if not self._episodes_pushed:
+            self._episodes_done = self._episode_resets - 1
         print("successfully unset obs and language intruction")

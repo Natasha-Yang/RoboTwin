@@ -113,13 +113,16 @@ def get_model(usr_args):
     # Robust parse: `--overrides guidance_scale 0.3` eval()s to a float, but a malformed
     # value stays a string, which must not silently read as "guidance on".
     guidance_scale = float(usr_args.get("guidance_scale", 0.0) or 0.0)
-    guidance_ramp_updates = usr_args.get("guidance_ramp_updates", 0)
+    # Episodes over which guidance ramps 0 -> guidance_scale, counted from the critic's first
+    # TD update of this run. The clock is the driver's own completed-episode count, pushed in
+    # per episode (PI0.set_episodes_done).
+    guidance_ramp_episodes = usr_args.get("guidance_ramp_episodes", 10)
+    # Set only by eval_policy when it resumes an interrupted run: the episode that run's ramp
+    # started at, so the resumed critic comes back at the guidance it had reached instead of
+    # waiting for a "first" update it already did. Not a user-facing config key.
+    guidance_ramp_start_episode = usr_args.get("guidance_ramp_start_episode")
     # Candidate chunks sampled per control step; the highest-Q one is executed. 1 = off.
     best_of_n = int(usr_args.get("best_of_n", 1) or 1)
-    # Set only by eval_policy when it resumes an interrupted run: the update count that run's
-    # ramp was measured from, so the resumed critic comes back at the guidance it had reached
-    # instead of re-ramping from 0 against its own checkpoint. Not a user-facing config key.
-    critic_ramp_baseline = usr_args.get("critic_ramp_baseline")
     # The third way, and the only one that is not a knob: `critic_type: dsrl` steers by picking
     # the sampler's noise, so it needs no guidance scale and no candidate count -- naming the
     # family is what turns it on (pi_model.CRITIC_TYPES).
@@ -151,8 +154,8 @@ def get_model(usr_args):
     return PI0(train_config_name, model_name, checkpoint_id, pi0_step,
                critic_ckpt=critic_ckpt, guidance_scale=guidance_scale,
                best_of_n=best_of_n,
-               guidance_ramp_updates=guidance_ramp_updates,
-               critic_ramp_baseline=critic_ramp_baseline,
+               guidance_ramp_episodes=guidance_ramp_episodes,
+               guidance_ramp_start_episode=guidance_ramp_start_episode,
                online_critic=online_critic, train_critic_online=train_critic_online,
                critic_config=critic_config, critic_seed=critic_seed,
                noise_warmup_chunks=noise_warmup_chunks,
