@@ -194,7 +194,22 @@ NATIVE_DELTA_MASK = _transforms.make_bool_mask(6, -1, 6, -1)
 
 # The static jit arguments of `Pi0.propose_from_demos`. Changing any of them recompiles, which
 # is why they are configuration rather than per-step state.
-_PROPOSE_STATIC = ("top_k", "views", "invert", "num_steps", "num_inner_steps", "num_substeps", "return_info")
+_PROPOSE_STATIC = (
+    "top_k",
+    "views",
+    "invert",
+    "num_steps",
+    "fp_per_step",
+    "num_inner_steps",
+    "num_substeps",
+    "return_info",
+)
+
+
+def action_horizon_window(actions: np.ndarray, frame_index: int, action_horizon: int) -> np.ndarray:
+    """The pi0.5 training target at a frame, holding the final action at episode end."""
+    indices = np.arange(frame_index, frame_index + action_horizon).clip(max=len(actions) - 1)
+    return actions[indices]
 
 
 def resolve_views(views) -> tuple[str, ...]:
@@ -673,7 +688,8 @@ class DemoRetriever:
         bank_size: int = 512,
         frame_stride: int = 1,
         num_steps: int = 10,
-        num_inner_steps: int = 10,
+        fp_per_step: int = 5,
+        num_inner_steps: int | None = None,
         num_substeps: int = 1,
         invert: bool = True,
         wrench_trace_len: int | None = None,
@@ -699,7 +715,7 @@ class DemoRetriever:
         self.bank_size = int(bank_size)
         self.frame_stride = max(1, int(frame_stride))
         self.num_steps = int(num_steps)
-        self.num_inner_steps = int(num_inner_steps)
+        self.fp_per_step = int(num_inner_steps if num_inner_steps is not None else fp_per_step)
         self.num_substeps = int(num_substeps)
         self.invert = bool(invert)
         # Rows of a `wrench.*` modality, i.e. how many primitive steps of contact history a
@@ -1110,20 +1126,19 @@ class DemoRetriever:
         frames = np.asarray(frames, dtype=np.int64).reshape(-1)
         raw = self.reader.read_episode(episode, frames=frames, sensors=self.sensor_modalities)
         instruction = self.reader.instructions()[episode] or ""
-        length = len(raw["state"])
-
         batch, chunks, thumbs, states = [], [], [], []
         for i, t in enumerate(frames.tolist()):
             # The chunk that was the training target at frame t. LeRobot pads a chunk that runs
             # past the end of the episode by holding the last action, and so does this.
-            window = np.arange(t, t + self.action_horizon).clip(max=length - 1)
             inputs = self.input_transform(
                 {
                     # The image arrays hold only the frames that were decoded, so they are
                     # indexed by position in `frames` rather than by frame index.
                     "images": {camera: raw["images"][camera][i] for camera in DEMO_CAMERAS},
                     "state": raw["state"][t],
-                    "actions": self._relative_actions(raw["action"][window], raw["state"][t]),
+                    "actions": self._relative_actions(
+                        action_horizon_window(raw["action"], t, self.action_horizon), raw["state"][t]
+                    ),
                     "prompt": instruction,
                 }
             )
@@ -1249,7 +1264,7 @@ class DemoRetriever:
             views=self.views,
             invert=self.invert,
             num_steps=self.num_steps,
-            num_inner_steps=self.num_inner_steps,
+            fp_per_step=self.fp_per_step,
             num_substeps=self.num_substeps,
             return_info=True,
         )

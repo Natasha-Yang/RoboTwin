@@ -280,6 +280,20 @@ class Pi0(_model.BaseModel):
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         return kv_cache, prefix_mask, prefix_tokens.shape[1], image_encoded
 
+    def get_prefix_rep(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b p emb"], at.Bool[at.Array, "b p"]]:
+        """Return the pi0.5 VLM prefix hidden state used by FlowDAgger's encoder."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        image_tokens, _ = self.embed_images(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, image_tokens=image_tokens)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_hidden, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return prefix_hidden, prefix_mask
+
     def _action_expert_features(
         self, obs: _model.Observation, kv_cache, prefix_mask, prefix_len: int, x_t, time
     ) -> at.Float[at.Array, "b ah emb"]:
@@ -328,58 +342,39 @@ class Pi0(_model.BaseModel):
         actions: _model.Actions,
         *,
         num_steps: int,
-        num_inner_steps: int,
-        num_substeps: int,
-    ) -> tuple[_model.Actions, at.Float[at.Array, " s"]]:
-        """The inversion itself, against a prefix that has already been run.
+        fp_per_step: int,
+    ) -> _model.Actions:
+        """FlowDAgger's per-step fixed-point reverse process using an existing prefix cache."""
+        dt_reverse = 1.0 / num_steps
 
-        Split out of ``invert_actions`` so a caller that has already paid for the image tower and
-        the prefix pass under this observation can invert against that cache instead of a second
-        one -- ``propose_from_demos`` inverts several retrieved chunks that way. ``obs``,
-        ``prefix_mask`` and ``kv_cache`` must be at ``actions``' batch, as for
-        ``_action_expert_features``.
-
-        Returns the recovered noise and the per-(sub)step fixed-point residual, in the order the
-        steps were undone. See ``invert_actions`` for what the iteration is and why.
-        """
-        dt = -1.0 / num_steps
-        dt_sub = dt / num_substeps
-
-        # Every timestep to be undone, in the order the forward pass would visit them. The
-        # denoising step's own `t_k` is accumulated the way the forward loop accumulates it -- it
-        # carries `time` as a float32 scalar starting at 1.0 and adds the Python float `dt`, so
-        # rebuilding the schedule in float64 would put each inverse step at a slightly different
-        # t than its forward step used. With `num_substeps > 1` each step contributes its own
-        # sub-grid on top of that, offset from the same `t_k`.
-        times = []
-        time = jnp.asarray(1.0, dtype=jnp.float32)
-        for _ in range(num_steps):
-            times.extend((time + m * dt_sub).astype(jnp.float32) for m in range(num_substeps))
-            time = (time + dt).astype(jnp.float32)
-        times = jnp.stack(times)
-
-        def invert_step(x_next, time):
-            """Undo the single forward (sub)step taken at `time`, by fixed-point iteration.
-
-            The iterate is seeded with `x_next` itself, so the first pass is the DDIM-style
-            explicit guess and each further one refines it.
-            """
-
-            def fixed_point(_, carry):
-                x_t, _ = carry
-                v_t = self.action_out_proj(
-                    self._action_expert_features(obs, kv_cache, prefix_mask, prefix_len, x_t, time)
-                )
-                x_new = x_next - dt_sub * v_t
-                return x_new, jnp.max(jnp.abs(x_new - x_t))
-
-            x_t, residual = jax.lax.fori_loop(
-                0, num_inner_steps, fixed_point, (x_next, jnp.asarray(jnp.inf, dtype=jnp.float32))
+        def velocity(x_t, time):
+            return self.action_out_proj(
+                self._action_expert_features(obs, kv_cache, prefix_mask, prefix_len, x_t, time)
             )
-            return x_t, residual
 
-        # Reverse order: the last forward step is the first one undone.
-        return jax.lax.scan(invert_step, actions, times[::-1])
+        def reverse_step(carry):
+            x_previous, time_previous = carry
+            time_next = time_previous + dt_reverse
+
+            # Initial reverse-Euler estimate, followed by FlowDAgger's fixed-point refinement.
+            x_next = x_previous + dt_reverse * velocity(x_previous, time_previous)
+
+            def fixed_point_body(_, x_estimate):
+                return x_previous + dt_reverse * velocity(x_estimate, time_next)
+
+            x_next = jax.lax.fori_loop(0, fp_per_step, fixed_point_body, x_next)
+            return x_next, time_next
+
+        def continue_reverse(carry):
+            _, time = carry
+            return time <= 1.0 - dt_reverse / 2
+
+        noise, _ = jax.lax.while_loop(
+            continue_reverse,
+            reverse_step,
+            (actions, jnp.array(0.0, dtype=actions.dtype)),
+        )
+        return noise
 
     @override
     def compute_loss(
@@ -630,7 +625,7 @@ class Pi0(_model.BaseModel):
                 # actor chose it. Everything else here is a function of the observation and
                 # could be recomputed from a stored frame; this is the draw that made the chunk
                 # *this* sample rather than another, and once the sampler has returned only
-                # `invert_actions` recovers it -- `num_steps * num_inner_steps` action-expert
+                # `invert_actions` recovers it -- `num_steps * (1 + fp_per_step)` action-expert
                 # passes, and only for the unguided sampler. Rollout collection records it as the
                 # dataset's `action.noise`, which is the action of a noise-space agent's MDP
                 # (DSRL, sec 5c). Kept at the model's padded `action_dim` rather than narrowed to
@@ -805,82 +800,32 @@ class Pi0(_model.BaseModel):
         actions: _model.Actions,
         *,
         num_steps: int = 10,
-        num_inner_steps: int = 10,
+        fp_per_step: int = 5,
+        num_inner_steps: int | None = None,
         num_substeps: int = 1,
         return_info: bool = False,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, jax.Array]]:
-        """Reverse the flow: recover the noise that ``sample_actions`` would denoise into ``actions``.
+        """Recover FlowDAgger noise for a normalized action chunk.
 
-        The exact inverse of the sampler, not an approximation of it: run this on a clean chunk
-        and hand the result back as ``sample_actions(..., noise=<this>)`` and the same chunk comes
-        out, to the arithmetic precision of the forward pass (see the precision note). ``num_steps``
-        must be the number of denoising steps the forward pass uses, and ``observation`` the same
-        conditioning; the map being inverted is the one *those* pin down.
+        This follows FlowDAgger's per-step reverse process exactly: an initial reverse-Euler
+        estimate and ``fp_per_step`` fixed-point refinements at the next time. The image/language
+        prefix is computed once and reused by every reverse step. ``num_inner_steps`` remains a
+        compatibility alias for old callers. FlowDAgger has no substep variant, so any
+        ``num_substeps`` value other than one is rejected.
 
-        ``actions`` is in the sampler's own space -- the **normalized**, ``action_dim``-padded
-        chunk ``sample_actions`` returns, i.e. before ``Policy.infer``'s output transform. To
-        invert an action recorded in robot units, push it back through that transform first.
-
-        How it works. The sampler integrates t=1 (noise) -> t=0 with explicit Euler at a fixed
-        step ``dt = -1/num_steps``::
-
-            x_{k+1} = x_k + dt * v(x_k, t_k),    t_k = 1 + k*dt
-
-        so undoing one step means solving ``x_k + dt*v(x_k, t_k) = x_{k+1}`` for ``x_k`` -- an
-        *implicit* equation, since v is evaluated at the unknown. It has no closed form, so it is
-        solved by fixed-point iteration, run ``num_inner_steps`` times per step::
-
-            x <- x_{k+1} - dt * v(x, t_k),   starting from x = x_{k+1}
-
-        whose fixed point is by construction exactly the ``x_k`` the forward step started from.
-        The iteration contracts at rate ``|dt| * Lip(v)``, comfortably < 1 at the sampler's step
-        sizes, so ~4 iterations already reach 1e-4 and 8-10 hit the float32 floor. Stopping at one
-        iteration is the usual DDIM-style *approximate* inversion, whose O(dt^2)-per-step error
-        is exactly what the remaining iterations remove.
-
-        The steps are undone in the reverse of the order the sampler took them, at the timesteps
-        it actually visited -- ``t_k`` is accumulated in float32 from 1.0 exactly as the forward
-        while_loop accumulates it, so each inverse step is taken at the same value its forward
-        step used.
-
-        ``num_substeps`` splits each denoising step into that many sub-intervals of ``dt/num_substeps``
-        and inverts each one (still by the fixed-point iteration above, at the sub-interval's own
-        time and step size). This is a **different trade**, not more accuracy: the fine grid
-        inverts the underlying ODE rather than the coarse Euler map ``sample_actions`` actually
-        applies, and the two differ by the integrator's own O(dt^2) truncation error -- so
-        ``num_substeps > 1`` makes the round trip through the *coarse* sampler worse, not better.
-        Reach for it only when the fixed point at the full ``dt`` will not contract (a very small
-        ``num_steps`` against a stiff velocity field): each sub-interval's contraction rate is
-        ``num_substeps`` times smaller, which is what buys convergence back. The default ``1``
-        is the exact inverse of the sampler and is what the round-trip guarantee above refers to.
-
-        Cost is ``num_steps * num_substeps * num_inner_steps`` action-expert passes against one
-        prefix pass (the prefix depends on neither x_t nor t, so the image tower still runs once).
-
-        Only the plain sampler is inverted -- not the critic-guided path, whose steps depend on
-        the critic's parameters at the time, and not best-of-N, which is not injective (the
-        losing candidates' noise is unrecoverable from the winning chunk).
-
-        A precision note: the round trip is only as exact as the forward pass is deterministic
-        and reproducible, and on this model that floor is set by matmul precision rather than by
-        the fixed point. Measured on a dummy-width pi0.5 at ``num_steps=10``, ``num_inner_steps=8``:
-        ~4e-7 in float32 under ``jax_default_matmul_precision="highest"``, ~4e-4 in float32 with
-        the GPU default (tf32 matmuls), ~2e-3 at the config default ``dtype="bfloat16"``. The
-        fixed point converges below all three; raising ``num_inner_steps`` past the point where
-        the residual stops falling buys nothing.
-
-        With ``return_info``, also returns ``{"residual": (num_steps * num_substeps,)}`` -- the max
-        absolute size of the last fixed-point update at each inverted (sub)step, in the order they
-        were undone (the step at t closest to 0 first). It bounds the remaining error up to the
-        contraction factor, so a residual that has not fallen to the precision floor means
-        ``num_inner_steps`` was too small.
+        When ``return_info`` is true, the returned ``error`` is FlowDAgger's reconstruction MSE:
+        the inverted noise is denoised again with the same observation and number of steps and
+        compared with the supplied normalized action chunk.
         """
-        if not isinstance(num_steps, int):
-            raise TypeError(f"num_steps must be a static Python int for inversion, got {type(num_steps).__name__}.")
-        if num_steps < 1 or num_inner_steps < 1 or num_substeps < 1:
+        if num_inner_steps is not None:
+            fp_per_step = num_inner_steps
+        if not isinstance(num_steps, int) or not isinstance(fp_per_step, int):
+            raise TypeError("num_steps and fp_per_step must be static Python ints for inversion.")
+        if num_steps < 1 or fp_per_step < 1:
+            raise ValueError(f"num_steps and fp_per_step must be >= 1, got {num_steps} and {fp_per_step}.")
+        if num_substeps != 1:
             raise ValueError(
-                f"num_steps, num_inner_steps and num_substeps must be >= 1, got "
-                f"{num_steps}, {num_inner_steps} and {num_substeps}."
+                f"FlowDAgger's inversion does not implement substeps; num_substeps must be 1, got {num_substeps}."
             )
 
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -892,20 +837,23 @@ class Pi0(_model.BaseModel):
                 f"sampler's own normalized, action_dim-padded chunk."
             )
         kv_cache, prefix_mask, prefix_len, _ = self._prefix_pass(observation)
-        noise, residual = self._invert_from_prefix(
+        noise = self._invert_from_prefix(
             observation,
             kv_cache,
             prefix_mask,
             prefix_len,
             actions,
             num_steps=num_steps,
-            num_inner_steps=num_inner_steps,
-            num_substeps=num_substeps,
+            fp_per_step=fp_per_step,
         )
 
         if not return_info:
             return noise
-        return noise, {"residual": residual}
+        reconstructed = self.sample_actions(
+            jax.random.key(0), observation, num_steps=num_steps, noise=noise
+        )
+        error = jnp.mean(jnp.square(reconstructed - actions), axis=(-2, -1))
+        return noise, {"error": error}
 
     def embed_observation(self, observation: _model.Observation) -> dict[str, at.Float[at.Array, "b emb"]]:
         """One pooled SigLIP vector per camera view -- the retrieval key for an observation.
@@ -954,7 +902,8 @@ class Pi0(_model.BaseModel):
         views: tuple[str, ...] = SIGLIP_VIEWS,
         invert: bool = True,
         num_steps: int = 10,
-        num_inner_steps: int = 10,
+        fp_per_step: int = 5,
+        num_inner_steps: int | None = None,
         num_substeps: int = 1,
         return_info: bool = False,
     ) -> dict[str, jax.Array]:
@@ -993,7 +942,7 @@ class Pi0(_model.BaseModel):
         3. ``invert_actions`` each retrieved chunk **under the live observation** -- the noise
            that would make *this* observation's sampler produce a demo-like action here. The
            inversion reuses the prefix from step 1, so ``top_k`` proposals cost
-           ``num_steps * num_inner_steps`` action-expert passes at batch ``top_k``, and one
+           ``num_steps * (1 + fp_per_step)`` action-expert passes at batch ``top_k``, and one
            tower + prefix pass in total.
 
         Returns ``{"action_proposals": (b, k, ah, ad)}``, plus ``"noise_proposals"`` of the same
@@ -1002,18 +951,28 @@ class Pi0(_model.BaseModel):
         to condition a critic on, which is why ``invert`` is separate: skipping it drops by far
         the larger half of the cost.
 
-        With ``return_info``, also returns ``"distance"`` ``(b, m)`` over the whole bank,
+        With ``return_info``, also returns ``"distance"`` ``(b, m)`` over the whole bank and
         ``"indices"`` and ``"scores"`` ``(b, k)`` for what was chosen (``scores`` being those
-        rows' distances, smallest first), and the inversion's ``"residual"`` when it ran.
+        rows' distances, smallest first).
 
         Note the asymmetry between the two outputs: the action proposals are exactly the demo
         chunks, unchanged by anything here, while the noise proposals are only as exact as the
         inversion (``invert_actions``' precision note applies, and its fixed point is being run
-        at whatever ``num_inner_steps`` the caller pays for). ``num_steps`` must match the
+        at whatever ``fp_per_step`` the caller pays for). ``num_steps`` must match the
         sampler's, or the noise inverts a different map than the one it will be fed to.
         """
         if not isinstance(top_k, int) or top_k < 1:
             raise ValueError(f"top_k must be a static Python int >= 1, got {top_k!r}.")
+        if num_inner_steps is not None:
+            fp_per_step = num_inner_steps
+        if not isinstance(num_steps, int) or not isinstance(fp_per_step, int):
+            raise TypeError("num_steps and fp_per_step must be static Python ints for inversion.")
+        if num_steps < 1 or fp_per_step < 1:
+            raise ValueError(f"num_steps and fp_per_step must be >= 1, got {num_steps} and {fp_per_step}.")
+        if num_substeps != 1:
+            raise ValueError(
+                f"FlowDAgger's inversion does not implement substeps; num_substeps must be 1, got {num_substeps}."
+            )
         if demo_embeddings.shape[0] != demo_actions.shape[0]:
             raise ValueError(
                 f"demo bank is inconsistent: {demo_embeddings.shape[0]} embeddings but "
@@ -1087,7 +1046,6 @@ class Pi0(_model.BaseModel):
         actions = jnp.take(demo_actions, indices, axis=0)
 
         out: dict[str, jax.Array] = {"action_proposals": actions}
-        residual = None
         if invert:
             # The k candidates are extra batch elements against the prefix that is already
             # cached, exactly as best-of-N widens the sampler: `_prefix_pass` ran once at
@@ -1097,20 +1055,17 @@ class Pi0(_model.BaseModel):
                 return tree if top_k == 1 else jax.tree.map(lambda x: jnp.repeat(x, top_k, axis=0), tree)
 
             wide_kv = kv_cache if top_k == 1 else jax.tree.map(lambda x: jnp.repeat(x, top_k, axis=1), kv_cache)
-            noise, residual = self._invert_from_prefix(
+            noise = self._invert_from_prefix(
                 tile(observation),
                 wide_kv,
                 tile(prefix_mask),
                 prefix_len,
                 actions.reshape(batch * top_k, *expected),
                 num_steps=num_steps,
-                num_inner_steps=num_inner_steps,
-                num_substeps=num_substeps,
+                fp_per_step=fp_per_step,
             )
             out["noise_proposals"] = noise.reshape(batch, top_k, *expected)
 
         if return_info:
             out |= {"distance": distance, "indices": indices, "scores": scores}
-            if residual is not None:
-                out["residual"] = residual
         return out

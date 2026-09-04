@@ -154,6 +154,9 @@ guidance_ramp_updates: 500
 # Unlike the keys above this also applies to the unguided baseline. eval.sh's 10th positional
 # arg overrides it.
 use_step_reward: false
+# Optional package-owned online adaptation runner. The referenced YAML must define
+# `runner: python.module:function`; null keeps the normal evaluation loop.
+adaptation_config_path: null
 # ===== Demo retrieval (action_proposals / noise_proposals) =====
 # Which demonstrations the two proposal modalities are retrieved from, and how. Whether they are
 # produced at all is the *task config's* `data_type.action_proposals` / `data_type.noise_proposals`
@@ -170,7 +173,7 @@ use_step_reward: false
 # when that flag is on -- the noise that would make *this* observation's sampler produce that
 # chunk as `noise_proposals` (Pi0.invert_actions).
 #
-# Cost: `noise_proposals` runs the flow inversion, num_steps x num_inner_steps action-expert
+# Cost: `noise_proposals` runs FlowDAgger inversion, num_steps x (1 + fp_per_step) action-expert
 # passes at batch top_k per control step, which is the most expensive thing in the step.
 # `action_proposals` alone costs only the retrieval (one extra image tower + prefix pass).
 demo_retrieval:
@@ -232,7 +235,7 @@ demo_retrieval:
   # Inversion settings for `noise_proposals`. `num_steps` MUST match the sampler's denoising
   # step count, or the noise inverts a different map than the one it will be fed to.
   num_steps: 10
-  num_inner_steps: 1
+  fp_per_step: 5
   # Demo frames encoded per image-tower call while building a bank.
   encode_batch_size: 16
   # How many matches the debug visualization draws per control step, independent of `top_k`

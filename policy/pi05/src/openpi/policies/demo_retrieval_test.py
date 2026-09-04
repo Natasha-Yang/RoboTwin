@@ -22,7 +22,16 @@ from openpi.policies import demo_retrieval
 from openpi.shared import nnx_utils
 import openpi.transforms as _transforms
 
-_PROPOSE_STATIC = ("top_k", "views", "invert", "num_steps", "num_inner_steps", "num_substeps", "return_info")
+_PROPOSE_STATIC = (
+    "top_k",
+    "views",
+    "invert",
+    "num_steps",
+    "fp_per_step",
+    "num_inner_steps",
+    "num_substeps",
+    "return_info",
+)
 
 # A v2.1 (one parquet per episode) and a v3.0 (episodes share parquet files) dataset. Both
 # layouts are read by `LeRobotEpisodeReader`, and the version is the whole reason it exists:
@@ -369,6 +378,16 @@ def test_resolve_signals_validates():
         demo_retrieval.resolve_signals(["siglip", "wrench"])
     with pytest.raises(ValueError, match="`siglip` is required"):
         demo_retrieval.resolve_signals(["state"])
+
+
+def test_action_horizon_window_matches_converter_alignment_and_terminal_hold():
+    # The converter has already aligned these rows as qpos[i] -> qpos[i + 1]. Retrieval and
+    # live FlowDAgger capture both window that aligned action column from the current frame.
+    aligned_actions = np.arange(3, dtype=np.float32)[:, None]
+    np.testing.assert_array_equal(
+        demo_retrieval.action_horizon_window(aligned_actions, 1, 4)[:, 0],
+        [1, 2, 2, 2],
+    )
 
 
 def test_zero_query_does_not_divide_by_zero():

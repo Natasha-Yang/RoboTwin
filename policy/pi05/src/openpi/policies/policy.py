@@ -75,13 +75,26 @@ class Policy(BasePolicy):
                 static_argnames=("return_features", "critic_apply", "noise_apply",
                                  "return_critic_obs", "critic_action_dim", "best_of_n"),
             )
+            if hasattr(model, "get_prefix_rep"):
+                self._get_prefix_rep = nnx_utils.module_jit(model.get_prefix_rep)
             self._rng = rng or jax.random.key(0)
+
+    def transform_input(self, obs: dict) -> dict:
+        """Apply the loaded checkpoint's complete input transform to a copied sample."""
+        inputs = jax.tree.map(lambda x: x, obs)
+        return self._input_transform(inputs)
+
+    def get_prefix_rep(self, obs: dict) -> tuple[jax.Array, jax.Array]:
+        """Return batched pi0.5 prefix hidden states for a raw policy observation."""
+        if self._is_pytorch_model or not hasattr(self, "_get_prefix_rep"):
+            raise NotImplementedError("Prefix representations are only available for compatible JAX policies.")
+        inputs = self.transform_input(obs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        return self._get_prefix_rep(_model.Observation.from_dict(inputs))
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        inputs = self.transform_input(obs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -138,6 +151,19 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    @property
+    def model(self) -> _model.BaseModel:
+        """The loaded model, exposed for external adaptation algorithms."""
+        return self._model
+
+    @property
+    def action_horizon(self) -> int:
+        return self._model.action_horizon
+
+    @property
+    def action_dim(self) -> int:
+        return self._model.action_dim
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

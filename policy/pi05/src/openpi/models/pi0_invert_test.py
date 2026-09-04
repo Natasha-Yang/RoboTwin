@@ -1,11 +1,4 @@
-"""Round-trip tests for `Pi0.invert_actions`: noise -> chunk -> noise -> chunk.
-
-The inversion is exact up to the arithmetic precision of the forward pass, and on GPU that
-floor is set by matmul precision, not by the fixed point: float32 with tf32 matmuls (the JAX
-default) bottoms out around 1e-4, while `highest` reaches ~1e-7. The tight assertions below run
-under `highest` so they are testing the algorithm rather than cuBLAS; `test_invert_actions_at_default_precision`
-pins down what the default buys.
-"""
+"""FlowDAgger parity and round-trip tests for `Pi0.invert_actions`."""
 
 import contextlib
 import itertools
@@ -19,7 +12,7 @@ from openpi.models import pi0_config
 from openpi.shared import nnx_utils
 
 # `invert_actions` builds its (sub)step schedule in Python, so these are compile-time constants.
-_INVERT_STATIC = ("num_steps", "num_inner_steps", "num_substeps", "return_info")
+_INVERT_STATIC = ("num_steps", "fp_per_step", "num_inner_steps", "num_substeps", "return_info")
 
 
 @contextlib.contextmanager
@@ -77,10 +70,9 @@ def test_invert_actions_round_trip():
     assert float(jnp.max(jnp.abs(actions - noise))) > 1e-2
 
     np.testing.assert_allclose(replayed, actions, atol=1e-5, rtol=0)
-    np.testing.assert_allclose(recovered, noise, atol=1e-5, rtol=0)
-    # Every step's fixed point converged to the float32 floor.
-    assert info["residual"].shape == (10,)
-    assert float(jnp.max(info["residual"])) < 1e-5
+    np.testing.assert_allclose(recovered, noise, atol=2e-5, rtol=0)
+    assert info["error"].shape == (2,)
+    assert float(jnp.max(info["error"])) < 1e-10
 
 
 def test_invert_actions_at_default_precision():
@@ -111,9 +103,11 @@ def test_invert_actions_holds_across_step_counts():
     config, model = _tiny_model()
     for num_steps in (4, 20):
         with exact_matmuls():
-            _, actions, _, replayed, info = _round_trip(config, model, num_steps=num_steps)
-        np.testing.assert_allclose(replayed, actions, atol=1e-5, rtol=0)
-        assert info["residual"].shape == (num_steps,)
+            _, actions, _, replayed, info = _round_trip(
+                config, model, num_steps=num_steps, fp_per_step=8
+            )
+        np.testing.assert_allclose(replayed, actions, atol=2e-5, rtol=0)
+        assert info["error"].shape == (2,)
 
 
 def test_invert_actions_is_tied_to_the_forward_step_count():
@@ -129,37 +123,37 @@ def test_invert_actions_is_tied_to_the_forward_step_count():
     assert float(jnp.max(jnp.abs(mismatched - noise))) > 1e-2
 
 
-def test_invert_actions_converges_with_more_inner_steps():
-    """More fixed-point iterations monotonically tighten the round trip -- it is not luck."""
+def test_invert_actions_converges_with_more_fixed_point_refinements():
+    """FlowDAgger's per-step refinements monotonically tighten the recovered latent."""
     config, model = _tiny_model()
     errors = []
     with exact_matmuls():
-        for num_inner_steps in (1, 2, 4, 8):
-            noise, _, recovered, _, _ = _round_trip(config, model, num_inner_steps=num_inner_steps)
+        for fp_per_step in (1, 2, 4, 8):
+            noise, _, recovered, _, _ = _round_trip(config, model, fp_per_step=fp_per_step)
             errors.append(float(jnp.max(jnp.abs(recovered - noise))))
-    # One iteration is the DDIM-style approximate inverse and should be visibly the worst.
-    assert errors[0] > 1e-2
     assert errors[-1] < 1e-5
     assert all(a > b for a, b in itertools.pairwise(errors)), errors
 
 
-def test_invert_actions_substeps_trade_exactness_for_contraction():
-    """`num_substeps > 1` inverts the ODE, not the coarse Euler map -- so it round-trips worse.
-
-    Its fixed points still converge (the residual falls just as far); what it loses is agreement
-    with the sampler's own truncation error, which is the whole point of the default of 1.
-    """
+def test_num_inner_steps_is_a_compatibility_alias():
     config, model = _tiny_model()
+    obs = config.fake_obs(2)
+    actions = jax.random.normal(jax.random.key(1), (2, config.action_horizon, config.action_dim))
+    _, invert = _fns(model)
     with exact_matmuls():
-        _, _, _, exact_replay, exact_info = _round_trip(config, model, num_substeps=1)
-        _, actions, _, fine_replay, fine_info = _round_trip(config, model, num_substeps=10)
+        current = invert(obs, actions, fp_per_step=3)
+        legacy = invert(obs, actions, num_inner_steps=3)
+    np.testing.assert_array_equal(current, legacy)
 
-    assert fine_info["residual"].shape == (100,)
-    assert float(jnp.max(fine_info["residual"])) < 1e-5  # converged, just to a different answer
-    exact_err = float(jnp.max(jnp.abs(exact_replay - actions)))
-    fine_err = float(jnp.max(jnp.abs(fine_replay - actions)))
-    assert exact_err < 1e-5 < fine_err, (exact_err, fine_err)
-    assert float(jnp.max(exact_info["residual"])) < 1e-5
+
+def test_default_matches_flowdagger_settings():
+    config, model = _tiny_model()
+    obs = config.fake_obs(2)
+    actions = jax.random.normal(jax.random.key(2), (2, config.action_horizon, config.action_dim))
+    _, invert = _fns(model)
+    default = invert(obs, actions)
+    explicit = invert(obs, actions, num_steps=10, fp_per_step=5)
+    np.testing.assert_array_equal(default, explicit)
 
 
 def test_invert_actions_rejects_bad_arguments():
@@ -172,6 +166,6 @@ def test_invert_actions_rejects_bad_arguments():
     with pytest.raises(TypeError, match="static Python int"):
         model.invert_actions(obs, actions, num_steps=jnp.int32(10))
     with pytest.raises(ValueError, match=">= 1"):
-        model.invert_actions(obs, actions, num_inner_steps=0)
-    with pytest.raises(ValueError, match=">= 1"):
-        model.invert_actions(obs, actions, num_substeps=0)
+        model.invert_actions(obs, actions, fp_per_step=0)
+    with pytest.raises(ValueError, match="does not implement substeps"):
+        model.invert_actions(obs, actions, num_substeps=2)

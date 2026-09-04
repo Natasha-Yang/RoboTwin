@@ -18,7 +18,16 @@ from openpi.models.pi0_invert_test import _tiny_model
 from openpi.models.pi0_invert_test import exact_matmuls
 from openpi.shared import nnx_utils
 
-_PROPOSE_STATIC = ("top_k", "views", "invert", "num_steps", "num_inner_steps", "num_substeps", "return_info")
+_PROPOSE_STATIC = (
+    "top_k",
+    "views",
+    "invert",
+    "num_steps",
+    "fp_per_step",
+    "num_inner_steps",
+    "num_substeps",
+    "return_info",
+)
 
 _BANK = 8
 
@@ -95,15 +104,13 @@ def test_noise_proposals_reproduce_the_action_proposals():
     sample, _, propose = _fns(model)
 
     with exact_matmuls():
-        out = propose(obs, emb, actions, top_k=2, num_steps=10, num_inner_steps=10, return_info=True)
+        out = propose(obs, emb, actions, top_k=2, num_steps=10, fp_per_step=8, return_info=True)
         assert out["noise_proposals"].shape == (2, 2, config.action_horizon, config.action_dim)
         for k in range(2):
             replayed = sample(jax.random.key(0), obs, num_steps=10, noise=out["noise_proposals"][:, k])
             np.testing.assert_allclose(replayed, out["action_proposals"][:, k], atol=1e-5, rtol=0)
 
-    # The residual is one entry per inverted step, and the fixed points converged.
-    assert out["residual"].shape == (10,)
-    assert float(jnp.max(out["residual"])) < 1e-5
+    assert "residual" not in out
 
 
 def test_distance_averages_every_signal_equally():

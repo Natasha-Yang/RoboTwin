@@ -282,7 +282,7 @@ class PI0:
               f"{self.demo_retriever.top_k}, views="
               f"{[v.split('.', 1)[1] for v in self.demo_retriever.views]}"
               + (f", inverted at num_steps={self.demo_retriever.num_steps} x "
-                 f"{self.demo_retriever.num_inner_steps} fixed-point iterations"
+                 f"{self.demo_retriever.fp_per_step} fixed-point refinements"
                  if self.demo_retriever.invert else ", no inversion (action_proposals only)"))
         print(f"[pi_model] demo rows can be keys for: "
               f"{list(self.demo_retriever.cotrain_modalities)}")
@@ -854,7 +854,7 @@ class PI0:
         term-for-term with the action the critic is judging.
 
         Costs one image tower + prefix pass on top of the sampler's own, plus -- when
-        `noise_proposals` is on -- `num_steps * num_inner_steps` action-expert passes at batch
+        `noise_proposals` is on -- `num_steps * (1 + fp_per_step)` action-expert passes at batch
         `top_k` for the inversion. That is the dominant cost of the whole control step, which is
         why nothing builds a retriever unless a critic asked for these.
         """

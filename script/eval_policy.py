@@ -771,9 +771,14 @@ def main(usr_args):
     # Snapshot the deploy config (and the critic config it includes) next to the results, with
     # the CLI overrides written in, so a run's settings stay readable -- and accurate -- after
     # the ymls are edited.
-    for config_path in (usr_args.get("_config_path"), usr_args.get("critic_config_path")):
-        if config_path and Path(config_path).is_file():
-            snapshot_config(config_path, usr_args, save_dir)
+    for config_path in (
+        usr_args.get("_config_path"),
+        usr_args.get("critic_config_path"),
+        usr_args.get("adaptation_config_path"),
+    ):
+        expanded_config_path = Path(config_path).expanduser() if config_path else None
+        if expanded_config_path and expanded_config_path.is_file():
+            snapshot_config(expanded_config_path, usr_args, save_dir)
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
@@ -872,6 +877,53 @@ def main(usr_args):
     topk = 1
 
     model = get_model(usr_args)
+    adaptation_config_path = usr_args.get("adaptation_config_path")
+    if adaptation_config_path:
+        with Path(adaptation_config_path).expanduser().open("r", encoding="utf-8") as f:
+            adaptation_config = yaml.safe_load(f) or {}
+        runner_path = adaptation_config.get("runner")
+        if not runner_path or ":" not in runner_path:
+            raise ValueError(
+                f"{adaptation_config_path} must define runner as 'python.module:function', got {runner_path!r}."
+            )
+        module_name, function_name = runner_path.split(":", 1)
+        runner = getattr(importlib.import_module(module_name), function_name)
+
+        def task_env_factory():
+            return class_decorator(args["task_name"])
+
+        # External adaptation loops own their rollout lifecycle and do not enter the evaluator's
+        # ffmpeg setup below. Keep RoboTwin's video callback disabled for those environments so
+        # `take_action` never tries to write through a pipe that was not created.
+        adaptation_task_args = {k: v for k, v in args.items() if k != "eval_video_save_dir"}
+
+        def prepare_episode(task_env, episode_seed, episode_index):
+            episode_info = run_expert_check(
+                task_env, adaptation_task_args, episode_seed, episode_index
+            )
+            if episode_info is None:
+                return False
+            task_env.setup_demo(
+                now_ep_num=episode_index,
+                seed=episode_seed,
+                is_test=True,
+                **adaptation_task_args,
+            )
+            set_episode_instruction(task_env, task_name, episode_info, instruction_type, test_num)
+            return True
+
+        runner(
+            config=adaptation_config,
+            task_env=TASK_ENV,
+            task_env_factory=task_env_factory,
+            task_args=adaptation_task_args,
+            policy=model,
+            prepare_episode=prepare_episode,
+            seed=st_seed,
+            output_dir=save_dir,
+        )
+        return
+
     # The policy decides whether guidance is on (pi05: guidance_scale != 0). The critic object
     # itself may not exist until the first observation (its shape depends on the embodiment),
     # so W&B keys off the policy's declared intent rather than off `model.online_critic`.
@@ -1721,6 +1773,15 @@ def parse_args_and_config():
         with Path(include_path).open("r", encoding="utf-8") as f:
             included = yaml.safe_load(f) or {}
         config = {**included, **config, "critic_config_path": include_path}
+
+    adaptation_path = overrides.get("adaptation_config_path", config.get("adaptation_config_path"))
+    if adaptation_path:
+        with Path(adaptation_path).expanduser().open("r", encoding="utf-8") as f:
+            adaptation = yaml.safe_load(f) or {}
+        deploy_overrides = adaptation.get("deploy_overrides") or {}
+        if not isinstance(deploy_overrides, dict):
+            raise TypeError("external adaptation deploy_overrides must be a mapping")
+        config = {**config, **deploy_overrides, "adaptation_config_path": adaptation_path}
 
     config.update(overrides)
 
