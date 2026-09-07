@@ -1197,11 +1197,44 @@ mutually exclusive with both keys below.)
 
 | Key | Off | On |
 |---|---|---|
-| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step **after the first** by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
 | `best_of_n` (11th arg) | `1` | `n` candidate chunks are drawn per control step and the highest-Q one is executed |
 
 Both off is the plain pi0.5 baseline — no critic is built, no replay collection, no TD updates,
 no W&B.
+
+#### What the gradient guidance actually is
+
+**Universal Guidance** (Bansal et al. 2023) adapted for flow matching, and as of 2026-09-07
+identical to `~/steering-with-failures`' `steered_ode.py::make_universal_guidance_fn` so results
+compare across the two codebases. Per denoising step, in `pi0.py::sample_actions::guided_step`:
+Tweedie-estimate the clean chunk `x̂₀ = clip(x_t − t·v_t, −1, 1)`, take `∇_{x_t} mean_k Q(obs, x̂₀)`
+**through** the velocity field, rescale it to `‖v_t‖` (QMFM's `steer_use_sigma_t=False`, Eq 129),
+and subtract `guidance_scale ×` that from the velocity. Three details are load-bearing:
+
+- **The `t=1` step is unsteered.** There `x_t` is pure noise, so its Tweedie estimate is a
+  denoised estimate of nothing and its gradient is noise the critic would be asked to follow.
+  `denoise(guided_step, first_step_fn=step)` runs that one step with the plain integrator; the
+  total is still `num_steps` steps, one of them just runs ahead of the `while_loop`.
+- **`x̂₀` and the returned chunk are clipped to `[−1, 1]`**, because that *is* pi0.5's action
+  range: `create_base_config` sets `use_quantile_norm` for any non-PI0 model
+  (`training/config.py`), so `Normalize._normalize_quantile` maps q01 → −1 and q99 → +1. The clip
+  therefore touches only the extreme percentile tails, and it zeroes the value gradient in a
+  saturated dim — deliberately, so the critic gets no say in pushing an action further past the
+  range it was fitted on. Both clips are on the **guided path only**: the plain baseline,
+  best-of-N-without-guidance, DSRL and rollout collection are byte-identical to before, so
+  existing baseline numbers stay comparable.
+- **The rescale is per sample**, over the flattened chunk. `steering-with-failures` takes one
+  global norm over the whole array, which is the same number at their batch size of 1; ours has
+  to hold under `best_of_n > 1`, where a global norm would couple the candidates.
+
+Two things of theirs this deliberately does *not* copy: `q_chunk_size` (they score only the first
+10 chunk steps, we score all 50 — that is a critic architecture key and changing it invalidates
+every checkpoint) and `ug_stop_grad_velocity` / backward guidance / self-recurrence.
+
+> Guided runs from before 2026-09-07 used the older variant (steered at `t=1`, no clipping). A
+> run **resumed** across that boundary would mix the two, so finish or restart such a run rather
+> than resuming it.
 
 #### Best-of-N selection
 
