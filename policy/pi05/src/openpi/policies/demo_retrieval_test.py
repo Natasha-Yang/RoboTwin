@@ -863,8 +863,15 @@ def test_reader_discovers_every_recorded_sensor_from_the_schema():
     # A camera the sim has no counterpart for keeps its own name rather than being guessed at.
     assert offered["images.front"] == "observation.images.front"
     assert "images.third_view" not in offered
+    # The endpose family goes through the same prefix mechanism, with an arm where a camera
+    # would be -- both poses and both gripper widths, at the shapes the sim's own
+    # `endpose.*` modality has (envs/utils/obs_modalities.py).
+    assert offered["endpose.left_endpose"] == "observation.endpose.left_endpose"
+    assert offered["endpose.right_gripper"] == "observation.endpose.right_gripper"
+    assert reader.sensor_shape("endpose.left_endpose") == (7,)
+    assert reader.sensor_shape("endpose.left_gripper") == (1,)
     # Nothing that is not a critic modality leaks in.
-    assert not [name for name in offered if "camera." in name or "endpose" in name]
+    assert not [name for name in offered if "camera." in name]
     # Shapes are reported as the critic would see them: an image column is stored [3, H, W].
     assert reader.sensor_shape("images.head") == (240, 320, 3)
     assert reader.sensor_shape("depth.head") == (240, 320)

@@ -110,13 +110,17 @@ CAMERA_MODALITY = {"cam_high": "head", "cam_left_wrist": "left_wrist", "cam_righ
 SENSOR_FAMILIES = {
     "observation.images.": ("images", np.uint8),
     "observation.depth.": ("depth", np.float32),
+    # `observation.endpose.left_endpose` -> `endpose.left_endpose`: the suffix is an arm, not a
+    # camera, so `CAMERA_MODALITY` passes it through unchanged and the family mechanism carries
+    # all four columns (both poses and both gripper widths) on one line.
+    "observation.endpose.": ("endpose", np.float32),
 }
 SENSOR_COLUMNS = {"observation.pointcloud": ("pointcloud", np.float32)}
 
 
 def modality_for_column(column: str) -> str | None:
     """The critic modality name a demo dataset column becomes, or None for one that is not a
-    modality at all (the state, the action, camera matrices, endposes, the index columns).
+    modality at all (the state, the action, camera matrices, the index columns).
 
     Wrench columns are deliberately *not* handled here: they are not served per frame like the
     rest but windowed into a `(wrench_trace_len, 6)` trace (`wrench_traces`), so they have their
@@ -294,8 +298,8 @@ class LeRobotEpisodeReader:
 
         Read off `meta/info.json`, so a caller can ask what a dataset offers before opening an
         episode -- the same way `wrench_columns` does. An rgb-only demo dataset yields just its
-        three camera views; the multimodal converter's also yields `depth.<cam>`, `pointcloud`
-        and whatever extra cameras it recorded.
+        three camera views; the multimodal converter's also yields `depth.<cam>`, `pointcloud`,
+        `endpose.<arm>_{endpose,gripper}` and whatever extra cameras it recorded.
 
         The three policy cameras appear here as `images.<suffix>` even though the bank already
         keeps them as *model inputs*: those are 224x224 and normalized for the tower, while the
