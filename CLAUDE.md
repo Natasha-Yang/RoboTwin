@@ -1155,7 +1155,7 @@ episode, and takes `--family links|arms|all` for the same reason.
 > into `policy/pi05/.venv`** (`pip install -e … --no-deps`) — cloning alone is not enough, since
 > `pi_model.py` imports it at module scope and a *baseline* eval fails without it (§8). The
 > **QMFM repo** it imports `ReplayBuffer` from (by explicit path, `$QMFM_ROOT/utils/datasets.py`)
-> is at `/home/natashay/links/projects/def-florian7/natashay/QMFM`. `eval.sh` exports that as the
+> is at `/home/natasha/QMFM`. `eval.sh` exports that as the
 > `QMFM_ROOT` default — override the env var to point elsewhere. It also forces
 > `WANDB_MODE=offline`: compute nodes have no internet, and the guided path opens a W&B run
 > per eval, so an online `wandb.init()` times out (90 s) and can take the job down. Sync the
@@ -1455,6 +1455,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
+| `endpose.{left,right}_endpose` | task config `data_type.endpose` — each arm's world-frame end-effector pose | `(7,)` each, xyz + wxyz quat |
+| `endpose.{left,right}_gripper` | the same, normalized gripper width | `(1,)` each |
 | `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-primitive-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
 | `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `action_proposals` | not a sensor: naming it in `encoder_modalities` turns retrieval on (§5b) | `(top_k, 50, 14)` |
@@ -1485,6 +1487,19 @@ Three things to keep in mind:
   the *following* chunk's trace instead — see §7a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§7a); a critic configured for `wrench.*` against a config
   that has it off — or naming a link this embodiment does not have — fails at startup.
+- **The endposes are the one modality in the sim's own frame.** Everything else a critic reads
+  is either a policy feature or a sensor reading; `endpose.*` is world-frame metres and a unit
+  quaternion, straight from `get_obs`, with **no normalization** — `state` next to it is the
+  policy's *model space*, normalized by the checkpoint's norm stats, and there is nothing in
+  those stats a Cartesian pose could be normalized by (they are 14 joint angles in radians plus
+  a gripper width). Its default spec is `vector` with no `offset`/`scale`, matching
+  `object_poses`; set the pair in the modality's spec if a run wants the table's ~0.74 m z
+  offset taken out. Two more details: it is the arm's move-group link (`fl_link6`), **0.12 m
+  behind** the TCP the wrench's torque is taken about (`robot.py::_trans_endpose`), and its z
+  moves with `table_z_bias` under `random_table_height`. Both shipped task configs set
+  `data_type.endpose: true`, and the multimodal demo datasets carry all four columns at exactly
+  these shapes — so unlike `images.<cam>`, a demonstration can serve it as a cross-attention key
+  or a co-training row (§5b, §5d) without a shape mismatch.
 - **The proposal modalities are not modalities.** `action_proposals` / `noise_proposals` come
   from a bank of demonstrations rather than from the sim (§5b), and they are not something a
   run either has or lacks: they are the *mechanism* by which everything else the critic encodes
