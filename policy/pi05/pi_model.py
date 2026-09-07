@@ -387,11 +387,13 @@ class PI0:
             # The proposals are model-produced, so unlike the sim's sensor modalities they are
             # not in `critic_obs_extra` yet -- the first one is retrieved on the first
             # get_action. Seeding them here puts them in `obs_shapes` (and so in
-            # `_critic_extra_shapes`) alongside everything else, with the width the critic
-            # scores in: the proposal is the same kind of object as the chunk it is compared to.
-            shape = (self.demo_retriever.top_k, horizon, self.critic_action_dim)
+            # `_critic_extra_shapes`) alongside everything else, each at the width
+            # `_proposal_width` keeps it at -- which is not the same for the two of them.
             for name in self.proposal_modalities:
-                self.critic_obs_extra[name] = np.zeros(shape, dtype=np.float32)
+                self.critic_obs_extra[name] = np.zeros(
+                    (self.demo_retriever.top_k, horizon, self._proposal_width(name)),
+                    dtype=np.float32,
+                )
 
         cc = dict(self._critic_config)
         # State is the model-space state narrowed back to the embodiment's own dims, exactly as
@@ -542,7 +544,7 @@ class PI0:
               + ", ".join(f"{k}{tuple(cc['obs_shapes'][k])}" for k in self.online_critic.obs_keys)
               + (f" (available but unused: {', '.join(unused)})" if unused else ""))
 
-    def _demo_source(self, repo_id):
+    def _demo_source(self, repo_id, critic_modalities=None):
         """A `DemoRetriever` over `repo_id`, reusing the run's own if it is the same dataset.
 
         Retrieval (§5b) and demo co-training both need the same three things -- the LeRobot
@@ -556,11 +558,14 @@ class PI0:
             return self.demo_retriever
         # Only the keys that affect *encoding*. The bank knobs (num_demos, top_k, bank_size,
         # frame_stride, the inversion) belong to retrieval and would only constrain a retriever
-        # that is never going to build a bank.
+        # that is never going to build a bank. `sensor_modalities` is one of the encoding keys:
+        # which recorded columns are read is a property of the dataset and this critic, not of
+        # the bank, and co-training needs exactly the same ones a retrieved row would serve.
         cfg = {
             key: value
             for key, value in self._demo_retrieval_config.items()
-            if key in ("root", "encode_batch_size", "seed") and value is not None
+            if key in ("root", "encode_batch_size", "seed", "sensor_modalities")
+            and value is not None
         }
         return DemoRetriever(
             self.policy._model,
@@ -568,6 +573,14 @@ class PI0:
             repo_id=repo_id,
             invert=False,
             wrench_trace_len=self.wrench_trace_len,
+            # Left unset (the default), the sensors to load are derived from what the critic
+            # asks for -- the same derivation `_init_demo_retriever` gets. Without it a run
+            # with no proposal modality never opens the run's own retriever, so this fallback
+            # would keep no recorded sensor at all and `cotrain_rows` would refuse every
+            # `pointcloud` / `depth.<cam>` / `images.<cam>` the critic encodes, with a message
+            # pointing at a `sensor_modalities` this path did not read.
+            critic_modalities=(self._critic_wanted_modalities()
+                               if critic_modalities is None else tuple(critic_modalities)),
             **cfg,
         )
 
@@ -594,7 +607,10 @@ class PI0:
                 "unset."
             )
         task = pending["task"] or self.task_name
-        source = self._demo_source(pending["repo_id"])
+        # The critic's *actual* obs keys, not the config's: a warm start takes its modalities
+        # from the checkpoint, and these are the exact names `cotrain_rows` will be asked for,
+        # so deriving what to load from them cannot come up short.
+        source = self._demo_source(pending["repo_id"], pending["modalities"])
         print(f"[pi_model] encoding demonstrations of {task!r} from {pending['repo_id']} as "
               f"critic observations {list(pending['modalities'])}, one row per "
               f"{pending['horizon']}-step chunk"
@@ -845,13 +861,35 @@ class PI0:
             obs[key] = value
         return obs
 
+    def _proposal_width(self, name):
+        """The trailing width one proposal modality is kept at. **Not the same for the two.**
+
+        `DemoRetriever.propose` returns both at the model's padded `action_dim` (32), and only
+        one of them should be narrowed back to the embodiment's `critic_action_dim`:
+
+        * `action_proposals` -- yes, exactly as the sampler narrows the chunk it scores.
+          AlohaInputs zero-pads 14 -> 32 and those trailing dims normalize to constant zero, so
+          a demo chunk keeps only the embodiment's own dims and lines up term-for-term with the
+          action the critic is judging.
+        * `noise_proposals` -- no. This is not an action but the *seed* that denoises into one,
+          and a latent has no dead dims even where an action does: all 32 go through
+          `action_in_proj` and shape the 14 that come out, which is why `_init_critic` sizes
+          DSRL's own latent on `action_dim` rather than on `critic_action_dim`. Whatever
+          `invert_actions` recovers in the trailing dims is a real part of the latent that
+          produced that chunk, so slicing them off would hand the critic a candidate it could
+          not actually seed the sampler with -- and would silently disagree with the space the
+          DSRL actor acts in.
+        """
+        if name == "noise_proposals":
+            return int(self.model_config.action_dim)
+        return self.critic_action_dim
+
     def _refresh_demo_proposals(self):
         """Retrieve this control step's demo proposals into the critic's extra observation.
 
-        Narrowed to `critic_action_dim` on the way in, exactly as the sampler narrows the chunk
-        it scores: the model pads both to `action_dim` (32) and those trailing dims are constant
-        zero for aloha, so a proposal keeps only the embodiment's own dims and lines up
-        term-for-term with the action the critic is judging.
+        Each is narrowed on the way in to whatever `_proposal_width` says it is -- the
+        embodiment's dims for a demo chunk, the model's full padded `action_dim` for an
+        inverted seed.
 
         Costs one image tower + prefix pass on top of the sampler's own, plus -- when
         `noise_proposals` is on -- `num_steps * num_inner_steps` action-expert passes at batch
@@ -862,7 +900,7 @@ class PI0:
             return
         proposals = self.demo_retriever.propose(self.observation_window)
         for name in self.proposal_modalities:
-            self.critic_obs_extra[name] = proposals[name][..., : self.critic_action_dim]
+            self.critic_obs_extra[name] = proposals[name][..., : self._proposal_width(name)]
         self._refresh_proposal_keys(proposals["proposal_rows"])
         self.last_demo_retrieval = self.demo_retriever.retrieved()
 
