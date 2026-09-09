@@ -62,6 +62,9 @@ overrides=()
 # (`--eval_interval 20 --eval_episodes 10 --eval_seed 7`; `--eval_interval 0` turns it off).
 # `env_seed` is deliberately NOT among them: it is a task-config key, so that one file decides
 # the environment for collection and eval alike (see task_config/_config_template.yml).
+# `--profile true` (or `cprofile` / `both`) is also passed this way: it turns on the wall-clock
+# breakdown in envs/utils/eval_profiler.py and writes `_profile.txt` into the run's result dir.
+# Off by default, and off means the hooks are never installed.
 [ "$#" -gt 12 ] && overrides+=("${@:13}")
 
 # Required. An empty gpu_id would `export CUDA_VISIBLE_DEVICES=`, which CUDA reads as "no

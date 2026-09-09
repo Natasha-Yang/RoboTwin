@@ -61,8 +61,8 @@ test_num: 300
 # choose the seeds) every `eval_interval` episodes, so at 10/20 the run is ~50% longer. Set
 # `eval_interval: 0` to turn it off, in which case the best checkpoint falls back to
 # `success_rate_ma` over the training episodes exactly as before.
-eval_interval: 20
-eval_episodes: 10
+eval_interval: 0
+eval_episodes: 25
 # Where the held-out seed search starts. This is an ACTUAL seed, not a `seed`-style block index:
 # the run's own episodes start at `100000 * (1 + seed)` and walk upward from there, one seed per
 # candidate (so more than one per episode -- the expert gate rejects some).
@@ -105,6 +105,28 @@ eval_seed: null
 # (A run that predates crash recovery has no resume_state.json at all; script/
 # resume_state_from_log.py rebuilds one from that run's SLURM log.)
 resume:
+
+# ===== Profiling =====
+# Where an eval run's wall clock actually goes -- off unless asked for, and off means the hooks
+# are never installed, so a normal run is byte-identical to one that has never heard of the
+# profiler (envs/utils/eval_profiler.py).
+#
+#   false     (default) no profiling.
+#   true      deterministic span timings: the renders, the TOPP retime, the physics loop, the
+#             contact queries, the policy forward, the critic's TD updates, the expert
+#             feasibility gate and the held-out evaluations -- each with a call count, so a cost
+#             reads as "ms per control step" rather than as a bare total. Overhead is one
+#             perf_counter pair per wrapped call, a fraction of a percent.
+#   cprofile  a cProfile pass over the seed loop instead, for function-level attribution once
+#             the spans have said which phase is expensive. Costs a few percent, more on the
+#             python-heavy per-physics-step paths, so the *relative* numbers shift a little.
+#   both      both of the above.
+#
+# The report is printed at the end of the run and written to `_profile.txt` / `_profile.json`
+# (and `_profile_cprofile.pstats` / `.txt`) in the run's eval_result directory. Startup is
+# reported apart from the seed loop, because the sampler's first JAX compilation is tens of
+# seconds and is not a per-episode cost. Per run: `bash eval.sh ... --profile true`.
+profile: false
 
 # ===== Online QMFM Value critic =====
 # `guidance_scale` is QMFM's steering_coeff. It and `best_of_n` (below) are the two ways the
@@ -176,7 +198,7 @@ use_step_reward: false
 demo_retrieval:
   # The LeRobot dataset the demonstrations come from -- normally the one the policy was
   # fine-tuned on, so a retrieved chunk is something the policy could plausibly produce.
-  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  repo_id: NatashaYang/robotwin_demo_clean_multimodal_50x10_lerobot
   # Where that dataset lives; null = $HF_LEROBOT_HOME/<repo_id>.
   root: null
   # Demonstrations drawn for the run (once, not per episode), and neighbours retrieved per
@@ -185,7 +207,7 @@ demo_retrieval:
   # chunk costs an action-expert pass, which is why the pool is not the whole bank -- and the
   # critic cross-attends them to decide what the value actually rests on. A critic that pools
   # the set instead gets exactly these `top_k` and no say in it.
-  num_demos: 1
+  num_demos: 10
   top_k: 3
   # Camera views the similarity is averaged over; null = all three the policy sees.
   views: null
@@ -262,4 +284,4 @@ critic_ckpt:
 #                              score an action chunk).
 #
 # Swap it here, or per run as eval.sh's 12th positional argument.
-critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm.yaml
+critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm_small.yaml
