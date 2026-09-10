@@ -1061,6 +1061,57 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   place it acts, so a guided run's TD targets and the printout agree by construction; the
   equivalent for a collected dataset's `reward` column is §7a, which is always shaped.
 
+#### Profiling a slow eval (`profile`)
+
+An eval is hours long and almost none of that is the policy. `profile` (in
+`deploy_policy.yml`, or `--profile true` through `eval.sh`'s pass-through overrides) turns on a
+deterministic span profiler that attributes the wall clock —
+`envs/utils/eval_profiler.py`. It is **off by default, and off means not installed**: no method
+is wrapped and the run is byte-identical to one that has never heard of it.
+
+```bash
+bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 0 --profile true
+python script/test_eval_profiler.py   # the profiler's own self-test; no GPU, no simulator
+```
+
+| value | what runs |
+|---|---|
+| `false` (default) | nothing |
+| `true` | span timings: one `perf_counter` pair per wrapped call, a fraction of a percent |
+| `cprofile` | a cProfile pass over the seed loop instead, for function-level detail once the spans say which phase is expensive (a few percent, more on the python-heavy per-physics-step paths) |
+| `both` | both |
+
+45 hooks are placed, on the simulator (`get_obs`, `take_action`, `check_success`,
+`scene.step`, `update_render`, the camera getters), the motion planning (curobo, and the TOPP
+retime `take_action` runs twice per primitive step), the policy (`Policy.infer`, `PI0.get_action`,
+retrieval), the critic (`stash` / `commit` / `train_step` / `q_values`, instrumented when
+`_init_critic` builds one) and the debug recorders. Coarse **phases** — `expert_check`,
+`rollout`, `holdout`, `other` — say which activity the run is spending its hours in, which is
+usually the first question: the feasibility gate is a full expert rollout per *candidate* seed,
+and `eval_interval` adds `eval_episodes` rollouts every `eval_interval` episodes.
+
+The report prints at the end and is rewritten into the run dir after **every episode**
+(`_profile.txt` / `_profile.json`, plus `_profile_cprofile.pstats` / `.txt`), so a run you kill
+still leaves a current one; it is also dumped from a `finally`, so a crash does too.
+
+Four things about reading it:
+
+- **`self` is the column to rank by.** It excludes nested spans and sums to the profiled wall
+  clock; `total` includes children, so `env.take_action`'s total is the whole physics loop.
+- **Startup is reported apart from the seed loop.** The sampler's first JAX compilation is tens
+  of seconds and is not a per-episode cost, so the per-control-step budget is over the loop
+  alone. For the same reason every span carries `first_ms` and `mean_ms_ex1`: a large `first` on
+  a policy or critic span is compilation.
+- **SAPIEN renders asynchronously.** `take_picture()` queues the work and `get_picture()` waits
+  for it, so the GPU time lands on `camera.get_rgb` / `camera.get_depth`, not on
+  `camera.take_picture`. Read the `render.*` and `camera.*` rows as one group.
+- **The counts are half the answer.** `env.get_obs` runs `pi0_step + 1` times per control step,
+  not once — `deploy_policy.py::eval` renders a full three-camera observation after *every*
+  primitive step of the chunk and only the last one conditions the next inference — and the
+  physics loop runs `update_render` **and** `check_success` **and** a contact query
+  (`data_type.wrench`) after every one of its 34–196 `scene.step()`s. The report calls both
+  ratios out.
+
 #### Crash recovery
 
 An eval run is hours long and can end early two ways: it can crash, and it can wedge.
@@ -1079,11 +1130,33 @@ appended to `_episode_results.csv`, the critic checkpointed, then `resume_state.
 atomically. The json is the commit marker, so an interruption rewinds to the last episode that
 completed all three; a csv row one ahead of it is trimmed on resume.
 
-`resume: true` (`deploy_policy.yml`) then continues the newest interrupted run for this
-task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one.
-`resume: "<run dir>"` names one specific run instead — needed when a second eval is writing into
-the same directory, since it rewrites its own `resume_state.json` every episode and so stays the
-"newest" one however long ago the run you meant stopped.
+Resuming is then one command, and it names the **run directory**:
+
+```bash
+bash eval_tasks.sh --resume "eval_result/lift_pot/pi05/demo_clean/robotwin_clean_ep10/2026-09-04 12:55:11"
+```
+
+It continues that run **in its existing directory** rather than opening a new timestamped one,
+and it takes **no other arguments** — the task, task config, train config, model and seed are
+read out of the `deploy_policy.yml` snapshot in that directory, and the critic settings out of
+the critic-config snapshot beside it. Those snapshots are what the run was actually launched
+with; the working-tree ymls describe the run you are setting up *next*. So a `--critic-ckpt`,
+`--guidance-scale` or `--tasks` meant for some other submission cannot reach a resumed run —
+passing one alongside `--resume` is an error, not an override, because none of them can apply to
+a run whose episodes, seed sequence and critic were already produced under the old settings.
+`policy/pi05/eval.sh ... --resume "<run dir>"` is the same thing one level down, for a hand-run
+eval; `--resume true` there still picks the newest interrupted run under the task's own root.
+
+**There is deliberately no `resume` key in `deploy_policy.yml` any more**, and the reason is
+worth keeping: one file is shared by every task, so a run directory pinned in it applied to
+whatever was submitted afterwards. On 2026-09-04 three jobs — `handover_block`, `open_laptop`
+and `put_object_cabinet` — all resumed the same `put_object_cabinet` directory concurrently;
+its `_episode_results.csv` ended up with 94 rows over 67 episode numbers from three tasks, and
+its `_result.txt` holding handover_block's score. `find_resumable_run` now also refuses a run
+directory that is not under the task/policy/config/ckpt root of the eval being launched, so that
+particular collision fails loudly rather than interleaving. A run from before config
+snapshotting has no snapshot to resume from, and has to be continued by pointing `--config` at a
+config that matches what it was launched with.
 
 | Restored | From | Why it cannot be recomputed |
 |---|---|---|
@@ -1301,11 +1374,44 @@ mutually exclusive with both keys below.)
 
 | Key | Off | On |
 |---|---|---|
-| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
+| `guidance_scale` (7th positional arg) | `0.0` | an ensemble QMFM `Value` critic steers each denoising step **after the first** by gradient guidance, ramping `0 → guidance_scale` over `guidance_ramp_updates` TD updates (`0` jumps to target after the first update) |
 | `best_of_n` (11th arg) | `1` | `n` candidate chunks are drawn per control step and the highest-Q one is executed |
 
 Both off is the plain pi0.5 baseline — no critic is built, no replay collection, no TD updates,
 no W&B.
+
+#### What the gradient guidance actually is
+
+**Universal Guidance** (Bansal et al. 2023) adapted for flow matching, and as of 2026-09-07
+identical to `~/steering-with-failures`' `steered_ode.py::make_universal_guidance_fn` so results
+compare across the two codebases. Per denoising step, in `pi0.py::sample_actions::guided_step`:
+Tweedie-estimate the clean chunk `x̂₀ = clip(x_t − t·v_t, −1, 1)`, take `∇_{x_t} mean_k Q(obs, x̂₀)`
+**through** the velocity field, rescale it to `‖v_t‖` (QMFM's `steer_use_sigma_t=False`, Eq 129),
+and subtract `guidance_scale ×` that from the velocity. Three details are load-bearing:
+
+- **The `t=1` step is unsteered.** There `x_t` is pure noise, so its Tweedie estimate is a
+  denoised estimate of nothing and its gradient is noise the critic would be asked to follow.
+  `denoise(guided_step, first_step_fn=step)` runs that one step with the plain integrator; the
+  total is still `num_steps` steps, one of them just runs ahead of the `while_loop`.
+- **`x̂₀` and the returned chunk are clipped to `[−1, 1]`**, because that *is* pi0.5's action
+  range: `create_base_config` sets `use_quantile_norm` for any non-PI0 model
+  (`training/config.py`), so `Normalize._normalize_quantile` maps q01 → −1 and q99 → +1. The clip
+  therefore touches only the extreme percentile tails, and it zeroes the value gradient in a
+  saturated dim — deliberately, so the critic gets no say in pushing an action further past the
+  range it was fitted on. Both clips are on the **guided path only**: the plain baseline,
+  best-of-N-without-guidance, DSRL and rollout collection are byte-identical to before, so
+  existing baseline numbers stay comparable.
+- **The rescale is per sample**, over the flattened chunk. `steering-with-failures` takes one
+  global norm over the whole array, which is the same number at their batch size of 1; ours has
+  to hold under `best_of_n > 1`, where a global norm would couple the candidates.
+
+Two things of theirs this deliberately does *not* copy: `q_chunk_size` (they score only the first
+10 chunk steps, we score all 50 — that is a critic architecture key and changing it invalidates
+every checkpoint) and `ug_stop_grad_velocity` / backward guidance / self-recurrence.
+
+> Guided runs from before 2026-09-07 used the older variant (steered at `t=1`, no clipping). A
+> run **resumed** across that boundary would mix the two, so finish or restart such a run rather
+> than resuming it.
 
 #### Best-of-N selection
 
@@ -1559,6 +1665,8 @@ run is offered to it, and **which modalities it uses is decided in the critic's 
 | `images.third_view` | task config `data_type.third_view` | `(H, W, 3)` uint8 |
 | `depth.{head,left_wrist,right_wrist}` | task config `data_type.depth` | `(240, 320)`, mm |
 | `pointcloud` | task config `data_type.pointcloud` | `(pcd_down_sample_num, 6)` |
+| `endpose.{left,right}_endpose` | task config `data_type.endpose` — each arm's world-frame end-effector pose | `(7,)` each, xyz + wxyz quat |
+| `endpose.{left,right}_gripper` | the same, normalized gripper width | `(1,)` each |
 | `wrench.<link>` (aloha: `fl_link7`, `fl_link8`, `fr_link7`, `fr_link8`) | per-primitive-step contact wrench per end-effector link, logged by the env | `(wrench_trace_len, 6)` each |
 | `wrench.<arm>` (`left`, `right`) | the same reading summed over that arm's links | `(wrench_trace_len, 6)` each |
 | `action_proposals` | not a sensor: naming it in `encoder_modalities` turns retrieval on (§5b) | `(top_k, 50, 14)` |
@@ -1589,6 +1697,19 @@ Three things to keep in mind:
   the *following* chunk's trace instead — see §7a.) The env's per-step logging is switched by the
   task config's `data_type.wrench` (§7a); a critic configured for `wrench.*` against a config
   that has it off — or naming a link this embodiment does not have — fails at startup.
+- **The endposes are the one modality in the sim's own frame.** Everything else a critic reads
+  is either a policy feature or a sensor reading; `endpose.*` is world-frame metres and a unit
+  quaternion, straight from `get_obs`, with **no normalization** — `state` next to it is the
+  policy's *model space*, normalized by the checkpoint's norm stats, and there is nothing in
+  those stats a Cartesian pose could be normalized by (they are 14 joint angles in radians plus
+  a gripper width). Its default spec is `vector` with no `offset`/`scale`, matching
+  `object_poses`; set the pair in the modality's spec if a run wants the table's ~0.74 m z
+  offset taken out. Two more details: it is the arm's move-group link (`fl_link6`), **0.12 m
+  behind** the TCP the wrench's torque is taken about (`robot.py::_trans_endpose`), and its z
+  moves with `table_z_bias` under `random_table_height`. Both shipped task configs set
+  `data_type.endpose: true`, and the multimodal demo datasets carry all four columns at exactly
+  these shapes — so unlike `images.<cam>`, a demonstration can serve it as a cross-attention key
+  or a co-training row (§5b, §5d) without a shape mismatch.
 - **The proposal modalities are not modalities.** `action_proposals` / `noise_proposals` come
   from a bank of demonstrations rather than from the sim (§5b), and they are not something a
   run either has or lacks: they are the *mechanism* by which everything else the critic encodes
@@ -2693,6 +2814,11 @@ sbatch cluster/robotwin_gpu.sh bash -c \
 # Motus (paths/config come from policy/Motus/paths_config.yml, not from argv):
 sbatch cluster/robotwin_gpu.sh bash -c \
   'cd policy/Motus && bash eval.sh beat_block_hammer 0'
+
+# --- why is the eval slow? (off by default; writes _profile.txt into the run dir) ---
+sbatch cluster/robotwin_gpu.sh bash -c \
+  'cd policy/pi05 && bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora_clean_50x25 run0 0 0 --profile true'
+python script/test_eval_profiler.py                  # the profiler's own self-test
 
 # --- collect a rollout dataset (compute node records; push from a login node) ---
 sbatch cluster/robotwin_gpu.sh bash -c \

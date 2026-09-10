@@ -10,7 +10,7 @@ instruction_type: unseen
 # Add Parameters You Need
 train_config_name: null
 model_name: null
-checkpoint_id: 15000
+checkpoint_id: 30000
 pi0_step: 10
 
 # ===== Contact-wrench trace length =====
@@ -61,8 +61,8 @@ test_num: 300
 # choose the seeds) every `eval_interval` episodes, so at 10/20 the run is ~50% longer. Set
 # `eval_interval: 0` to turn it off, in which case the best checkpoint falls back to
 # `success_rate_ma` over the training episodes exactly as before.
-eval_interval: 20
-eval_episodes: 10
+eval_interval: 0
+eval_episodes: 25
 # Where the held-out seed search starts. This is an ACTUAL seed, not a `seed`-style block index:
 # the run's own episodes start at `100000 * (1 + seed)` and walk upward from there, one seed per
 # candidate (so more than one per episode -- the expert gate rejects some).
@@ -90,21 +90,55 @@ eval_seed: null
 # resume_state.json records the loop counters -- so an interrupted run keeps the episodes it
 # already paid for.
 #
-# `resume: true` then continues the newest interrupted run for this task/policy/config/ckpt in
-# its existing directory instead of opening a new timestamped one: the seed sequence carries on
-# where it stopped (it cannot be recomputed -- which seeds the expert check rejected is not a
-# function of the episode index), the critic reloads with its optimizer and LR schedule intact,
-# the guidance ramp picks up where it stopped rather than restarting at 0, and the W&B run is
-# rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP
-# features), so a resumed critic refills it from empty before TD updates restart.
-# `false` always starts a fresh run and leaves any interrupted one untouched.
+# Resuming is a LAUNCH argument, not a key here, and deliberately so. Name the run directory:
 #
-# `resume: "<run dir>"` continues that specific run instead of the newest. Use it when another
-# eval is writing into the same task/policy/config/ckpt directory -- it rewrites its own
-# resume_state.json every episode, so it stays the "newest" one however long ago yours stopped.
-# (A run that predates crash recovery has no resume_state.json at all; script/
-# resume_state_from_log.py rebuilds one from that run's SLURM log.)
-resume:
+#     bash eval_tasks.sh --resume "<run dir>"
+#
+# That continues it in place instead of opening a new timestamped directory: the seed sequence
+# carries on where it stopped (it cannot be recomputed -- which seeds the expert check rejected
+# is not a function of the episode index), the critic reloads with its optimizer and LR schedule
+# intact, the guidance ramp picks up where it stopped rather than restarting at 0, and the W&B
+# run is rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP features),
+# so a resumed critic refills it from empty before TD updates restart.
+#
+# It takes no other arguments, because it takes no settings from this file: a resume reads the
+# deploy config and critic config snapshotted in the run's own directory, which is what that run
+# was actually launched with (eval_policy.parse_args_and_config). This file describes the run
+# you are setting up next, and the two are not the same thing.
+#
+# `resume` used to live here as a key, and that is what made it dangerous. One file is shared by
+# every task, so a run directory pinned in it applied to whatever was submitted afterwards: on
+# 2026-09-04 three jobs -- handover_block, open_laptop and put_object_cabinet -- all resumed the
+# same put_object_cabinet directory concurrently, and its _episode_results.csv ended up with 94
+# rows over 67 episode numbers from three different tasks, its _result.txt holding handover_block's
+# score. `find_resumable_run` now rejects a run directory that does not belong to the task being
+# evaluated, so that particular accident fails loudly, but the key is gone regardless.
+#
+# (A run that predates config snapshotting cannot be resumed this way; point --config at a
+# matching config by hand. One that predates crash recovery has no resume_state.json at all --
+# script/resume_state_from_log.py rebuilds one from that run's SLURM log.)
+
+# ===== Profiling =====
+# Where an eval run's wall clock actually goes -- off unless asked for, and off means the hooks
+# are never installed, so a normal run is byte-identical to one that has never heard of the
+# profiler (envs/utils/eval_profiler.py).
+#
+#   false     (default) no profiling.
+#   true      deterministic span timings: the renders, the TOPP retime, the physics loop, the
+#             contact queries, the policy forward, the critic's TD updates, the expert
+#             feasibility gate and the held-out evaluations -- each with a call count, so a cost
+#             reads as "ms per control step" rather than as a bare total. Overhead is one
+#             perf_counter pair per wrapped call, a fraction of a percent.
+#   cprofile  a cProfile pass over the seed loop instead, for function-level attribution once
+#             the spans have said which phase is expensive. Costs a few percent, more on the
+#             python-heavy per-physics-step paths, so the *relative* numbers shift a little.
+#   both      both of the above.
+#
+# The report is printed at the end of the run and written to `_profile.txt` / `_profile.json`
+# (and `_profile_cprofile.pstats` / `.txt`) in the run's eval_result directory. Startup is
+# reported apart from the seed loop, because the sampler's first JAX compilation is tens of
+# seconds and is not a per-episode cost. Per run: `bash eval.sh ... --profile true`.
+profile: false
 
 # ===== Online QMFM Value critic =====
 # `guidance_scale` is QMFM's steering_coeff. It and `best_of_n` (below) are the two ways the
@@ -144,7 +178,7 @@ resume:
 # Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
 # denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
 best_of_n: 1
-guidance_scale: 0.05
+guidance_scale: 0
 guidance_ramp_updates: 500
 # The reward the run scores itself with -- what `commit()` feeds the online critic, what the
 # W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
@@ -176,7 +210,7 @@ use_step_reward: false
 demo_retrieval:
   # The LeRobot dataset the demonstrations come from -- normally the one the policy was
   # fine-tuned on, so a retrieved chunk is something the policy could plausibly produce.
-  repo_id: NatashaYang/robotwin_demo_clean_50_lerobot
+  repo_id: NatashaYang/robotwin_demo_clean_multimodal_50x10_lerobot
   # Where that dataset lives; null = $HF_LEROBOT_HOME/<repo_id>.
   root: null
   # Demonstrations drawn for the run (once, not per episode), and neighbours retrieved per
@@ -185,7 +219,7 @@ demo_retrieval:
   # chunk costs an action-expert pass, which is why the pool is not the whole bank -- and the
   # critic cross-attends them to decide what the value actually rests on. A critic that pools
   # the set instead gets exactly these `top_k` and no say in it.
-  num_demos: 1
+  num_demos: 10
   top_k: 3
   # Camera views the similarity is averaged over; null = all three the policy sees.
   views: null
@@ -226,7 +260,7 @@ demo_retrieval:
   # ~0.6 MB per view per row at fp16 -- 1.8 GB here, at 1000 rows over three cameras. Lower it
   # (or `views`) if that is too much; `frame_stride` shrinks it for free when the demos are
   # longer than the bank anyway.
-  bank_size: 1000
+  bank_size: 5000
   # Keep every Nth demo frame. >1 shrinks the bank and the per-episode encoding cost.
   frame_stride: 1
   # Inversion settings for `noise_proposals`. `num_steps` MUST match the sampler's denoising
@@ -247,5 +281,18 @@ critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/202
 # Everything below only takes effect when a critic is running, i.e. guidance_scale != 0 or
 # best_of_n > 1.
 # Critic network / TD / replay / W&B knobs are merged in from this file; anything set above
-# (or overridden on the eval.sh command line) wins over it.
-critic_config_path: /home/natashay/projects/aip-florian7/natashay/multisensory-steering/cfgs/qmfm.yaml
+# (or overridden on the eval.sh command line) wins over it. It also picks the critic *family*
+# (`critic_type`), which is what decides how the critic gets to act on sampling:
+#
+#   cfgs/qmfm.yaml  (default)  an ensemble Q over action chunks. It steers the denoising by
+#                              value gradient (`guidance_scale`) and/or ranks the chunks the
+#                              sampler draws (`best_of_n`); the keys above are its switches.
+#   cfgs/dsrl.yaml             SAC over the sampler's *latent noise*. The denoising is left
+#                              exactly as it is and the actor picks the noise chunk pi0.5
+#                              denoises from, so naming the family is the whole switch -- there
+#                              is no scale to set, and `guidance_scale != 0` or `best_of_n > 1`
+#                              alongside it is an error (its Q is over latents, so it cannot
+#                              score an action chunk).
+#
+# Swap it here, or per run as eval.sh's 12th positional argument.
+critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm_small.yaml

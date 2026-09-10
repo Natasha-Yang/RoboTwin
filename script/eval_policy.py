@@ -33,6 +33,7 @@ from envs import CONFIGS_PATH
 from envs._base_task import resolve_background_texture_pool
 from envs.utils.create_actor import UnStableError
 from envs.utils.debug_vis import DemoRetrievalRecorder, QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
+from envs.utils import eval_profiler
 
 import numpy as np
 from pathlib import Path
@@ -432,6 +433,9 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
+SNAPSHOT_HEADER_PREFIX = "# Snapshot of "
+
+
 def snapshot_config(src_path, values, dst_dir):
     """Copy a yml config into `dst_dir` with the values actually used written in.
 
@@ -443,6 +447,10 @@ def snapshot_config(src_path, values, dst_dir):
     src_path = Path(src_path)
     with src_path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
+    # A resumed run snapshots the snapshot it was configured from (src and dst are then the same
+    # file), so drop any header this function wrote before rather than stacking a new one on it.
+    while lines and lines[0].startswith(SNAPSHOT_HEADER_PREFIX):
+        lines.pop(0)
     original = yaml.safe_load("".join(lines)) or {}
 
     for i, line in enumerate(lines):
@@ -461,7 +469,7 @@ def snapshot_config(src_path, values, dst_dir):
                 comment = "  " + raw_value[hash_at:].lstrip()
         lines[i] = yaml.safe_dump({key: values[key]}, sort_keys=False).strip() + comment + "\n"
 
-    header = f"# Snapshot of {src_path.resolve()} as used by this eval run.\n"
+    header = f"{SNAPSHOT_HEADER_PREFIX}{src_path.resolve()} as used by this eval run.\n"
     with (Path(dst_dir) / src_path.name).open("w", encoding="utf-8") as f:
         f.writelines([header] + lines)
 
@@ -625,18 +633,44 @@ def load_resume_state(save_dir):
     return state
 
 
+# The run identity: the keys that decide *which* experiment a run directory holds. A resume
+# reloads them from the run's own config snapshot (see `parse_args_and_config`), so they cannot
+# be taken from the working-tree yml -- that file describes whatever is being set up next, not
+# what this run was launched as. Anything passed on the command line is checked against the
+# snapshot rather than applied, because an override here does not reconfigure the run, it
+# mislabels it: the episodes, seeds and critic in the directory are still the old experiment's.
+IDENTITY_KEYS = ("policy_name", "task_name", "task_config", "ckpt_setting",
+                 "train_config_name", "model_name", "seed")
+
+
 def find_resumable_run(run_root, resume=True):
     """The run directory to continue, or None to start a fresh one.
 
-    `resume` is normally just a switch, and picks the most recent interrupted run under
-    `run_root`. It may instead name one specific run directory, which is what you want when the
-    newest-first rule would pick the wrong one: another eval writing into the same root updates
-    its state file every episode, so it stays "most recent" no matter which run you meant.
+    `resume` is normally the run directory to continue -- what `eval_tasks.sh --resume` passes,
+    and the only form that names one run unambiguously. `true` instead picks the most recent
+    interrupted run under `run_root`, which is right for a single task evaluated one job at a
+    time but ambiguous the moment two evals share a root: each rewrites its state file every
+    episode, so whichever ran last is "most recent" however long ago yours stopped.
+
+    A named directory must live under `run_root`, i.e. must belong to the task/policy/config/
+    checkpoint this process was configured for. It is the check that makes a wrong `--resume`
+    fail instead of appending one task's episodes to another task's results -- which is exactly
+    what a run directory pinned in a shared config file used to do to every task submitted
+    after it (see the `resume` note in policy/pi05/deploy_policy.yml).
     """
     if isinstance(resume, str) and as_bool_or_none(resume) is None:
         run_dir = Path(resume).expanduser()
         if not (run_dir / RESUME_STATE).exists():
             raise FileNotFoundError(f"resume: {run_dir} has no {RESUME_STATE}")
+        run_root = Path(run_root)
+        if run_dir.resolve().parent != run_root.resolve():
+            raise ValueError(
+                f"resume: {run_dir} does not belong to this eval.\n"
+                f"  it lives under : {run_dir.resolve().parent}\n"
+                f"  this run wants : {run_root.resolve()}\n"
+                "Resuming it would append this task's episodes to another run's results. "
+                "Check the directory, or the task/config/checkpoint this job was launched with."
+            )
         return run_dir
     if not as_bool(resume, False):
         return None
@@ -735,6 +769,14 @@ def main(usr_args):
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)
 
+    # Profiling (`profile:` in deploy_policy.yml, or `--profile true` through eval.sh's
+    # pass-through overrides). Off by default and off means *not installed* -- nothing is
+    # wrapped and the run is byte-identical to one that never heard of the profiler. Installed
+    # here because the hooks are class patches that must be in place before the env, the policy
+    # and the critic are built, and because the report needs `save_dir` to exist.
+    profile_mode = eval_profiler.parse_flag(usr_args.get("profile"))
+    profiler = eval_profiler.install(profile_mode) if profile_mode != "off" else None
+
     resume_state = load_resume_state(save_dir) if resume_dir is not None else None
     if resume_state is not None:
         print(f"\033[93m[resume] continuing {save_dir}\033[0m")
@@ -819,6 +861,9 @@ def main(usr_args):
     print("\n==================================")
 
     TASK_ENV = class_decorator(args["task_name"])
+    # `setup_demo` / `play_once` / `check_success` are defined by the task, not by `Base_Task`,
+    # so the profiler can only wrap them once the concrete class exists. No-op when off.
+    eval_profiler.install_env(TASK_ENV)
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
@@ -881,16 +926,31 @@ def main(usr_args):
                             resume_id=(resume_state or {}).get("wandb_run_id"))
                  if _uses_online_critic(model) else None)
 
-    st_seed, suc_num, episode_results = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type,
-                                   wandb_run=wandb_run,
-                                   resume_state=resume_state)
+    # The profiled region is the seed loop and nothing else: model loading and the JAX
+    # compilation it triggers are one-off startup, and folding them into the per-control-step
+    # numbers would make a long run look like a slow one.
+    try:
+        with eval_profiler.cprofile_to(save_dir / "_profile_cprofile",
+                                       enabled=profile_mode in ("cprofile", "both")):
+            st_seed, suc_num, episode_results = eval_policy(
+                task_name,
+                TASK_ENV,
+                args,
+                model,
+                st_seed,
+                test_num=test_num,
+                video_size=video_size,
+                instruction_type=instruction_type,
+                wandb_run=wandb_run,
+                resume_state=resume_state)
+    finally:
+        # Also on the way out of a crash or a Ctrl-C -- which is the run you most want the
+        # numbers for.
+        if profiler is not None:
+            print(profiler.dump(save_dir, extra=[
+                f"task {task_name}, config {task_config}, ckpt {ckpt_setting}",
+                f"written to {save_dir / '_profile.txt'} (and _profile.json)",
+            ]))
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -974,11 +1034,12 @@ def run_expert_check(TASK_ENV, args, seed, now_ep_num):
     render_freq = args["render_freq"]
     args["render_freq"] = 0
     try:
-        TASK_ENV.setup_demo(now_ep_num=now_ep_num, seed=seed, is_test=True, **args)
-        episode_info = TASK_ENV.play_once()
-        solved = TASK_ENV.plan_success and TASK_ENV.check_success()
-        TASK_ENV.close_env()
-        return episode_info if solved else None
+        with eval_profiler.PROFILER.phase("expert_check"):
+            TASK_ENV.setup_demo(now_ep_num=now_ep_num, seed=seed, is_test=True, **args)
+            episode_info = TASK_ENV.play_once()
+            solved = TASK_ENV.plan_success and TASK_ENV.check_success()
+            TASK_ENV.close_env()
+            return episode_info if solved else None
     except UnStableError:
         TASK_ENV.close_env()
         return None
@@ -1026,6 +1087,9 @@ def rollout_episode(TASK_ENV, model, eval_func, reset_func, use_step_reward,
         observation = TASK_ENV.get_obs()
         if on_observation is not None:
             on_observation(step, observation)
+        # One chunk sampled and `pi0_step` of it executed -- the unit the profile's per-step
+        # budget is over.
+        eval_profiler.PROFILER.count("control_steps")
         eval_func(TASK_ENV, model, observation)
         success_now = bool(TASK_ENV.eval_success)
         reward = control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward)
@@ -1104,7 +1168,7 @@ def run_holdout_eval(TASK_ENV, args, model, eval_func, reset_func, seeds, info_c
     successes = 0
     rewards, steps = [], []
     try:
-        with frozen_for_eval(model):
+        with eval_profiler.PROFILER.phase("holdout"), frozen_for_eval(model):
             for idx, seed in enumerate(seeds):
                 # The instruction is built from the expert run's `info` placeholders, which is
                 # why the gate's `info` was cached: the scene is a function of the seed, so the
@@ -1418,6 +1482,11 @@ def eval_policy(task_name,
                       f"{save_every_updates} updates to {critic_path}")
                 periodic_ckpt_announced = True
 
+    # Everything before this -- loading the checkpoint, building the critic, the sampler's first
+    # JAX compilation -- is one-off startup, and folding it into the per-control-step budget
+    # would make a long run read as a slow one.
+    eval_profiler.PROFILER.mark_startup_done()
+
     while succ_seed < test_num:
         # The run walks its seeds upward and the held-out set sits `HOLDOUT_SEED_OFFSET` above
         # the start, so a long run (or an unusually high expert reject rate) can eventually
@@ -1473,9 +1542,11 @@ def eval_policy(task_name,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
-        succ, episode_steps, episode_reward = rollout_episode(
-            TASK_ENV, model, eval_func, reset_func, use_step_reward,
-            on_observation=on_observation, on_step=on_step)
+        with eval_profiler.PROFILER.phase("rollout"):
+            succ, episode_steps, episode_reward = rollout_episode(
+                TASK_ENV, model, eval_func, reset_func, use_step_reward,
+                on_observation=on_observation, on_step=on_step)
+        eval_profiler.PROFILER.count("episodes")
         episode_seed = now_seed
         episode_results["episode"].append(TASK_ENV.test_num)
         episode_results["seed"].append(episode_seed)
@@ -1580,7 +1651,8 @@ def eval_policy(task_name,
         # critic` then copies from -- the evaluation changes nothing about the critic, so the
         # bytes are the same either way, but the copy needs the file to exist.
         if save_critic and online_critic is not None:
-            save_critic_atomically(online_critic, critic_path)
+            with eval_profiler.PROFILER.span("critic.save_checkpoint"):
+                save_critic_atomically(online_critic, critic_path)
             if not critic_ckpt_announced:
                 print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
                       f"{critic_path} (set `critic_ckpt` to it to resume this run); the best "
@@ -1652,6 +1724,10 @@ def eval_policy(task_name,
                 best_score, best_score_episode, best_criterion = score, TASK_ENV.test_num, criterion
                 print(f"\033[96m[critic]\033[0m new best: {criterion} "
                       f"{best_score:.3f} -> {best_critic_path.name}")
+        # Refreshed every episode rather than only at the end: an eval slow enough to be worth
+        # profiling is one you are likely to kill, and the report is a few kB.
+        if eval_profiler.PROFILER.enabled:
+            eval_profiler.PROFILER.dump(save_dir)
         write_resume_state(save_dir, {
             "episodes": succ_seed,
             "successes": TASK_ENV.suc,
@@ -1691,7 +1767,8 @@ def parse_args_and_config():
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
-    with Path(args.config).open("r", encoding="utf-8") as f:
+    config_path = Path(args.config)
+    with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     def parse_override_pairs(pairs):
@@ -1708,6 +1785,45 @@ def parse_args_and_config():
 
     overrides = parse_override_pairs(args.overrides) if args.overrides else {}
 
+    # ===== Resuming: the run's own config, not the working tree's =====
+    # Every run snapshots its deploy config (and the critic config it includes) into its result
+    # directory with the values actually used written in (`snapshot_config`). Resuming reads
+    # those back instead of the working-tree ymls, because the ymls have moved on -- they
+    # describe the run being set up next, and a resumed run must continue with the settings its
+    # episodes, its seed sequence and its critic were produced under. It also means a resume
+    # needs no knobs on the command line: `--resume <dir>` is the whole instruction, and a
+    # `--critic-ckpt` (or guidance, or reward) flag meant for some *other* submission cannot
+    # reach it.
+    resume_dir = overrides.get("resume")
+    if resume_dir is not None and as_bool_or_none(resume_dir) is None:
+        resume_dir = Path(str(resume_dir)).expanduser()
+        snapshot = resume_dir / config_path.name
+        if not snapshot.is_file():
+            raise FileNotFoundError(
+                f"resume: {resume_dir} has no {config_path.name} snapshot to continue from. "
+                "Runs from before config snapshotting have to be resumed by pointing --config "
+                "at a config that matches what they were launched with."
+            )
+        config_path = snapshot
+        with config_path.open("r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+        # The identity keys are the run's, full stop. eval.sh passes them positionally on every
+        # invocation, so they arrive here whether or not the caller meant to set them -- compare
+        # rather than apply, and say which one disagrees.
+        mismatched = {k: (config.get(k), overrides[k]) for k in IDENTITY_KEYS
+                      if k in overrides and overrides[k] != config.get(k)}
+        if mismatched:
+            detail = "\n".join(f"  {k}: run is {was!r}, command says {now!r}"
+                               for k, (was, now) in sorted(mismatched.items()))
+            raise ValueError(
+                f"resume: {resume_dir} was not launched with these settings.\n{detail}\n"
+                "A resumed run continues the experiment in the directory; these keys cannot be "
+                "changed. Drop them, or start a new run instead of resuming."
+            )
+        for key in IDENTITY_KEYS:
+            overrides.pop(key, None)
+
     # Policy-specific hyperparameters may be factored out into a file that ships with the
     # implementation they configure (e.g. the critic config in the multisensory_steering
     # repo, so it stays in sync with the critic that reads it). Merge it in *underneath* the
@@ -1718,14 +1834,22 @@ def parse_args_and_config():
     # defaults of the file it replaced -- silently mixing two critic families' configs.
     include_path = overrides.get("critic_config_path", config.get("critic_config_path"))
     if include_path:
+        # Same reasoning as the deploy config above: a resumed run takes the critic config it
+        # was launched under, which is the copy in its own directory. The recorded path may name
+        # a checkout that has since been edited, or is not on this machine at all.
+        if config_path.parent != Path(args.config).parent:
+            snapshot = config_path.parent / Path(include_path).name
+            if snapshot.is_file():
+                include_path = str(snapshot)
         with Path(include_path).open("r", encoding="utf-8") as f:
             included = yaml.safe_load(f) or {}
         config = {**included, **config, "critic_config_path": include_path}
 
     config.update(overrides)
 
-    # Kept so `main` can copy the deploy config into the eval_result dir.
-    config["_config_path"] = args.config
+    # Kept so `main` can copy the deploy config into the eval_result dir. On a resume this is
+    # the snapshot itself, so re-snapshotting rewrites the file with the same content.
+    config["_config_path"] = str(config_path)
 
     return config
 

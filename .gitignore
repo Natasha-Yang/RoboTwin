@@ -50,3 +50,6 @@ envs/curobo_pi05
 envs/curobo_pi05/*
 # Miniforge installer blob (~100M).
 miniforge.sh
+
+policy/Motus/
+pretrained_models/

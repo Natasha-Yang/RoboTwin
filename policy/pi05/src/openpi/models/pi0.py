@@ -437,13 +437,20 @@ class Pi0(_model.BaseModel):
         becomes ``(actions, {"action_features": feats})`` where ``feats`` has shape
         ``(batch, num_steps, action_horizon, feature_dim)``.
 
-        If ``critic_apply``/``critic_params`` are provided, the denoising is steered by QMFM's
-        exact denoised-estimate gradient guidance (``QMFM/agents/mfm.py::compute_flow_actions``,
-        ``steer_use_denoised_estimate=True``): at each step the clean action chunk is estimated
-        (``x1 = x_t - t*v``), the value gradient ``grad_V = d/d(x_t) mean_k Q(obs, x1)`` is taken
-        **through** the velocity field, rescaled to the velocity norm, and ``guidance_scale``
-        (QMFM's ``steering_coeff``) times it steers the velocity. ``critic_apply(params, obs,
-        action)`` is the JAX apply of the QMFM ``Value`` ensemble (``multisensory_steering``); ``params``
+        If ``critic_apply``/``critic_params`` are provided, the denoising is steered by Universal
+        Guidance (Bansal et al. 2023, adapted for flow matching), matching
+        ``steering-with-failures``' ``steered_ode.py::make_universal_guidance_fn``: at each step
+        the clean action chunk is estimated by Tweedie (``x1 = clip(x_t - t*v, -1, 1)``), the
+        value gradient ``grad_V = d/d(x_t) mean_k Q(obs, x1)`` is taken **through** the velocity
+        field, rescaled to the velocity norm (QMFM's ``steer_use_sigma_t=False``, Eq 129), and
+        ``guidance_scale`` (QMFM's ``steering_coeff``) times it steers the velocity. The ``t=1``
+        step is taken **unsteered**: there ``x_t`` is pure noise, so its Tweedie estimate carries
+        no signal worth differentiating. The returned chunk is clipped to ``[-1, 1]`` as well --
+        pi0.5 normalizes actions by quantiles, so that is the action range (see ``x1_estimate``).
+        Both clips are on this path only; the unguided and best-of-N-only paths are untouched.
+
+        ``critic_apply(params, obs, action)`` is the JAX apply of the QMFM ``Value`` ensemble
+        (``multisensory_steering``); ``params``
         is a traced pytree (so online critic updates need no recompile), ``guidance_scale`` is a
         traced scalar (so online schedules do not recompile per value), and ``critic_apply`` is a
         static arg. Returns ``(actions, {"critic_obs_siglip", "critic_obs_state",
@@ -672,15 +679,24 @@ class Pi0(_model.BaseModel):
                 # picks all `action_horizon` rows outright.
                 noise_chunk, noise = noise_apply(actor_params, critic_obs_n, noise_rng)
 
-        def denoise(step_fn):
-            """Integrate `step_fn` from t=1 (noise) down to t=0, returning the clean chunk."""
+        def denoise(step_fn, first_step_fn=None):
+            """Integrate `step_fn` from t=1 (noise) down to t=0, returning the clean chunk.
+
+            `first_step_fn` takes the t=1 step instead, when the first step is special: the
+            guided path takes it unsteered (see `guided_step`). `cond` is on the time carried
+            in the loop rather than on a step counter, so the total is `num_steps` integrator
+            steps either way -- one of them just runs ahead of the loop.
+            """
 
             def cond(carry):
                 _, time = carry
                 # robust to floating-point error
                 return time >= -dt / 2
 
-            x_0, _ = jax.lax.while_loop(cond, step_fn, (noise, 1.0))
+            carry = (noise, 1.0)
+            if first_step_fn is not None:
+                carry = first_step_fn(carry)
+            x_0, _ = jax.lax.while_loop(cond, step_fn, carry)
             return x_0
 
         if has_critic:
@@ -724,19 +740,27 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt
 
         if steer:
-            # QMFM-exact denoised-estimate gradient guidance
-            # (QMFM/agents/mfm.py::compute_flow_actions, steer_use_denoised_estimate=True).
+            # Universal Guidance (Bansal et al. 2023) for flow matching, matching
+            # steering-with-failures' steered_ode.py::make_universal_guidance_fn. The gradient
+            # rescale below is QMFM's (agents/mfm.py::compute_flow_actions).
 
             def guided_step(carry):
                 x_t, time = carry
                 v_t = self.action_out_proj(action_expert_features(x_t, time))
 
                 def x1_estimate(a):
-                    # Clean action estimate (flow target at t=0): x1 = x_t - t*v, differentiated
-                    # THROUGH the velocity field (QMFM). QMFM clips to [-1, 1]; pi0.5 normalized
-                    # actions are ~standardized (not hard-bounded), so we skip the clip.
+                    # Tweedie estimate of the clean action (flow target at t=0): x1 = x_t - t*v,
+                    # differentiated THROUGH the velocity field.
+                    #
+                    # Clipped to [-1, 1] because that IS pi0.5's action range: for a pi05 model
+                    # `DataConfigFactory.create_base_config` sets `use_quantile_norm=True`
+                    # (training/config.py), so actions go through `Normalize._normalize_quantile`
+                    # -- q01 maps to -1 and q99 to +1. An estimate outside the box is off the
+                    # manifold the critic was fitted on. The clip zeroes the gradient in a
+                    # saturated dim, which is the point: the critic gets no say in pushing an
+                    # action further past the range it has ever seen.
                     v = self.action_out_proj(action_expert_features(a, time))
-                    return (a - time * v).astype(jnp.float32)
+                    return jnp.clip((a - time * v).astype(jnp.float32), -1.0, 1.0)
 
                 def value_fn(a):
                     # grad_V = d/d(x_t) mean_k Q(obs, x1(x_t)); .sum() over batch keeps per-sample grads.
@@ -761,7 +785,12 @@ class Pi0(_model.BaseModel):
                 # (uphill on the critic). `guidance_scale` is QMFM's steering_coeff (>0 ascends Q).
                 return x_t + dt * (v_t - guidance_scale * grad), time + dt
 
-            return finish(denoise(guided_step))
+            # The t=1 step runs the plain `step`: x_t is pure noise there, so `x1_estimate` is a
+            # Tweedie estimate from nothing and its gradient is noise the critic would be asked
+            # to follow anyway. The final chunk is clipped to the same [-1, 1] the estimate is,
+            # and clipped BEFORE `finish` so the chunk that gets executed, the one best-of-N
+            # ranks and the `critic_action` the replay buffer stores are all the same array.
+            return finish(jnp.clip(denoise(guided_step, first_step_fn=step), -1.0, 1.0))
 
         if has_critic:
             # Best-of-N with no steering: plain pi0.5 denoising for every candidate, and the
