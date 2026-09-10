@@ -31,7 +31,7 @@
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
 # Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
 # `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
-export QMFM_ROOT="${QMFM_ROOT:-/home/natashay/links/projects/def-florian7/natashay/QMFM}"
+export QMFM_ROOT="${QMFM_ROOT:-/home/natasha/QMFM}"
 # Compute nodes have no internet, and the guided path opens a W&B run per eval -- an online
 # wandb.init() there times out (90s) and can take the job with it. Log to disk instead and
 # `wandb sync` from a login node afterwards (cluster/wandb_sync.sh).
@@ -66,6 +66,9 @@ overrides=()
 # (`--eval_interval 20 --eval_episodes 10 --eval_seed 7`; `--eval_interval 0` turns it off).
 # `env_seed` is deliberately NOT among them: it is a task-config key, so that one file decides
 # the environment for collection and eval alike (see task_config/_config_template.yml).
+# `--profile true` (or `cprofile` / `both`) is also passed this way: it turns on the wall-clock
+# breakdown in envs/utils/eval_profiler.py and writes `_profile.txt` into the run's result dir.
+# Off by default, and off means the hooks are never installed.
 [ "$#" -gt 12 ] && overrides+=("${@:13}")
 
 # Required. An empty gpu_id would `export CUDA_VISIBLE_DEVICES=`, which CUDA reads as "no

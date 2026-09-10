@@ -33,6 +33,7 @@ from envs import CONFIGS_PATH
 from envs._base_task import resolve_background_texture_pool
 from envs.utils.create_actor import UnStableError
 from envs.utils.debug_vis import DemoRetrievalRecorder, QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
+from envs.utils import eval_profiler
 
 import numpy as np
 from pathlib import Path
@@ -768,6 +769,14 @@ def main(usr_args):
     save_dir.mkdir(parents=True, exist_ok=True)
     args["eval_save_dir"] = str(save_dir)
 
+    # Profiling (`profile:` in deploy_policy.yml, or `--profile true` through eval.sh's
+    # pass-through overrides). Off by default and off means *not installed* -- nothing is
+    # wrapped and the run is byte-identical to one that never heard of the profiler. Installed
+    # here because the hooks are class patches that must be in place before the env, the policy
+    # and the critic are built, and because the report needs `save_dir` to exist.
+    profile_mode = eval_profiler.parse_flag(usr_args.get("profile"))
+    profiler = eval_profiler.install(profile_mode) if profile_mode != "off" else None
+
     resume_state = load_resume_state(save_dir) if resume_dir is not None else None
     if resume_state is not None:
         print(f"\033[93m[resume] continuing {save_dir}\033[0m")
@@ -852,6 +861,9 @@ def main(usr_args):
     print("\n==================================")
 
     TASK_ENV = class_decorator(args["task_name"])
+    # `setup_demo` / `play_once` / `check_success` are defined by the task, not by `Base_Task`,
+    # so the profiler can only wrap them once the concrete class exists. No-op when off.
+    eval_profiler.install_env(TASK_ENV)
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
@@ -914,16 +926,31 @@ def main(usr_args):
                             resume_id=(resume_state or {}).get("wandb_run_id"))
                  if _uses_online_critic(model) else None)
 
-    st_seed, suc_num, episode_results = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type,
-                                   wandb_run=wandb_run,
-                                   resume_state=resume_state)
+    # The profiled region is the seed loop and nothing else: model loading and the JAX
+    # compilation it triggers are one-off startup, and folding them into the per-control-step
+    # numbers would make a long run look like a slow one.
+    try:
+        with eval_profiler.cprofile_to(save_dir / "_profile_cprofile",
+                                       enabled=profile_mode in ("cprofile", "both")):
+            st_seed, suc_num, episode_results = eval_policy(
+                task_name,
+                TASK_ENV,
+                args,
+                model,
+                st_seed,
+                test_num=test_num,
+                video_size=video_size,
+                instruction_type=instruction_type,
+                wandb_run=wandb_run,
+                resume_state=resume_state)
+    finally:
+        # Also on the way out of a crash or a Ctrl-C -- which is the run you most want the
+        # numbers for.
+        if profiler is not None:
+            print(profiler.dump(save_dir, extra=[
+                f"task {task_name}, config {task_config}, ckpt {ckpt_setting}",
+                f"written to {save_dir / '_profile.txt'} (and _profile.json)",
+            ]))
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -1007,11 +1034,12 @@ def run_expert_check(TASK_ENV, args, seed, now_ep_num):
     render_freq = args["render_freq"]
     args["render_freq"] = 0
     try:
-        TASK_ENV.setup_demo(now_ep_num=now_ep_num, seed=seed, is_test=True, **args)
-        episode_info = TASK_ENV.play_once()
-        solved = TASK_ENV.plan_success and TASK_ENV.check_success()
-        TASK_ENV.close_env()
-        return episode_info if solved else None
+        with eval_profiler.PROFILER.phase("expert_check"):
+            TASK_ENV.setup_demo(now_ep_num=now_ep_num, seed=seed, is_test=True, **args)
+            episode_info = TASK_ENV.play_once()
+            solved = TASK_ENV.plan_success and TASK_ENV.check_success()
+            TASK_ENV.close_env()
+            return episode_info if solved else None
     except UnStableError:
         TASK_ENV.close_env()
         return None
@@ -1059,6 +1087,9 @@ def rollout_episode(TASK_ENV, model, eval_func, reset_func, use_step_reward,
         observation = TASK_ENV.get_obs()
         if on_observation is not None:
             on_observation(step, observation)
+        # One chunk sampled and `pi0_step` of it executed -- the unit the profile's per-step
+        # budget is over.
+        eval_profiler.PROFILER.count("control_steps")
         eval_func(TASK_ENV, model, observation)
         success_now = bool(TASK_ENV.eval_success)
         reward = control_step_reward(TASK_ENV, success_now, prev_success, use_step_reward)
@@ -1137,7 +1168,7 @@ def run_holdout_eval(TASK_ENV, args, model, eval_func, reset_func, seeds, info_c
     successes = 0
     rewards, steps = [], []
     try:
-        with frozen_for_eval(model):
+        with eval_profiler.PROFILER.phase("holdout"), frozen_for_eval(model):
             for idx, seed in enumerate(seeds):
                 # The instruction is built from the expert run's `info` placeholders, which is
                 # why the gate's `info` was cached: the scene is a function of the seed, so the
@@ -1451,6 +1482,11 @@ def eval_policy(task_name,
                       f"{save_every_updates} updates to {critic_path}")
                 periodic_ckpt_announced = True
 
+    # Everything before this -- loading the checkpoint, building the critic, the sampler's first
+    # JAX compilation -- is one-off startup, and folding it into the per-control-step budget
+    # would make a long run read as a slow one.
+    eval_profiler.PROFILER.mark_startup_done()
+
     while succ_seed < test_num:
         # The run walks its seeds upward and the held-out set sits `HOLDOUT_SEED_OFFSET` above
         # the start, so a long run (or an unusually high expert reject rate) can eventually
@@ -1506,9 +1542,11 @@ def eval_policy(task_name,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
-        succ, episode_steps, episode_reward = rollout_episode(
-            TASK_ENV, model, eval_func, reset_func, use_step_reward,
-            on_observation=on_observation, on_step=on_step)
+        with eval_profiler.PROFILER.phase("rollout"):
+            succ, episode_steps, episode_reward = rollout_episode(
+                TASK_ENV, model, eval_func, reset_func, use_step_reward,
+                on_observation=on_observation, on_step=on_step)
+        eval_profiler.PROFILER.count("episodes")
         episode_seed = now_seed
         episode_results["episode"].append(TASK_ENV.test_num)
         episode_results["seed"].append(episode_seed)
@@ -1613,7 +1651,8 @@ def eval_policy(task_name,
         # critic` then copies from -- the evaluation changes nothing about the critic, so the
         # bytes are the same either way, but the copy needs the file to exist.
         if save_critic and online_critic is not None:
-            save_critic_atomically(online_critic, critic_path)
+            with eval_profiler.PROFILER.span("critic.save_checkpoint"):
+                save_critic_atomically(online_critic, critic_path)
             if not critic_ckpt_announced:
                 print(f"\033[96m[critic]\033[0m checkpointing after every episode to "
                       f"{critic_path} (set `critic_ckpt` to it to resume this run); the best "
@@ -1685,6 +1724,10 @@ def eval_policy(task_name,
                 best_score, best_score_episode, best_criterion = score, TASK_ENV.test_num, criterion
                 print(f"\033[96m[critic]\033[0m new best: {criterion} "
                       f"{best_score:.3f} -> {best_critic_path.name}")
+        # Refreshed every episode rather than only at the end: an eval slow enough to be worth
+        # profiling is one you are likely to kill, and the report is a few kB.
+        if eval_profiler.PROFILER.enabled:
+            eval_profiler.PROFILER.dump(save_dir)
         write_resume_state(save_dir, {
             "episodes": succ_seed,
             "successes": TASK_ENV.suc,

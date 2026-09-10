@@ -9,6 +9,8 @@ in the online (eval) and offline (rollout-dataset) paths:
     ``images.third_view``                                              (H, W, 3) uint8
     ``depth.head``      ``depth.left_wrist``   ``depth.right_wrist``   (H, W) float32, mm
     ``pointcloud``      (N, 6) float32, world-frame xyz + rgb
+    ``endpose.<arm>_endpose``                  (7,) float32, world-frame xyz + wxyz quat
+    ``endpose.<arm>_gripper``                  (1,) float32, normalized gripper width
     ``wrench.<link>``   ``wrench.<arm>``       (num_steps, 6) float32, world-frame contact
                                                wrench per primitive step, at both
                                                granularities, see below
@@ -22,8 +24,8 @@ is that same camera as seen by pi0.5's own image tower, for every view the polic
 both wrists). Taking one here as raw pixels is a second, much cheaper to train and much weaker,
 encoding of a frame the critic can already see through the policy's encoder.
 
-Not included yet: the segmentation / endpose / camera-matrix entries, which rollout datasets
-record but no critic encoder consumes. Adding one is a line here plus an encoder in the critic.
+Not included yet: the segmentation / camera-matrix entries, which rollout datasets record but
+no critic encoder consumes. Adding one is a line here plus an encoder in the critic.
 """
 
 import numpy as np
@@ -56,10 +58,11 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     was made with.
 
     Arrays are handed over raw, in their natural dtype -- rgb as uint8, depth in millimetres,
-    point clouds in world metres plus 0-255 rgb, wrench in N / N*m -- and carry NaN where a
-    chunk ended early. Scaling and NaN handling belong to the critic's per-modality encoders,
-    which are the only thing that knows what range its network wants; keeping the raw dtype
-    here also keeps a camera frame at a quarter of the bytes through the replay buffer.
+    point clouds in world metres plus 0-1 rgb, endposes in world metres plus a unit quaternion,
+    wrench in N / N*m -- and carry NaN where a chunk ended early. Scaling and NaN handling
+    belong to the critic's per-modality encoders, which are the only thing that knows what range
+    its network wants; keeping the raw dtype here also keeps a camera frame at a quarter of the
+    bytes through the replay buffer.
     """
     mods = {}
     for cam_name, cam_obs in observation.get("observation", {}).items():
@@ -75,6 +78,15 @@ def obs_modalities(observation, step_wrench=(), num_steps=0):
     pointcloud = observation.get("pointcloud", [])
     if len(pointcloud) > 0:
         mods["pointcloud"] = np.asarray(pointcloud, dtype=np.float32)
+
+    # Each arm's end-effector pose and normalized gripper width, when `data_type.endpose` is on.
+    # Reshaped to 1-D so the gripper's scalar arrives as `(1,)`, which is the width the demo and
+    # rollout datasets store it at. The pose is the arm's move-group link (aloha: `fl_link6`) in
+    # world coordinates with the embodiment's axis convention applied, i.e. 0.12 m *behind* the
+    # TCP the wrench's torque is taken about -- `envs/robot/robot.py::_trans_endpose` subtracts
+    # that from `gripper_bias` for `get_..._ee_pose` and not for `get_..._tcp_pose`.
+    for key, value in observation.get("endpose", {}).items():
+        mods[f"endpose.{key}"] = np.asarray(value, dtype=np.float32).reshape(-1)
 
     # Both granularities, since the env logs both (`envs/utils/wrench.py::wrench_vectors`): one
     # per-primitive-step trace per end-effector link -- aloha's `wrench.fl_link7`, `wrench.fl_link8`,
