@@ -18,6 +18,8 @@ off never pays for them.
 """
 
 from pathlib import Path
+from dataclasses import asdict, is_dataclass
+import json
 
 import numpy as np
 
@@ -108,6 +110,112 @@ class RolloutFrameLog:
     def flush(self):
         """Drop the episode's frames. Called after every recorder has rendered its GIF."""
         self._reset()
+
+
+class ScriptedInterventionRecorder:
+    """Scripted recovery attempts -> labeled GIFs, Q-drop plot and machine-readable metadata.
+
+    This intentionally owns its frames instead of using ``RolloutFrameLog``: recovery begins
+    only after the autonomous recorders have flushed, rewinds the sim-time axis, and must not
+    make the failed rollout's debug GIF appear to have succeeded.
+    """
+
+    def __init__(self, debug_save_dir):
+        self.debug_save_dir = Path(debug_save_dir)
+        self._reset()
+
+    def _reset(self):
+        self.attempts = []
+
+    def record_attempt(self, snapshot_index, frames, success, restore_report):
+        images = []
+        for frame in frames:
+            rgb = frame.get("images", {}).get("cam_high")
+            if rgb is None:
+                continue
+            rgb = np.asarray(rgb, dtype=np.uint8)
+            if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4):
+                rgb = rgb.transpose(1, 2, 0)
+            images.append(rgb[..., :3].copy())
+        self.attempts.append({
+            "snapshot_index": int(snapshot_index),
+            "success": bool(success),
+            "restore_exact": bool(restore_report.exact),
+            "restore_max_abs_error": float(restore_report.max_abs_error),
+            "restore_mismatches": list(restore_report.mismatches),
+            "frames": images,
+        })
+
+    def flush(self, episode_idx, result):
+        if not self.attempts and result is None:
+            return
+        out_dir = self.debug_save_dir / f"episode{episode_idx}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            from PIL import Image, ImageDraw
+
+            for attempt_index, attempt in enumerate(self.attempts):
+                rendered = []
+                for frame_index in gif_frame_indices(len(attempt["frames"])):
+                    image = Image.fromarray(attempt["frames"][frame_index])
+                    if image.width > DEBUG_GIF_FRAME_WIDTH:
+                        scale = DEBUG_GIF_FRAME_WIDTH / image.width
+                        image = image.resize(
+                            (DEBUG_GIF_FRAME_WIDTH, max(1, round(image.height * scale))),
+                            Image.BILINEAR,
+                        )
+                    draw = ImageDraw.Draw(image)
+                    label = (f"expert attempt {attempt_index + 1} | snapshot "
+                             f"{attempt['snapshot_index']} | frame {frame_index} | "
+                             f"{'SUCCESS' if attempt['success'] else 'FAILED'}")
+                    draw.rectangle((0, 0, image.width, 18), fill=(0, 0, 0))
+                    draw.text((4, 3), label, fill=(255, 255, 255))
+                    rendered.append(image)
+                write_gif(
+                    out_dir / (f"intervention_attempt{attempt_index + 1}_snapshot"
+                               f"{attempt['snapshot_index']}.gif"),
+                    rendered,
+                )
+
+            payload = asdict(result) if is_dataclass(result) else dict(result or {})
+            # Under its own key: `result.attempts` already carries every attempt including the
+            # ones rejected before a rollout, which are exactly the ones with no frames here.
+            payload["rendered_attempts"] = [
+                {k: v for k, v in attempt.items() if k != "frames"}
+                | {"num_frames": len(attempt["frames"])}
+                for attempt in self.attempts
+            ]
+            (out_dir / f"intervention_episode{episode_idx}.json").write_text(
+                json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8"
+            )
+            self._save_q_plot(out_dir, episode_idx, payload)
+            print(f"\033[93m[debug] scripted intervention written to "
+                  f"{out_dir}/intervention_*\033[0m")
+        except Exception as exc:
+            print(f"[debug] scripted intervention output failed: {exc}")
+        self._reset()
+
+    @staticmethod
+    def _save_q_plot(out_dir, episode_idx, payload):
+        q = np.asarray(payload.get("q_values", ()), dtype=np.float64)
+        if q.size == 0:
+            return
+        plt = agg_pyplot()
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(np.arange(q.size), q, marker="o", label="episode-start target Q mean")
+        drop = payload.get("drop_index")
+        rewind = payload.get("requested_snapshot")
+        if drop is not None:
+            ax.axvline(drop, color="tab:red", linestyle="--", label="largest Q drop")
+        if rewind is not None:
+            ax.axvline(rewind, color="tab:green", linestyle=":", label="requested rewind")
+        ax.set_xlabel("autonomous control chunk")
+        ax.set_ylabel("frozen target Q")
+        ax.set_title(f"episode {episode_idx} — post-failure intervention schedule")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / f"intervention_q_episode{episode_idx}.png", dpi=100)
+        plt.close(fig)
 
 
 WRENCH_AXIS_LENGTH = 0.08  # metres; length of the world frame arrows drawn on the rollout

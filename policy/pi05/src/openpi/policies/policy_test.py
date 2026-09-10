@@ -1,9 +1,29 @@
 from openpi_client import action_chunk_broker
+import numpy as np
 import pytest
 
+from openpi import transforms
 from openpi.policies import aloha_policy
+from openpi.policies.policy import Policy
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
+
+
+def test_transform_input_does_not_mutate_expert_action_targets():
+    policy = object.__new__(Policy)
+    policy._input_transform = transforms.compose([
+        aloha_policy.AlohaInputs(adapt_to_pi=False),
+        transforms.DeltaActions(transforms.make_bool_mask(6, -1, 6, -1)),
+    ])
+    sample = aloha_policy.make_aloha_example()
+    sample["actions"] = np.full((2, 14), 2.0, dtype=np.float32)
+    original = sample["actions"].copy()
+
+    first = policy.transform_input(sample)["actions"]
+    second = policy.transform_input(sample)["actions"]
+
+    np.testing.assert_array_equal(sample["actions"], original)
+    np.testing.assert_array_equal(first, second)
 
 
 @pytest.mark.manual

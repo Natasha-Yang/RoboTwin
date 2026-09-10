@@ -77,11 +77,22 @@ class Policy(BasePolicy):
             )
             self._rng = rng or jax.random.key(0)
 
+    def transform_input(self, obs: dict) -> dict:
+        """Apply this checkpoint's real input/normalization transform to a copied sample."""
+        # Several stock transforms intentionally edit actions in place (DeltaActions does
+        # ``actions -= state``).  Copying only the pytree containers would therefore mutate a
+        # captured expert sample, and a later inversion/re-denoise pass would apply the delta
+        # conversion a second time. Ordinary inference has no action target, so retain its old
+        # allocation behavior; expert/training inputs copy mutable leaves before transforming.
+        copy_leaves = "actions" in obs
+        inputs = jax.tree.map(
+            lambda x: x.copy() if copy_leaves and hasattr(x, "copy") else x, obs
+        )
+        return self._input_transform(inputs)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        inputs = self.transform_input(obs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -138,6 +149,19 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    @property
+    def model(self) -> _model.BaseModel:
+        """The loaded model, exposed to checkpoint-compatible adaptation code."""
+        return self._model
+
+    @property
+    def action_horizon(self) -> int:
+        return self._model.action_horizon
+
+    @property
+    def action_dim(self) -> int:
+        return self._model.action_dim
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

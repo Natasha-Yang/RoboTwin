@@ -156,7 +156,7 @@ profile: false
 # (`critic_ramp_baseline` in resume_state.json) instead of climbing the ramp a second time.
 # Both are overridable as eval.sh's 7th / 8th positional args.
 #
-# Whether that critic also *learns* here is `train_online` in the `critic_config_path` file
+# Whether that critic also *learns* here is `train_online` in the `adaptation_config_path` file
 # below, with `freeze_encoder` next to it for the half-way point (keep the checkpoint's
 # observation encoder, keep training the value head). `train_online: false` freezes the critic
 # at `critic_ckpt` entirely: it still steers, but nothing is stashed into the replay buffer and
@@ -178,7 +178,7 @@ profile: false
 # Cost: the SigLIP tower and the prefix pass are shared across candidates, so only the
 # denoising loop and the prefix KV cache scale with n. Overridable as eval.sh's 11th arg.
 best_of_n: 1
-guidance_scale: 0
+guidance_scale: 0.0
 guidance_ramp_updates: 500
 # The reward the run scores itself with -- what `commit()` feeds the online critic, what the
 # W&B reward curves and the per-episode `reward` column in _episode_results.csv measure:
@@ -295,4 +295,4 @@ critic_ckpt: "eval_result/open_microwave/pi05/demo_clean/robotwin_clean_ep25/202
 #                              score an action chunk).
 #
 # Swap it here, or per run as eval.sh's 12th positional argument.
-critic_config_path: /home/natasha/multisensory-steering/cfgs/qmfm_small.yaml
+adaptation_config_path: # /home/natasha/multisensory-steering/cfgs/qmfm_small.yaml

@@ -32,7 +32,14 @@ sys.path.append("./description/utils")
 from envs import CONFIGS_PATH
 from envs._base_task import resolve_background_texture_pool
 from envs.utils.create_actor import UnStableError
-from envs.utils.debug_vis import DemoRetrievalRecorder, QValueRecorder, RolloutFrameLog, TCPWrenchRecorder
+from envs.utils.debug_vis import (
+    DemoRetrievalRecorder,
+    QValueRecorder,
+    RolloutFrameLog,
+    ScriptedInterventionRecorder,
+    TCPWrenchRecorder,
+)
+from envs.utils.obs_modalities import obs_modalities
 from envs.utils import eval_profiler
 
 import numpy as np
@@ -98,6 +105,8 @@ def init_wandb(usr_args, save_dir, current_time, resume_id=None):
     wandb.define_metric("rollout/*", step_metric="critic/update")
     wandb.define_metric("eval/episode")
     wandb.define_metric("eval/*", step_metric="eval/episode")
+    wandb.define_metric("intervention/episode")
+    wandb.define_metric("intervention/*", step_metric="intervention/episode")
     # The periodic held-out evaluation (`eval_interval`), logged against the training episode it
     # ran after -- so its curve lines up with `eval/success_rate_ma`, the criterion it replaces.
     wandb.define_metric("holdout/*", step_metric="eval/episode")
@@ -810,12 +819,13 @@ def main(usr_args):
             print("\033[93m[resume] the replay buffer is not checkpointed -- it refills from "
                   "empty before TD updates restart\033[0m")
 
-    # Snapshot the deploy config (and the critic config it includes) next to the results, with
+    # Snapshot the deploy config (and the adaptation config it includes) next to the results, with
     # the CLI overrides written in, so a run's settings stay readable -- and accurate -- after
     # the ymls are edited.
-    for config_path in (usr_args.get("_config_path"), usr_args.get("critic_config_path")):
-        if config_path and Path(config_path).is_file():
-            snapshot_config(config_path, usr_args, save_dir)
+    for config_path in (usr_args.get("_config_path"), usr_args.get("adaptation_config_path")):
+        expanded_path = Path(config_path).expanduser() if config_path else None
+        if expanded_path is not None and expanded_path.is_file():
+            snapshot_config(expanded_path, usr_args, save_dir)
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
@@ -882,6 +892,21 @@ def main(usr_args):
     args["critic_save_every_updates"] = usr_args.get("critic_save_every_updates", 200)
     # Off leaves the sparse terminal reward, which is what the critic is then trained on.
     args["use_step_reward"] = usr_args["use_step_reward"]
+    # Post-failure adaptation is configured beside the critic, in the included
+    # `adaptation_config_path`, while `eval_policy` receives the task config (`args`). Forward
+    # just the lifecycle knobs it consumes; the critic's own keys already travel through
+    # deploy_policy.get_model.
+    for key in (
+        "post_failure_intervention", "adaptation_adapter",
+        "rewind_control_steps", "retry_rewind_control_steps", "intervention_start_episode",
+        "intervention_chunk_offsets",
+        "q_reduction", "q_source", "intervention_replay_fraction", "restore_atol",
+        "inversion_num_steps", "inversion_fixed_point_iterations",
+        "inversion_batch_size", "inversion_mse_threshold",
+        "inversion_audit_fraction", "inversion_audit_seed",
+    ):
+        if key in usr_args:
+            args[key] = usr_args[key]
     # Fixed length of the `wrench.*` trace a control step sees, and the cap on the env's log
     # (`_base_task._init_task_env_`). The env commits one row per primitive step, so a chunk
     # drains exactly the policy's steps-per-call and `pi0_step` is the right width -- the config
@@ -1353,6 +1378,46 @@ def eval_policy(task_name,
     # whenever the policy is actually choosing between candidates.
     best_of_n = int(getattr(model, "best_of_n", 1) or 1)
     best_of_n_recorder = BestOfNRecorder() if best_of_n > 1 else None
+
+    # The included adaptation config chooses the external lifecycle adapter dynamically. Most
+    # implementation remains in multisensory-steering; this driver supplies only environment
+    # callbacks and the existing debug output location.
+    intervention = None
+    intervention_recorder = None
+    intervention_enabled = as_bool(args.get("post_failure_intervention"), False)
+    if intervention_enabled and _uses_online_critic(model):
+        if not train_critic:
+            raise ValueError("post_failure_intervention requires train_online: true")
+        adapter_spec = str(args.get(
+            "adaptation_adapter",
+            "multisensory_steering.interventions.robotwin:build_adapter",
+        ))
+        module_name, separator, factory_name = adapter_spec.partition(":")
+        if not separator:
+            raise ValueError("adaptation_adapter must have the form 'module:function'")
+        factory = getattr(importlib.import_module(module_name), factory_name)
+        intervention_recorder = (
+            ScriptedInterventionRecorder(debug_save_dir) if debug else None
+        )
+        intervention = factory(
+            args,
+            model,
+            output_dir=save_dir,
+            reward_fn=control_step_reward,
+            obs_modalities_fn=obs_modalities,
+            debug_recorder=intervention_recorder,
+        )
+        start_episode = int(args.get("intervention_start_episode", 0) or 0)
+        print("\033[95mPost-failure expert intervention:\033[0m ON "
+              f"(adapter {adapter_spec}, debug={'ON' if debug else 'OFF'}, "
+              + (f"from episode {start_episode} -- the first {start_episode} are autonomous "
+                 "warm-up for the critic)" if start_episode > 0 else "from episode 0)"))
+    elif intervention_enabled:
+        # The shared adaptation config is also included by the plain pi0.5 baseline.  With
+        # guidance_scale=0 and best_of_n=1 there is deliberately no critic, hence no Q-drop
+        # schedule or replay to intervene into; keep that established baseline runnable.
+        print("\033[95mPost-failure expert intervention:\033[0m OFF "
+              "(plain pi0.5 baseline has no critic)")
     if best_of_n_recorder is not None:
         print(f"\033[96m[critic]\033[0m best-of-{best_of_n} sampling ON: {best_of_n} candidate "
               f"chunks per control step, highest ensemble-mean Q executed")
@@ -1428,6 +1493,8 @@ def eval_policy(task_name,
     # writes no debug output, feeds nothing to the recorders, and above all collects no
     # transition and runs no TD update.
     def on_observation(step, observation):
+        if intervention is not None:
+            intervention.pre_action_snapshot(TASK_ENV)
         if debug:
             visualize_debug_obs(
                 observation,
@@ -1439,8 +1506,29 @@ def eval_policy(task_name,
                 wrench_recorder=wrench_recorder,
             )
 
-    def on_step(step, observation, reward, success_now):
+    def train_for_collected_transition(episode_step):
         nonlocal chunk_count, last_info, periodic_ckpt_announced
+        online_critic = getattr(model, "online_critic", None) if train_critic else None
+        if online_critic is None:
+            return
+        chunk_count += 1
+        if chunk_count % train_freq != 0:
+            return
+        info = online_critic.train_step()
+        if info is None:
+            return
+        last_info = info
+        log_critic_update(wandb_run, online_critic, model, info, chunk_count,
+                          TASK_ENV.test_num, episode_step)
+        updates = int(online_critic.num_updates)
+        if save_every_updates and updates % save_every_updates == 0:
+            save_critic_atomically(online_critic, critic_path)
+            if not periodic_ckpt_announced:
+                print(f"\033[96m[critic]\033[0m also checkpointing every "
+                      f"{save_every_updates} updates to {critic_path}")
+                periodic_ckpt_announced = True
+
+    def on_step(step, observation, reward, success_now):
         # The chunk's Q only exists once the policy has sampled it, so unlike the wrench this is
         # logged after the control step -- but against `step`, the count the observation it was
         # drawn from was taken at, so it lines up with that frame.
@@ -1453,6 +1541,12 @@ def eval_policy(task_name,
         if best_of_n_recorder is not None:
             best_of_n_recorder.record(model)
 
+        # Read the stashed action before terminal commit clears it. The adapter's parameter tree
+        # was retained at episode start, so mid-episode Polyak/online updates do not move this
+        # diagnostic Q sequence.
+        if intervention is not None:
+            intervention.post_sampling_q(reward)
+
         # Online critic: close the chunk transition (SARSA), then run a TD update. Skipped for a
         # frozen critic -- it guides, but its parameters and buffer stay untouched.
         online_critic = getattr(model, "online_critic", None) if train_critic else None
@@ -1460,27 +1554,7 @@ def eval_policy(task_name,
             return
         done = success_now or (TASK_ENV.take_action_cnt >= TASK_ENV.step_lim)
         online_critic.commit(reward, done)
-        chunk_count += 1
-        if chunk_count % train_freq != 0:
-            return
-        info = online_critic.train_step()
-        if info is None:
-            return
-        last_info = info
-        log_critic_update(wandb_run, online_critic, model, info, chunk_count,
-                          TASK_ENV.test_num, TASK_ENV.take_action_cnt)
-        # Mid-episode checkpoint. The per-episode write below is the commit point, but an
-        # episode is up to `step_lim` control steps and so can be hundreds of TD updates long --
-        # a kill inside one would otherwise discard all of them. Counted on the critic's own
-        # lifetime `num_updates` rather than on `chunk_count`, so the cadence is in updates
-        # whatever `train_freq` is.
-        updates = int(online_critic.num_updates)
-        if save_every_updates and updates % save_every_updates == 0:
-            save_critic_atomically(online_critic, critic_path)
-            if not periodic_ckpt_announced:
-                print(f"\033[96m[critic]\033[0m also checkpointing every "
-                      f"{save_every_updates} updates to {critic_path}")
-                periodic_ckpt_announced = True
+        train_for_collected_transition(TASK_ENV.take_action_cnt)
 
     # Everything before this -- loading the checkpoint, building the critic, the sampler's first
     # JAX compilation -- is one-off startup, and folding it into the per-control-step budget
@@ -1512,6 +1586,9 @@ def eval_policy(task_name,
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         set_episode_instruction(TASK_ENV, args["task_name"], episode_info, instruction_type, test_num)
+
+        if intervention is not None:
+            intervention.begin_episode(TASK_ENV, TASK_ENV.test_num)
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -1565,6 +1642,43 @@ def eval_policy(task_name,
         if frame_log is not None:
             frame_log.flush()  # last: both GIFs above are drawn from it
 
+        recovery = None
+        if not succ and intervention is not None:
+            with eval_profiler.PROFILER.phase("expert_intervention"):
+                recovery = intervention.recover_failed_episode(
+                    TASK_ENV, TASK_ENV.test_num, use_step_reward=use_step_reward
+                )
+            # Each accepted expert transition gets one ordinary train-frequency opportunity;
+            # add_intervention_episode already stored it, so there is no second commit here.
+            for _ in range(recovery.inserted_transitions):
+                train_for_collected_transition(episode_steps)
+            if wandb_run is not None:
+                wandb_run.log({
+                    "intervention/episode": int(TASK_ENV.test_num),
+                    "intervention/expert_success": float(recovery.expert_success),
+                    "intervention/accepted_chunks": int(recovery.accepted_chunks),
+                    "intervention/rejected_chunks": int(recovery.rejected_chunks),
+                    "intervention/inserted_transitions": int(recovery.inserted_transitions),
+                    "intervention/corrections": int(recovery.interventions_inserted),
+                    "intervention/attempts": len(recovery.attempts),
+                    "intervention/restore_exact": float(bool(recovery.restore_exact)),
+                    "intervention/restore_max_abs_error": float(
+                        recovery.restore_max_abs_error or 0.0
+                    ),
+                    "intervention/buffer_size": int(recovery.intervention_buffer_size),
+                })
+            attempted = "/".join(
+                f"{r.snapshot_index}:{r.outcome.split(':')[0]}" for r in recovery.attempts
+            )
+            print(f"\033[95m[intervention]\033[0m {recovery.reason}: "
+                  f"rewind={recovery.requested_snapshot}, "
+                  f"attempts=[{attempted}], "
+                  f"corrections={recovery.interventions_inserted}, "
+                  f"accepted/rejected={recovery.accepted_chunks}/{recovery.rejected_chunks}, "
+                  f"inserted={recovery.inserted_transitions}")
+        if intervention_recorder is not None and recovery is not None:
+            intervention_recorder.flush(TASK_ENV.test_num, recovery)
+
         if succ:
             TASK_ENV.suc += 1
             print("\033[92mSuccess!\033[0m")
@@ -1612,7 +1726,7 @@ def eval_policy(task_name,
             model,
             TASK_ENV.test_num,
             succ,
-            TASK_ENV.take_action_cnt,
+            episode_steps,
             episode_reward,
             success_rate,
             success_rate_ma,
@@ -1825,14 +1939,15 @@ def parse_args_and_config():
             overrides.pop(key, None)
 
     # Policy-specific hyperparameters may be factored out into a file that ships with the
-    # implementation they configure (e.g. the critic config in the multisensory_steering
-    # repo, so it stays in sync with the critic that reads it). Merge it in *underneath* the
+    # implementation they configure (the adaptation config in multisensory-steering includes
+    # both the critic and intervention settings, so it stays in sync with the code that reads
+    # them). Merge it in *underneath* the
     # deploy config: precedence is CLI overrides > deploy config > included file.
     #
     # Which file that is has to be resolved against the overrides first, or `--overrides
-    # critic_config_path .../dsrl.yaml` would swap the recorded path while still merging in the
+    # adaptation_config_path .../dsrl.yaml` would swap the recorded path while still merging in the
     # defaults of the file it replaced -- silently mixing two critic families' configs.
-    include_path = overrides.get("critic_config_path", config.get("critic_config_path"))
+    include_path = overrides.get("adaptation_config_path", config.get("adaptation_config_path"))
     if include_path:
         # Same reasoning as the deploy config above: a resumed run takes the critic config it
         # was launched under, which is the copy in its own directory. The recorded path may name
@@ -1841,9 +1956,9 @@ def parse_args_and_config():
             snapshot = config_path.parent / Path(include_path).name
             if snapshot.is_file():
                 include_path = str(snapshot)
-        with Path(include_path).open("r", encoding="utf-8") as f:
+        with Path(include_path).expanduser().open("r", encoding="utf-8") as f:
             included = yaml.safe_load(f) or {}
-        config = {**included, **config, "critic_config_path": include_path}
+        config = {**included, **config, "adaptation_config_path": include_path}
 
     config.update(overrides)
 
