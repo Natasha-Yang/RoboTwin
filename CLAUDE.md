@@ -889,7 +889,7 @@ logs video (`eval_video_log`). Results go to
 `_episode_results.csv`, `_holdout_results.csv` when `eval_interval` is on (§5a.1), videos, and
 `debug_vis/` when the task config sets `debug`).
 
-Alongside those, each run snapshots `deploy_policy.yml` and the `critic_config_path`
+Alongside those, each run snapshots `deploy_policy.yml` and the `adaptation_config_path`
 file it includes into the result dir (`script/eval_policy.py::snapshot_config`). The
 copies keep their comments but carry the values **actually used** — `eval.sh`'s
 positional args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as
@@ -914,7 +914,7 @@ Or directly on an `salloc`'d GPU node:
 cd policy/pi05
 bash eval.sh <task_name> <task_config> <train_config_name> <model_name> <seed> <gpu_id> \
              [guidance_scale] [guidance_ramp_updates] [train_online] [use_step_reward] [best_of_n] \
-             [critic_config_path]
+             [adaptation_config_path]
 # baseline (no critic guidance)
 bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubsetLoraFT 0 0
 # online critic-guided
@@ -942,7 +942,7 @@ bash eval.sh beat_block_hammer demo_clean pi05_base_aloha_lora Pi05RoboTwinSubse
   Alongside `_result.txt` / `_episode_results.csv` (and `_holdout_results.csv`, the periodic
   frozen held-out score that picks the best critic checkpoint — §5a.1), each run snapshots
   `deploy_policy.yml` and the
-  `critic_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
+  `adaptation_config_path` file it includes into that dir (`script/eval_policy.py::snapshot_config`).
   The copies keep their comments but carry the values **actually used** — `eval.sh`'s positional
   args are written in, so `task_name`, `seed`, `guidance_scale` etc. read as resolved rather than
   as the `null`/default in the source yml.
@@ -1213,7 +1213,7 @@ episode, and takes `--family links|arms|all` for the same reason.
 > offline runs from a login node afterwards (`cluster/wandb_sync.sh`). To turn guidance on,
 > stage a critic checkpoint and set `guidance_scale` (or pass it as `eval.sh`'s 7th arg).
 >
-> Note `critic_config_path` is read **unconditionally** by `parse_args_and_config`, even
+> Note `adaptation_config_path` is read **unconditionally** by `parse_args_and_config`, even
 > at `guidance_scale: 0.0` — so if that path doesn't exist, *baseline* eval crashes too.
 > It points at the `multisensory-steering` checkout above; repoint it when porting.
 
@@ -1317,7 +1317,7 @@ separate the chunks the sampler draws and the extra `n`-fold denoising is buying
 
 
 How much of the critic online TD is then allowed to move is decided by two keys in the
-**critic config** (`critic_config_path`, i.e. `cfgs/qmfm.yaml` — not `deploy_policy.yml`, though
+**critic config** (`adaptation_config_path`, i.e. `cfgs/qmfm.yaml` — not `deploy_policy.yml`, though
 that file and the CLI can override them like any other critic key). Both only mean anything once
 a critic is running:
 
@@ -1492,8 +1492,8 @@ the first chunk; `PI0.scheduled_guidance_scale` subtracts the value at load time
 
 `guidance_scale` and `best_of_n` default to whatever `deploy_policy.yml` says; the positional args
 only override them (pass `0` and `1` to force the baseline). The critic's own hyperparameters are **not** in
-`deploy_policy.yml` — it carries `critic_config_path`, and `parse_args_and_config` merges that
-file in underneath, so precedence is **CLI > deploy_policy.yml > critic_config_path**. The
+`deploy_policy.yml` — it carries `adaptation_config_path`, and `parse_args_and_config` merges that
+file in underneath, so precedence is **CLI > deploy_policy.yml > adaptation_config_path**. The
 critic implementation and its config both come from the `multisensory_steering` package
 (editable install from `/lustre09/project/6028519/natashay/multisensory-steering`, config at
 `cfgs/qmfm.yaml`), which imports QMFM's `ReplayBuffer` from `$QMFM_ROOT` — see the status note
@@ -1905,12 +1905,12 @@ pushes the denoising around with a value gradient. DSRL
 sampler's **latent noise**: the agent's action is the noise chunk `w` pi0.5 denoises from, the
 environment's action is whatever the frozen policy turns `w` into, and SAC runs on `(s, w)`.
 
-It is selected by pointing `critic_config_path` at the other config — the family is that file's
+It is selected by pointing `adaptation_config_path` at the other config — the family is that file's
 own `critic_type`, and there is no scale to set:
 
 ```yaml
 # policy/pi05/deploy_policy.yml
-critic_config_path: /home/natasha/multisensory-steering/cfgs/dsrl.yaml   # `critic_type: dsrl`
+adaptation_config_path: /home/natasha/multisensory-steering/cfgs/dsrl.yaml   # `critic_type: dsrl`
 ```
 ```bash
 # or per run, as eval.sh's 12th positional arg (args 7 and 11 must stay 0 / 1)
@@ -1920,7 +1920,7 @@ bash eval.sh <task> <config> <train_config> <model> 0 0 "" "" "" "" "" \
 
 Naming the family **is** the switch. `guidance_scale != 0` or `best_of_n > 1` alongside it
 raises at startup: a Q over latents cannot score an action chunk, so there is nothing for either
-of them to guide or rank with. `--overrides critic_config_path ...` is resolved *before* the
+of them to guide or rank with. `--overrides adaptation_config_path ...` is resolved *before* the
 include is merged (`parse_args_and_config`), so swapping the file swaps the family and its
 defaults together rather than only the recorded path.
 
@@ -2422,7 +2422,7 @@ Notes:
   it imports `ReplayBuffer` from via `$QMFM_ROOT`. On Rorqual they are at
   `/lustre09/project/6028519/natashay/multisensory-steering` and
   `/home/natashay/links/projects/def-florian7/natashay/QMFM`, and `policy/pi05/eval.sh` exports
-  the `QMFM_ROOT` default. On a new cluster re-point that export and `critic_config_path`.
+  the `QMFM_ROOT` default. On a new cluster re-point that export and `adaptation_config_path`.
   Two traps:
   - **`multisensory_steering` is `import`ed, so it must be installed into `policy/pi05/.venv`**,
     not merely cloned. Editable, and **`--no-deps`** — its pyproject lists `jax` unpinned and
@@ -2434,7 +2434,7 @@ Notes:
   - **`pi_model.py` imports it at module scope** (`from multisensory_steering import
     load_critic`), even though the name is only used inside `_init_critic` on the guided path.
     So a *baseline* eval at `guidance_scale: 0.0` also fails with `ModuleNotFoundError`
-    without it. Same shape as the `critic_config_path` trap in §6.2 — the guidance switch does
+    without it. Same shape as the `adaptation_config_path` trap in §6.2 — the guidance switch does
     not gate the guidance imports.
   See §6.2 before turning guidance on.
 - **`uv` may not exist on a new cluster.** §5.1's `uv sync` / `uv run` instructions assume it

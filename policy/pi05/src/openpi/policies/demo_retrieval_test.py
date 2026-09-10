@@ -362,6 +362,26 @@ def test_siglip_only_retrieval_drops_the_pose_term():
     assert "3 independent relative L2 distances" in retriever.describe_similarity()
 
 
+def test_action_horizon_window_holds_the_last_action_past_the_end():
+    """LeRobot pads a chunk that runs off the episode by repeating its final action."""
+    actions = np.arange(5, dtype=np.float32).reshape(5, 1)
+
+    np.testing.assert_array_equal(
+        demo_retrieval.action_horizon_window(actions, 1, 3), [[1.0], [2.0], [3.0]]
+    )
+    # Off the end: the last action is held rather than wrapping or truncating.
+    np.testing.assert_array_equal(
+        demo_retrieval.action_horizon_window(actions, 3, 4), [[3.0], [4.0], [4.0], [4.0]]
+    )
+    # Starting past the end degenerates to standing still at the final action.
+    np.testing.assert_array_equal(
+        demo_retrieval.action_horizon_window(actions, 9, 2), [[4.0], [4.0]]
+    )
+    assert demo_retrieval.action_horizon_window(actions, 0, 2).shape == (2, 1)
+    with pytest.raises(ValueError, match="empty action sequence"):
+        demo_retrieval.action_horizon_window(np.zeros((0, 1), np.float32), 0, 2)
+
+
 def test_resolve_signals_validates():
     assert demo_retrieval.resolve_signals(None) == ("siglip", "state")
     assert demo_retrieval.resolve_signals(["state", "siglip"]) == ("siglip", "state")

@@ -316,6 +316,50 @@ class Base_Task(gym.Env):
     def check_success(self):
         pass
 
+    # ===================================================== Resumable Scripted Expert =====================================================
+    # `play_once` assumes the scene is untouched, so replaying it from a mid-episode state has
+    # the expert reach for objects another arm is already holding. A task opts into resumable
+    # recovery by overriding `scripted_stages` and `resume_stage`; the defaults below leave
+    # every other task replaying the whole demo exactly as before.
+
+    def scripted_stages(self):
+        """The ordered steps of `play_once`, each a zero-argument callable.
+
+        ``None`` means this task has not been made resumable.
+        """
+        return None
+
+    def resume_stage(self):
+        """Index into `scripted_stages` the *live scene* has already reached.
+
+        Read this off the scene as an ordinal rather than scanning the stages for the first
+        unmet postcondition: mid-episode the postconditions are not monotone (a mug in the
+        right gripper leaves the earlier "placed at the handover point" step unsatisfied), and
+        a scan would resume in the middle of an already-finished prefix.
+        """
+        return 0
+
+    def resume_feasible(self):
+        """Whether the expert could plan the stage it would resume at, without running it.
+
+        Recovery rewinds to a control step near the failure and retries earlier ones on
+        rejection, so most candidates are hopeless. This is the cheap rejection.
+        """
+        return True
+
+    def play_from_here(self):
+        """Run the scripted expert from the stage the live scene has already reached."""
+        stages = self.scripted_stages()
+        if stages is None:
+            self.play_once()
+            return 0
+        start = int(self.resume_stage())
+        for stage in stages[start:]:
+            stage()
+            if not self.plan_success:
+                break
+        return start
+
     def setup_scene(self, **kwargs):
         """
         Set the scene
@@ -1346,6 +1390,14 @@ class Base_Task(gym.Env):
             target_dis=grasp_dis,
             contact_point_id=contact_point_id,
         )
+        if pre_grasp_pose is None:
+            # No contact point of the actor is reachable for this arm, so `choose_grasp_pose`
+            # gave up on all of them. That is an ordinary planning failure and belongs in
+            # `plan_success` alongside every other one -- without this it falls through as a
+            # `target_pose=None` and trips the assertion inside `Action`, turning "the object
+            # is out of reach" into an exception every caller has to special-case.
+            self.plan_success = False
+            return None, []
         if pre_grasp_pose == grasp_pose:
             return arm_tag, [
                 Action(arm_tag, "move", target_pose=pre_grasp_pose),

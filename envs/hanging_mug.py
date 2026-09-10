@@ -70,43 +70,103 @@ class hanging_mug(Base_Task):
         # Reward state, reset per episode because load_actors runs on every setup_demo.
         self.last_hang = self._hang_progress()
 
+    GRASP_ARM = "left"
+    HANG_ARM = "right"
+    HOLD_DIS = 0.12  # gripper-center to mug-origin distance that counts as holding it. The mug
+    #                  is ~0.09 m across, so this is "the closed gripper is on the mug" with a
+    #                  little slack, not "the arm is near it".
+    HANDOVER_TOL = 0.08  # ... and this close to `middle_pos` counts as staged for the handover.
+
+    # -- scripted expert ------------------------------------------------------------------
+    # Split into stages so post-failure recovery can resume where the scene actually is
+    # (see Base_Task.scripted_stages). play_once runs all of them, unchanged.
+
+    def scripted_stages(self):
+        grasp_arm_tag = ArmTag(self.GRASP_ARM)
+        hang_arm_tag = ArmTag(self.HANG_ARM)
+        return [
+            # 0: move the grasping arm to the mug's position and grasp it
+            lambda: self.move(self.grasp_actor(self.mug, arm_tag=grasp_arm_tag, pre_grasp_dis=0.05)),
+            # 1: lift it clear of the table
+            lambda: self.move(self.move_by_displacement(arm_tag=grasp_arm_tag, z=0.08)),
+            # 2: carry it to the middle position, where the other arm can reach it
+            lambda: self.move(
+                self.place_actor(self.mug,
+                                 arm_tag=grasp_arm_tag,
+                                 target_pose=self.middle_pos,
+                                 pre_dis=0.05,
+                                 dis=0.0,
+                                 constrain="free")),
+            # 3: withdraw upward, off the mug
+            lambda: self.move(self.move_by_displacement(arm_tag=grasp_arm_tag, z=0.1)),
+            # 4: hand over -- grasp with the hanging arm while the other returns to its origin
+            lambda: self.move(self.back_to_origin(grasp_arm_tag),
+                              self.grasp_actor(self.mug, arm_tag=hang_arm_tag, pre_grasp_dis=0.05)),
+            # 5: lift it clear before the approach
+            lambda: self.move(
+                self.move_by_displacement(arm_tag=hang_arm_tag, z=0.1, quat=GRASP_DIRECTION_DIC['front'])),
+            # 6: hang the mug's handle on the rack's functional point (the end of the bracket)
+            lambda: self.move(
+                self.place_actor(self.mug,
+                                 arm_tag=hang_arm_tag,
+                                 target_pose=self.rack.get_functional_point(0),
+                                 functional_point_id=0,
+                                 constrain="align",
+                                 pre_dis=0.05,
+                                 dis=-0.05,
+                                 pre_dis_axis='fp')),
+            # 7: withdraw along the arm axis, leaving the mug on the hook
+            lambda: self.move(self.move_by_displacement(arm_tag=hang_arm_tag, z=0.1, move_axis='arm')),
+        ]
+
+    def _holding(self, arm):
+        """That arm's gripper is closed on the mug."""
+        closed = self.is_left_gripper_close() if arm == "left" else self.is_right_gripper_close()
+        if not closed:
+            return False
+        tcp = (self.robot.get_left_tcp_pose() if arm == "left" else self.robot.get_right_tcp_pose())
+        return bool(np.linalg.norm(np.array(tcp[:3]) - np.array(self.mug.get_pose().p)) < self.HOLD_DIS)
+
+    def resume_stage(self):
+        """Ordinal progress, tested from the most advanced state down.
+
+        Ordering matters: with the mug in the hanging arm, the handover stage's own
+        postcondition (mug resting at `middle_pos`) is false, so anything that scanned stages
+        in order would restart the carry with the grasping arm and drive it into the arm that
+        is already holding the mug.
+        """
+        if self.check_success():
+            return len(self.scripted_stages())
+        if self._holding(self.HANG_ARM):
+            # Stage 5 is the clearing lift before the approach. Once the handle is already over
+            # the bracket that lift is not just wasted, it is usually unplannable -- and
+            # `_hang_progress` is exactly the "over the bracket" test, gated on HANG_RADIUS.
+            return 6 if self._hang_progress() > 0.0 else 5
+        if self._holding(self.GRASP_ARM):
+            return 1
+        at_handover = np.linalg.norm(
+            np.array(self.mug.get_pose().p) - np.array(self.middle_pos[:3])) < self.HANDOVER_TOL
+        return 4 if at_handover else 0
+
+    def resume_feasible(self):
+        """Both grasp stages plan a reachable contact point, so test that and nothing else.
+
+        The remaining stages are placements and displacements of a mug already in hand, which
+        cannot fail this way (`get_place_pose` always returns a pose).
+        """
+        stage = self.resume_stage()
+        if stage == 0:
+            arm = ArmTag(self.GRASP_ARM)
+        elif stage == 4:
+            arm = ArmTag(self.HANG_ARM)
+        else:
+            return True
+        pre_grasp_pose, _ = self.choose_grasp_pose(self.mug, arm_tag=arm, pre_dis=0.05)
+        return pre_grasp_pose is not None
+
     def play_once(self):
-        # Initialize arm tags for grasping and hanging
-        grasp_arm_tag = ArmTag("left")
-        hang_arm_tag = ArmTag("right")
-
-        # Move the grasping arm to the mug's position and grasp it
-        self.move(self.grasp_actor(self.mug, arm_tag=grasp_arm_tag, pre_grasp_dis=0.05))
-        self.move(self.move_by_displacement(arm_tag=grasp_arm_tag, z=0.08))
-
-        # Move the grasping arm to a middle position before hanging
-        self.move(
-            self.place_actor(self.mug,
-                             arm_tag=grasp_arm_tag,
-                             target_pose=self.middle_pos,
-                             pre_dis=0.05,
-                             dis=0.0,
-                             constrain="free"))
-        self.move(self.move_by_displacement(arm_tag=grasp_arm_tag, z=0.1))
-
-        # Grasp the mug with the hanging arm, and move the grasping arm back to its origin
-        self.move(self.back_to_origin(grasp_arm_tag),
-                  self.grasp_actor(self.mug, arm_tag=hang_arm_tag, pre_grasp_dis=0.05))
-        self.move(self.move_by_displacement(arm_tag=hang_arm_tag, z=0.1, quat=GRASP_DIRECTION_DIC['front']))
-
-        # Target pose for hanging the mug is the functional point of the rack
-        target_pose = self.rack.get_functional_point(0)
-        # Move the hanging arm to the target pose and hang the mug
-        self.move(
-            self.place_actor(self.mug,
-                             arm_tag=hang_arm_tag,
-                             target_pose=target_pose,
-                             functional_point_id=0,
-                             constrain="align",
-                             pre_dis=0.05,
-                             dis=-0.05,
-                             pre_dis_axis='fp'))
-        self.move(self.move_by_displacement(arm_tag=hang_arm_tag, z=0.1, move_axis='arm'))
+        for stage in self.scripted_stages():
+            stage()
         self.info["info"] = {"{A}": f"039_mug/base{self.mug_id}", "{B}": "040_rack/base0"}
         return self.info
 

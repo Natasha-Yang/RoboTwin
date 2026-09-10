@@ -505,6 +505,27 @@ def _per_frame_wrench(column, order, name: str) -> np.ndarray:
     return values.astype(np.float32)
 
 
+def action_horizon_window(actions: np.ndarray, index: int, action_horizon: int) -> np.ndarray:
+    """The `action_horizon` actions starting at `index`, holding the last one past the end.
+
+    LeRobot pads a chunk that runs off the end of an episode by repeating its final action, so
+    the policy's training target over an episode's last frames is a chunk that stands still.
+    Anything that rebuilds a chunk has to pad the same way, or a critic is scored on targets the
+    policy was never trained to produce -- which is why this is one function rather than a slice
+    written out at each call site.
+
+    Used for demo bank rows (`DemoReader._encode_frames`) and for the scripted-expert suffixes
+    post-failure recovery inserts (`multisensory_steering.interventions.robotwin`).
+
+    Returns `(action_horizon, *action_shape)`.
+    """
+    actions = np.asarray(actions)
+    if len(actions) == 0:
+        raise ValueError("cannot build an action chunk from an empty action sequence.")
+    window = np.arange(int(index), int(index) + int(action_horizon)).clip(max=len(actions) - 1)
+    return actions[window]
+
+
 def wrench_traces(per_frame: dict, frames, trace_len: int) -> dict[str, np.ndarray]:
     """Per-frame wrench rows -> the `(trace_len, 6)` trace each of `frames` observes.
 
@@ -1114,20 +1135,19 @@ class DemoRetriever:
         frames = np.asarray(frames, dtype=np.int64).reshape(-1)
         raw = self.reader.read_episode(episode, frames=frames, sensors=self.sensor_modalities)
         instruction = self.reader.instructions()[episode] or ""
-        length = len(raw["state"])
 
         batch, chunks, thumbs, states = [], [], [], []
         for i, t in enumerate(frames.tolist()):
-            # The chunk that was the training target at frame t. LeRobot pads a chunk that runs
-            # past the end of the episode by holding the last action, and so does this.
-            window = np.arange(t, t + self.action_horizon).clip(max=length - 1)
+            # The chunk that was the training target at frame t, padded past the end of the
+            # episode the way LeRobot pads it (`action_horizon_window`).
+            chunk = action_horizon_window(raw["action"], t, self.action_horizon)
             inputs = self.input_transform(
                 {
                     # The image arrays hold only the frames that were decoded, so they are
                     # indexed by position in `frames` rather than by frame index.
                     "images": {camera: raw["images"][camera][i] for camera in DEMO_CAMERAS},
                     "state": raw["state"][t],
-                    "actions": self._relative_actions(raw["action"][window], raw["state"][t]),
+                    "actions": self._relative_actions(chunk, raw["state"][t]),
                     "prompt": instruction,
                 }
             )

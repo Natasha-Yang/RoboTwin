@@ -21,14 +21,14 @@
 # success. Unlike the args above it applies to the baseline too (it is what the csv's per-episode
 # `reward` column and the W&B reward curves measure).
 # It defaults to whatever policy/pi05/deploy_policy.yml says; the 7th arg overrides it.
-# The critic's own hyperparameters come from the `critic_config_path` file in that yml, and the
+# The critic's own hyperparameters come from the `adaptation_config_path` file in that yml, and the
 # 12th arg swaps that file -- which is also how the *other* critic family is selected:
 #   cfgs/qmfm.yaml  (default)  an ensemble Q over action chunks; `guidance_scale` / `best_of_n`.
 #   cfgs/dsrl.yaml             SAC over the sampler's latent noise. The denoising is untouched
 #                              and the actor chooses the noise chunk it starts from, so there is
 #                              nothing to guide or rank: leave args 7 and 11 at 0 and 1.
 
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 # ensure GPU < 24G
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.65 # ensure GPU < 24G
 # Only needed when guidance_scale != 0: the QMFM checkout multisensory_steering imports
 # `ReplayBuffer` from, by explicit path ($QMFM_ROOT/utils/datasets.py).
 export QMFM_ROOT="${QMFM_ROOT:-/home/natasha/QMFM}"
@@ -54,7 +54,7 @@ overrides=()
 [ -n "${9}" ] && overrides+=(--train_online "${9}")            # false = guide with a frozen critic
 [ -n "${10}" ] && overrides+=(--use_step_reward "${10}")       # false = sparse success reward only
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
-[ -n "${12}" ] && overrides+=(--critic_config_path "${12}")   # which critic family + its hyperparameters
+[ -n "${12}" ] && overrides+=(--adaptation_config_path "${12}")   # which critic family + its hyperparameters
 # Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
 # positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
 # without editing the yml (and so without steering a concurrent eval into that run's directory),
