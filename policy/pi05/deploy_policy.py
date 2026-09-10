@@ -47,7 +47,7 @@ def critic_obs_modalities(TASK_ENV, model, observation):
     return obs_modalities(observation, TASK_ENV.pop_step_wrench(), model.wrench_trace_len)
 
 
-# Keys of the `critic_config_path` file that are the critic's own hyperparameters, forwarded
+# Keys of the `adaptation_config_path` file that are the critic's own hyperparameters, forwarded
 # into `load_critic`. They reach `usr_args` flattened alongside the deploy config
 # (`eval_policy.parse_args_and_config` merges the included file underneath it), so this is what
 # separates them back out again -- anything not listed stays a deploy-side knob.
@@ -61,7 +61,7 @@ CRITIC_CONFIG_KEYS = (
     "n_steps",
     "lr_warmup_steps", "lr_decay_steps", "lr_final_frac",
     "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
-    "start_training", "utd_ratio",
+    "start_training", "utd_ratio", "intervention_replay_fraction",
     # Offline rollouts mixed into every TD batch (a `{enabled, frac, config, ...}` block; see
     # cfgs/qmfm.yaml). `train_online` rides along with it so the critic can skip loading the
     # dataset when no update is going to run -- it is otherwise read as `train_critic_online`
@@ -129,13 +129,13 @@ def get_model(usr_args):
     # `critic_ckpt` holds: it still steers the sampler, but nothing is stashed into the replay
     # buffer and no TD update runs. Only meaningful when a critic exists at all.
     #
-    # It is a critic-side knob, so it lives in the `critic_config_path` file as `train_online`
+    # It is a critic-side knob, so it lives in the `adaptation_config_path` file as `train_online`
     # (next to `freeze_encoder`, which is the same idea one level down -- freeze the encoder
     # and keep training the value head) and reaches usr_args through that include. The attribute
     # keeps the longer name on this side, where "online" alone would not say online *what*.
     train_critic_online = _as_bool(usr_args.get("train_online"), True)
     # The critic's own hyperparameters. These reach usr_args via the deploy config's
-    # `critic_config_path` include (see eval_policy.parse_args_and_config), so the critic's own
+    # `adaptation_config_path` include (see eval_policy.parse_args_and_config), so the critic's own
     # cfg file stays the source of truth for them.
     critic_config = {k: usr_args[k] for k in CRITIC_CONFIG_KEYS if k in usr_args}
     critic_seed = usr_args.get("critic_seed", usr_args.get("seed", 0) or 0)
