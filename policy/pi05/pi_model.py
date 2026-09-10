@@ -825,6 +825,12 @@ class PI0:
         than becoming four times the bytes to cross into XLA -- and NaN and all: an early-ended
         chunk pads its wrench trace with NaN, and mapping that to something finite is the
         encoders' job.
+
+        The shapes checked here are the *sensor's* (`_critic_extra_shapes`, from the critic's
+        `obs_shapes`), because that is what the observation is required to arrive as. A critic
+        whose `encoder_modalities` downscale a camera then works at a smaller one, so the
+        arrays are handed to `to_stored_obs` on the way out -- once, before the caller splits
+        them between the sampler and the replay buffer, so both see identical pixels.
         """
         obs = {}
         for key, shape in self._critic_extra_shapes.items():
@@ -843,7 +849,7 @@ class PI0:
                     f"un-downsampled -- the critic needs a fixed-size observation."
                 )
             obs[key] = value
-        return obs
+        return self.online_critic.to_stored_obs(obs)
 
     def _refresh_demo_proposals(self):
         """Retrieve this control step's demo proposals into the critic's extra observation.
