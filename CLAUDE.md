@@ -1026,11 +1026,33 @@ appended to `_episode_results.csv`, the critic checkpointed, then `resume_state.
 atomically. The json is the commit marker, so an interruption rewinds to the last episode that
 completed all three; a csv row one ahead of it is trimmed on resume.
 
-`resume: true` (`deploy_policy.yml`) then continues the newest interrupted run for this
-task/policy/config/ckpt **in its existing directory** rather than opening a new timestamped one.
-`resume: "<run dir>"` names one specific run instead — needed when a second eval is writing into
-the same directory, since it rewrites its own `resume_state.json` every episode and so stays the
-"newest" one however long ago the run you meant stopped.
+Resuming is then one command, and it names the **run directory**:
+
+```bash
+bash eval_tasks.sh --resume "eval_result/lift_pot/pi05/demo_clean/robotwin_clean_ep10/2026-09-04 12:55:11"
+```
+
+It continues that run **in its existing directory** rather than opening a new timestamped one,
+and it takes **no other arguments** — the task, task config, train config, model and seed are
+read out of the `deploy_policy.yml` snapshot in that directory, and the critic settings out of
+the critic-config snapshot beside it. Those snapshots are what the run was actually launched
+with; the working-tree ymls describe the run you are setting up *next*. So a `--critic-ckpt`,
+`--guidance-scale` or `--tasks` meant for some other submission cannot reach a resumed run —
+passing one alongside `--resume` is an error, not an override, because none of them can apply to
+a run whose episodes, seed sequence and critic were already produced under the old settings.
+`policy/pi05/eval.sh ... --resume "<run dir>"` is the same thing one level down, for a hand-run
+eval; `--resume true` there still picks the newest interrupted run under the task's own root.
+
+**There is deliberately no `resume` key in `deploy_policy.yml` any more**, and the reason is
+worth keeping: one file is shared by every task, so a run directory pinned in it applied to
+whatever was submitted afterwards. On 2026-09-04 three jobs — `handover_block`, `open_laptop`
+and `put_object_cabinet` — all resumed the same `put_object_cabinet` directory concurrently;
+its `_episode_results.csv` ended up with 94 rows over 67 episode numbers from three tasks, and
+its `_result.txt` holding handover_block's score. `find_resumable_run` now also refuses a run
+directory that is not under the task/policy/config/ckpt root of the eval being launched, so that
+particular collision fails loudly rather than interleaving. A run from before config
+snapshotting has no snapshot to resume from, and has to be continued by pointing `--config` at a
+config that matches what it was launched with.
 
 | Restored | From | Why it cannot be recomputed |
 |---|---|---|

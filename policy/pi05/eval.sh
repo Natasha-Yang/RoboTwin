@@ -56,9 +56,13 @@ overrides=()
 [ -n "${11}" ] && overrides+=(--best_of_n "${11}")             # candidate chunks per control step
 [ -n "${12}" ] && overrides+=(--adaptation_config_path "${12}")   # which critic family + its hyperparameters
 # Anything after those is passed through to deploy_policy.yml verbatim, for the keys that have no
-# positional slot -- above all `--resume "<run dir>"`, which continues one specific interrupted run
-# without editing the yml (and so without steering a concurrent eval into that run's directory),
-# and the periodic held-out evaluation that picks the best critic checkpoint
+# positional slot -- above all `--resume "<run dir>"`, which continues that one interrupted run.
+# A resume takes its whole configuration from the deploy_policy.yml and critic-config snapshots
+# in that directory rather than from the working tree, so the args above have nothing to override
+# and the identity args (task_name, seed, ...) are checked against the snapshot instead of applied.
+# `bash eval_tasks.sh --resume "<run dir>"` is the launcher form, and derives every positional
+# argument from the same snapshot; reach for this one only when running eval.sh by hand.
+# The tail also carries the periodic held-out evaluation that picks the best critic checkpoint
 # (`--eval_interval 20 --eval_episodes 10 --eval_seed 7`; `--eval_interval 0` turns it off).
 # `env_seed` is deliberately NOT among them: it is a task-config key, so that one file decides
 # the environment for collection and eval alike (see task_config/_config_template.yml).

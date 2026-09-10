@@ -90,21 +90,33 @@ eval_seed: null
 # resume_state.json records the loop counters -- so an interrupted run keeps the episodes it
 # already paid for.
 #
-# `resume: true` then continues the newest interrupted run for this task/policy/config/ckpt in
-# its existing directory instead of opening a new timestamped one: the seed sequence carries on
-# where it stopped (it cannot be recomputed -- which seeds the expert check rejected is not a
-# function of the episode index), the critic reloads with its optimizer and LR schedule intact,
-# the guidance ramp picks up where it stopped rather than restarting at 0, and the W&B run is
-# rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP
-# features), so a resumed critic refills it from empty before TD updates restart.
-# `false` always starts a fresh run and leaves any interrupted one untouched.
+# Resuming is a LAUNCH argument, not a key here, and deliberately so. Name the run directory:
 #
-# `resume: "<run dir>"` continues that specific run instead of the newest. Use it when another
-# eval is writing into the same task/policy/config/ckpt directory -- it rewrites its own
-# resume_state.json every episode, so it stays the "newest" one however long ago yours stopped.
-# (A run that predates crash recovery has no resume_state.json at all; script/
-# resume_state_from_log.py rebuilds one from that run's SLURM log.)
-resume:
+#     bash eval_tasks.sh --resume "<run dir>"
+#
+# That continues it in place instead of opening a new timestamped directory: the seed sequence
+# carries on where it stopped (it cannot be recomputed -- which seeds the expert check rejected
+# is not a function of the episode index), the critic reloads with its optimizer and LR schedule
+# intact, the guidance ramp picks up where it stopped rather than restarting at 0, and the W&B
+# run is rejoined. The replay buffer is NOT checkpointed (it is gigabytes of SigLIP features),
+# so a resumed critic refills it from empty before TD updates restart.
+#
+# It takes no other arguments, because it takes no settings from this file: a resume reads the
+# deploy config and critic config snapshotted in the run's own directory, which is what that run
+# was actually launched with (eval_policy.parse_args_and_config). This file describes the run
+# you are setting up next, and the two are not the same thing.
+#
+# `resume` used to live here as a key, and that is what made it dangerous. One file is shared by
+# every task, so a run directory pinned in it applied to whatever was submitted afterwards: on
+# 2026-09-04 three jobs -- handover_block, open_laptop and put_object_cabinet -- all resumed the
+# same put_object_cabinet directory concurrently, and its _episode_results.csv ended up with 94
+# rows over 67 episode numbers from three different tasks, its _result.txt holding handover_block's
+# score. `find_resumable_run` now rejects a run directory that does not belong to the task being
+# evaluated, so that particular accident fails loudly, but the key is gone regardless.
+#
+# (A run that predates config snapshotting cannot be resumed this way; point --config at a
+# matching config by hand. One that predates crash recovery has no resume_state.json at all --
+# script/resume_state_from_log.py rebuilds one from that run's SLURM log.)
 
 # ===== Profiling =====
 # Where an eval run's wall clock actually goes -- off unless asked for, and off means the hooks
@@ -248,7 +260,7 @@ demo_retrieval:
   # ~0.6 MB per view per row at fp16 -- 1.8 GB here, at 1000 rows over three cameras. Lower it
   # (or `views`) if that is too much; `frame_stride` shrinks it for free when the demos are
   # longer than the bank anyway.
-  bank_size: 1000
+  bank_size: 5000
   # Keep every Nth demo frame. >1 shrinks the bank and the per-episode encoding cost.
   frame_stride: 1
   # Inversion settings for `noise_proposals`. `num_steps` MUST match the sampler's denoising

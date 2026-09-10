@@ -442,6 +442,9 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
+SNAPSHOT_HEADER_PREFIX = "# Snapshot of "
+
+
 def snapshot_config(src_path, values, dst_dir):
     """Copy a yml config into `dst_dir` with the values actually used written in.
 
@@ -453,6 +456,10 @@ def snapshot_config(src_path, values, dst_dir):
     src_path = Path(src_path)
     with src_path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
+    # A resumed run snapshots the snapshot it was configured from (src and dst are then the same
+    # file), so drop any header this function wrote before rather than stacking a new one on it.
+    while lines and lines[0].startswith(SNAPSHOT_HEADER_PREFIX):
+        lines.pop(0)
     original = yaml.safe_load("".join(lines)) or {}
 
     for i, line in enumerate(lines):
@@ -471,7 +478,7 @@ def snapshot_config(src_path, values, dst_dir):
                 comment = "  " + raw_value[hash_at:].lstrip()
         lines[i] = yaml.safe_dump({key: values[key]}, sort_keys=False).strip() + comment + "\n"
 
-    header = f"# Snapshot of {src_path.resolve()} as used by this eval run.\n"
+    header = f"{SNAPSHOT_HEADER_PREFIX}{src_path.resolve()} as used by this eval run.\n"
     with (Path(dst_dir) / src_path.name).open("w", encoding="utf-8") as f:
         f.writelines([header] + lines)
 
@@ -635,18 +642,44 @@ def load_resume_state(save_dir):
     return state
 
 
+# The run identity: the keys that decide *which* experiment a run directory holds. A resume
+# reloads them from the run's own config snapshot (see `parse_args_and_config`), so they cannot
+# be taken from the working-tree yml -- that file describes whatever is being set up next, not
+# what this run was launched as. Anything passed on the command line is checked against the
+# snapshot rather than applied, because an override here does not reconfigure the run, it
+# mislabels it: the episodes, seeds and critic in the directory are still the old experiment's.
+IDENTITY_KEYS = ("policy_name", "task_name", "task_config", "ckpt_setting",
+                 "train_config_name", "model_name", "seed")
+
+
 def find_resumable_run(run_root, resume=True):
     """The run directory to continue, or None to start a fresh one.
 
-    `resume` is normally just a switch, and picks the most recent interrupted run under
-    `run_root`. It may instead name one specific run directory, which is what you want when the
-    newest-first rule would pick the wrong one: another eval writing into the same root updates
-    its state file every episode, so it stays "most recent" no matter which run you meant.
+    `resume` is normally the run directory to continue -- what `eval_tasks.sh --resume` passes,
+    and the only form that names one run unambiguously. `true` instead picks the most recent
+    interrupted run under `run_root`, which is right for a single task evaluated one job at a
+    time but ambiguous the moment two evals share a root: each rewrites its state file every
+    episode, so whichever ran last is "most recent" however long ago yours stopped.
+
+    A named directory must live under `run_root`, i.e. must belong to the task/policy/config/
+    checkpoint this process was configured for. It is the check that makes a wrong `--resume`
+    fail instead of appending one task's episodes to another task's results -- which is exactly
+    what a run directory pinned in a shared config file used to do to every task submitted
+    after it (see the `resume` note in policy/pi05/deploy_policy.yml).
     """
     if isinstance(resume, str) and as_bool_or_none(resume) is None:
         run_dir = Path(resume).expanduser()
         if not (run_dir / RESUME_STATE).exists():
             raise FileNotFoundError(f"resume: {run_dir} has no {RESUME_STATE}")
+        run_root = Path(run_root)
+        if run_dir.resolve().parent != run_root.resolve():
+            raise ValueError(
+                f"resume: {run_dir} does not belong to this eval.\n"
+                f"  it lives under : {run_dir.resolve().parent}\n"
+                f"  this run wants : {run_root.resolve()}\n"
+                "Resuming it would append this task's episodes to another run's results. "
+                "Check the directory, or the task/config/checkpoint this job was launched with."
+            )
         return run_dir
     if not as_bool(resume, False):
         return None
@@ -1848,7 +1881,8 @@ def parse_args_and_config():
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
-    with Path(args.config).open("r", encoding="utf-8") as f:
+    config_path = Path(args.config)
+    with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     def parse_override_pairs(pairs):
@@ -1865,6 +1899,45 @@ def parse_args_and_config():
 
     overrides = parse_override_pairs(args.overrides) if args.overrides else {}
 
+    # ===== Resuming: the run's own config, not the working tree's =====
+    # Every run snapshots its deploy config (and the critic config it includes) into its result
+    # directory with the values actually used written in (`snapshot_config`). Resuming reads
+    # those back instead of the working-tree ymls, because the ymls have moved on -- they
+    # describe the run being set up next, and a resumed run must continue with the settings its
+    # episodes, its seed sequence and its critic were produced under. It also means a resume
+    # needs no knobs on the command line: `--resume <dir>` is the whole instruction, and a
+    # `--critic-ckpt` (or guidance, or reward) flag meant for some *other* submission cannot
+    # reach it.
+    resume_dir = overrides.get("resume")
+    if resume_dir is not None and as_bool_or_none(resume_dir) is None:
+        resume_dir = Path(str(resume_dir)).expanduser()
+        snapshot = resume_dir / config_path.name
+        if not snapshot.is_file():
+            raise FileNotFoundError(
+                f"resume: {resume_dir} has no {config_path.name} snapshot to continue from. "
+                "Runs from before config snapshotting have to be resumed by pointing --config "
+                "at a config that matches what they were launched with."
+            )
+        config_path = snapshot
+        with config_path.open("r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+        # The identity keys are the run's, full stop. eval.sh passes them positionally on every
+        # invocation, so they arrive here whether or not the caller meant to set them -- compare
+        # rather than apply, and say which one disagrees.
+        mismatched = {k: (config.get(k), overrides[k]) for k in IDENTITY_KEYS
+                      if k in overrides and overrides[k] != config.get(k)}
+        if mismatched:
+            detail = "\n".join(f"  {k}: run is {was!r}, command says {now!r}"
+                               for k, (was, now) in sorted(mismatched.items()))
+            raise ValueError(
+                f"resume: {resume_dir} was not launched with these settings.\n{detail}\n"
+                "A resumed run continues the experiment in the directory; these keys cannot be "
+                "changed. Drop them, or start a new run instead of resuming."
+            )
+        for key in IDENTITY_KEYS:
+            overrides.pop(key, None)
+
     # Policy-specific hyperparameters may be factored out into a file that ships with the
     # implementation they configure (the adaptation config in multisensory-steering includes
     # both the critic and intervention settings, so it stays in sync with the code that reads
@@ -1876,14 +1949,22 @@ def parse_args_and_config():
     # defaults of the file it replaced -- silently mixing two critic families' configs.
     include_path = overrides.get("adaptation_config_path", config.get("adaptation_config_path"))
     if include_path:
+        # Same reasoning as the deploy config above: a resumed run takes the critic config it
+        # was launched under, which is the copy in its own directory. The recorded path may name
+        # a checkout that has since been edited, or is not on this machine at all.
+        if config_path.parent != Path(args.config).parent:
+            snapshot = config_path.parent / Path(include_path).name
+            if snapshot.is_file():
+                include_path = str(snapshot)
         with Path(include_path).expanduser().open("r", encoding="utf-8") as f:
             included = yaml.safe_load(f) or {}
         config = {**included, **config, "adaptation_config_path": include_path}
 
     config.update(overrides)
 
-    # Kept so `main` can copy the deploy config into the eval_result dir.
-    config["_config_path"] = args.config
+    # Kept so `main` can copy the deploy config into the eval_result dir. On a resume this is
+    # the snapshot itself, so re-snapshotting rewrites the file with the same content.
+    config["_config_path"] = str(config_path)
 
     return config
 
