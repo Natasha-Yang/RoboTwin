@@ -172,6 +172,11 @@ class _PegInsertionBase(Base_Task):
         # depend on the expert having run -- during a policy rollout it has not.
         self.arm_tag = ArmTag("left" if peg_pose.p[0] < 0 else "right")
 
+        # Where the peg's tip rests before anything touches it, so a resumed expert can tell a
+        # lifted peg from one still standing on the table. Read here rather than from TABLE_Z,
+        # which is rand_pose's nominal default before `preprocess` adds `table_z_bias`.
+        self.peg_rest_z = float(self.peg.get_functional_point(0, "pose").p[2])
+
         # Reward state, reset per episode because load_actors runs on every setup_demo.
         lateral, depth = self._insertion_state()
         self.last_lateral = lateral
@@ -330,28 +335,74 @@ class _PegInsertionBase(Base_Task):
             ],
         ))
 
+    # Split into stages so post-failure recovery can resume where the scene actually is
+    # (see Base_Task.scripted_stages). play_once runs all of them, unchanged.
+
+    def scripted_stages(self):
+        arm_tag = self.arm_tag
+        return [
+            # 0: grasp the upper band of the standing peg, so the fingers stay ~0.07 m above
+            #    the socket rim once it is fully inserted.
+            lambda: self.move(
+                self.grasp_actor(
+                    self.peg,
+                    arm_tag=arm_tag,
+                    pre_grasp_dis=PRE_GRASP_DIS,
+                    grasp_dis=0.0,
+                    contact_point_id=GRASP_BAND,
+                )),
+            # 1: lift it clear of the table
+            lambda: self.move(self.move_by_displacement(arm_tag, z=LIFT_Z)),
+            # 2: carry it over the mouth and drive it down the bore, then release
+            lambda: self.insert_peg(arm_tag),
+            # 3: "arm" retracts along the end-effector's own approach direction, i.e. straight
+            #    back out of the (side) grasp rather than up through the peg.
+            lambda: self.move(self.move_by_displacement(arm_tag, z=RETRACT_DIS, move_axis="arm")),
+            # 4: get the arm out of the frame
+            lambda: self.move(self.back_to_origin(arm_tag)),
+            # 5: let the released peg settle before check_success
+            lambda: self.delay(4),
+        ]
+
+    def resume_stage(self):
+        """Ordinal progress, tested from the most advanced state down.
+
+        Single-arm, so unlike the handover tasks there is no role to get backwards -- but the
+        released peg is still the thing to be careful about: a peg standing in the bore with
+        the gripper open is finished being inserted, and a scan for the first unmet
+        postcondition would send the arm back down to re-grasp it out of the hole.
+        """
+        stages = len(self.scripted_stages())
+        if self.check_success():
+            return stages
+        lateral, depth = self._insertion_state()
+        seated = self._bore_depth(lateral, depth) > 0.0
+        if self._peg_grasped():
+            if seated:
+                return 2  # in the bore but not released: insert_peg still owes the open
+            lifted = (self.peg.get_functional_point(0, "pose").p[2] - self.peg_rest_z) > LIFT_Z / 2
+            return 2 if lifted else 1
+        if seated:
+            # Inserted and let go; what is left is getting the arm off it without knocking it.
+            return 3
+        return 0
+
+    def resume_feasible(self):
+        """Only the grasp can fail to find a reachable contact point; probe that.
+
+        `insert_peg` and the retracts build their poses from `get_place_pose` and the current
+        end-effector pose, which always return one.
+        """
+        if self.resume_stage() != 0:
+            return True
+        pre_grasp_pose, _ = self.choose_grasp_pose(
+            self.peg, arm_tag=self.arm_tag, pre_dis=PRE_GRASP_DIS, contact_point_id=GRASP_BAND)
+        return pre_grasp_pose is not None
+
     def play_once(self):
         arm_tag = self.arm_tag
-
-        # Grasp the upper band of the standing peg, so the fingers stay ~0.07 m above the
-        # socket rim once it is fully inserted.
-        self.move(
-            self.grasp_actor(
-                self.peg,
-                arm_tag=arm_tag,
-                pre_grasp_dis=PRE_GRASP_DIS,
-                grasp_dis=0.0,
-                contact_point_id=GRASP_BAND,
-            ))
-        self.move(self.move_by_displacement(arm_tag, z=LIFT_Z))
-
-        self.insert_peg(arm_tag)
-
-        # "arm" retracts along the end-effector's own approach direction, i.e. straight back
-        # out of the (side) grasp rather than up through the peg.
-        self.move(self.move_by_displacement(arm_tag, z=RETRACT_DIS, move_axis="arm"))
-        self.move(self.back_to_origin(arm_tag))
-        self.delay(4)  # let the released peg settle before check_success
+        for stage in self.scripted_stages():
+            stage()
 
         self.info["info"] = {
             "{A}": f"{self.socket_modelname}/base{self.socket_model_id}",

@@ -121,11 +121,7 @@ class hanging_mug(Base_Task):
 
     def _holding(self, arm):
         """That arm's gripper is closed on the mug."""
-        closed = self.is_left_gripper_close() if arm == "left" else self.is_right_gripper_close()
-        if not closed:
-            return False
-        tcp = (self.robot.get_left_tcp_pose() if arm == "left" else self.robot.get_right_tcp_pose())
-        return bool(np.linalg.norm(np.array(tcp[:3]) - np.array(self.mug.get_pose().p)) < self.HOLD_DIS)
+        return self.gripper_holds(arm, self.mug, hold_dis=self.HOLD_DIS)
 
     def resume_stage(self):
         """Ordinal progress, tested from the most advanced state down.

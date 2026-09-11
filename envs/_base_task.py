@@ -347,6 +347,28 @@ class Base_Task(gym.Env):
         """
         return True
 
+    def gripper_holds(self, arm_tag, actor, hold_dis=0.12, point=None):
+        """Whether that arm's gripper is closed on `actor` -- the building block of a
+        handover task's `resume_stage`, where which arm holds the object IS the progress.
+
+        Contact would be the more direct evidence, but `get_gripper_actor_contact_position`
+        does not report which gripper a contact belongs to, which is exactly the distinction
+        needed here. So: the gripper is commanded closed, and its TCP is within `hold_dis` of
+        the object. `hold_dis` therefore has to be read per task off the object's own size --
+        it means "the closed gripper is on it", not "the arm is near it".
+
+        `point` overrides where on the actor to measure from, for an articulation whose root
+        pose is nowhere near the part being grasped (a cabinet's drawer handle, say).
+        """
+        arm = str(arm_tag)
+        closed = self.is_left_gripper_close() if arm == "left" else self.is_right_gripper_close()
+        if not closed:
+            return False
+        tcp = (self.robot.get_left_tcp_pose() if arm == "left"
+               else self.robot.get_right_tcp_pose())
+        target = actor.get_pose().p if point is None else point
+        return bool(np.linalg.norm(np.array(tcp[:3]) - np.array(target)[:3]) < hold_dis)
+
     def play_from_here(self):
         """Run the scripted expert from the stage the live scene has already reached."""
         stages = self.scripted_stages()

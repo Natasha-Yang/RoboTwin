@@ -1385,6 +1385,21 @@ def eval_policy(task_name,
     intervention = None
     intervention_recorder = None
     intervention_enabled = as_bool(args.get("post_failure_intervention"), False)
+    if intervention_enabled and not _uses_online_critic(model):
+        # Same class of mistake as `train_online: false` below, and the more expensive one to
+        # find: the run does not fail, it just quietly becomes an unguided baseline, and the
+        # only sign is a banner three lines into a log that then runs for hours. The rewind
+        # point is chosen from the critic's Q trace, so no critic means no interventions.
+        # Read off the model, which is what actually decided, rather than off `args`, which
+        # only carries the lifecycle keys forwarded above.
+        raise ValueError(
+            "post_failure_intervention is on but no critic was built, so no episode can be "
+            "recovered. deploy_policy.get_model builds one only for `critic_type: dsrl`, "
+            f"`guidance_scale != 0` or `best_of_n > 1`; this run has "
+            f"critic_type={getattr(model, 'critic_type', 'qmfm')!r}, "
+            f"guidance_scale={getattr(model, 'guidance_scale_target', 0.0)!r}, "
+            f"best_of_n={best_of_n}. "
+            "Set one of them in deploy_policy.yml, or turn off post_failure_intervention.")
     if intervention_enabled and _uses_online_critic(model):
         if not train_critic:
             raise ValueError("post_failure_intervention requires train_online: true")

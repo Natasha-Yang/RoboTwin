@@ -62,6 +62,10 @@ CRITIC_CONFIG_KEYS = (
     "lr_warmup_steps", "lr_decay_steps", "lr_final_frac",
     "clip_grad", "cnn_features", "cnn_out_dim", "batch_size", "buffer_size",
     "start_training", "utd_ratio", "intervention_replay_fraction",
+    # Weight on L_pairwise, which ties the Q *gap* at a rewind state to the realized return
+    # gap between the expert's branch and the autonomous one. 0 = off (the second critic
+    # forward never runs). Only paired rows contribute, so it is inert without interventions.
+    "pairwise_loss_weight",
     # Offline rollouts mixed into every TD batch (a `{enabled, frac, config, ...}` block; see
     # cfgs/qmfm.yaml). `train_online` rides along with it so the critic can skip loading the
     # dataset when no update is going to run -- it is otherwise read as `train_critic_online`

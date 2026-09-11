@@ -34,6 +34,12 @@ class put_object_cabinet(Base_Task):
 
     def setup_demo(self, **kwags):
         super()._init_task_env_(**kwags, table_static=False)
+        # After `_init_task_env_`, so the scene has settled: `check_success` measures the lift
+        # against this with a 7 mm threshold, and the object drops a little further than that
+        # while settling. After it rather than in `load_actors` for that reason, and here
+        # rather than in `play_once` because a policy rollout never runs the expert -- which
+        # left `check_success` reading an attribute that did not exist.
+        self.origin_z = self.object.get_pose().p[2]
 
     def load_actors(self):
         self.model_name = "036_cabinet"
@@ -118,37 +124,109 @@ class put_object_cabinet(Base_Task):
         self.last_open = self._open_progress()
         self.last_place = self._place_progress(self.last_open)
 
+        # Fixed here rather than in play_once, so neither `check_success` nor a resumed expert
+        # depends on the demo having run: during a policy rollout it has not, and mid-episode
+        # the object has been carried across the table, so re-deriving the side off its live
+        # pose would swap the two arms' roles.
+        self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
+
+    PULL_STEP = 0.04  # metres of drawer travel per expert pull...
+    PULL_COUNT = 4  # ... and how many of them the demo makes, for 0.16 m of 46653's 0.178 m.
+    HOLD_DIS = 0.12  # gripper-center to object-origin distance that counts as holding it.
+    HANDLE_DIS = 0.12  # ... and TCP to drawer-handle distance that counts as holding the bar.
+    LIFTED_Z = 0.10  # of the 0.15 m lift: past this the object is up and stage 6 is done.
+
+    # -- scripted expert ------------------------------------------------------------------
+    # Split into stages so post-failure recovery can resume where the scene actually is
+    # (see Base_Task.scripted_stages). play_once runs all of them, unchanged. The four pulls
+    # are four stages rather than one loop precisely so a half-open drawer can resume at the
+    # pull it got to instead of re-running all four against a drawer already part-way out.
+
+    def scripted_stages(self):
+        arm_tag = self.arm_tag
+        pull_arm = arm_tag.opposite
+        return [
+            # 0: take the object with the arm on its side
+            lambda: self.move(self.grasp_actor(self.object, arm_tag=arm_tag, pre_grasp_dis=0.1)),
+            # 1: take the drawer bar with the other arm
+            lambda: self.move(self.grasp_actor(self.cabinet, arm_tag=pull_arm, pre_grasp_dis=0.05)),
+            # 2-5: pull the drawer out, PULL_STEP at a time
+            *[
+                (lambda: self.move(self.move_by_displacement(arm_tag=pull_arm, y=-self.PULL_STEP)))
+                for _ in range(self.PULL_COUNT)
+            ],
+            # 6: lift the object clear of the table
+            lambda: self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.15)),
+            # 7: lower it into the open drawer
+            lambda: self.move(self.place_actor(
+                self.object,
+                arm_tag=arm_tag,
+                target_pose=self.cabinet.get_functional_point(0),
+                pre_dis=0.13,
+                dis=0.1,
+            )),
+        ]
+
+    def _pulls_done(self):
+        """How many of the expert's `PULL_STEP` pulls the drawer is already out by.
+
+        Read in metres straight off the prismatic joint rather than through
+        `_open_progress`'s normalization, since a pull is defined in metres too.
+        """
+        low, _ = self.cabinet.get_qlimits()[self.drawer_joint_idx]
+        qpos = self.cabinet.get_qpos()[self.drawer_joint_idx]
+        return int(np.clip((qpos - low) / self.PULL_STEP, 0, self.PULL_COUNT))
+
+    def resume_stage(self):
+        """Ordinal progress, tested from the most advanced state down.
+
+        The object arm holds the object for the whole of stages 0-7, so losing it is what
+        sends the expert back to the beginning; everything else is read off the drawer joint
+        and the object's height.
+        """
+        stages = len(self.scripted_stages())
+        if self.check_success():
+            return stages
+        if not self.gripper_holds(self.arm_tag, self.object, hold_dis=self.HOLD_DIS):
+            return 0
+        pulls = self._pulls_done()
+        if pulls < self.PULL_COUNT:
+            # `get_contact_point(0)` is the drawer bar, which rides the drawer link and so
+            # moves as it comes out -- unlike the cabinet's root pose, which does not move at
+            # all and would read as "holding" from anywhere in front of the cabinet.
+            handle = self.cabinet.get_contact_point(0)[:3]
+            holding_bar = self.gripper_holds(
+                self.arm_tag.opposite, self.cabinet, hold_dis=self.HANDLE_DIS, point=handle)
+            return 2 + pulls if holding_bar else 1
+        lifted = (self.object.get_pose().p[2] - self.origin_z) > self.LIFTED_Z
+        return 7 if lifted else 6
+
+    def resume_feasible(self):
+        """The two grasps are the only stages that can fail to find a reachable contact point.
+
+        Stage 1's is the one that matters in practice: the drawer bar has to be reachable by
+        the arm that is *not* holding the object, and a rewind that finds the object carried
+        across the midline is exactly where that stops being true.
+        """
+        stage = self.resume_stage()
+        if stage == 0:
+            actor, arm, pre_dis = self.object, self.arm_tag, 0.1
+        elif stage == 1:
+            actor, arm, pre_dis = self.cabinet, self.arm_tag.opposite, 0.05
+        else:
+            return True
+        pre_grasp_pose, _ = self.choose_grasp_pose(actor, arm_tag=arm, pre_dis=pre_dis)
+        return pre_grasp_pose is not None
+
     def play_once(self):
-        arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
-        self.arm_tag = arm_tag
-        self.origin_z = self.object.get_pose().p[2]
-
-        # Grasp the object and grasp the drawer bar
-        self.move(self.grasp_actor(self.object, arm_tag=arm_tag, pre_grasp_dis=0.1))
-        self.move(self.grasp_actor(self.cabinet, arm_tag=arm_tag.opposite, pre_grasp_dis=0.05))
-
-        # Pull the drawer
-        for _ in range(4):
-            self.move(self.move_by_displacement(arm_tag=arm_tag.opposite, y=-0.04))
-
-        # Lift the object
-        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.15))
-
-        # Place the object into the cabinet
-        target_pose = self.cabinet.get_functional_point(0)
-        self.move(self.place_actor(
-            self.object,
-            arm_tag=arm_tag,
-            target_pose=target_pose,
-            pre_dis=0.13,
-            dis=0.1,
-        ))
+        for stage in self.scripted_stages():
+            stage()
 
         self.info["info"] = {
             "{A}": f"{self.selected_modelname}/base{self.selected_model_id}",
             "{B}": f"036_cabinet/base{0}",
-            "{a}": str(arm_tag),
-            "{b}": str(arm_tag.opposite),
+            "{a}": str(self.arm_tag),
+            "{b}": str(self.arm_tag.opposite),
         }
         return self.info
 

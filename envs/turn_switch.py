@@ -54,15 +54,47 @@ class turn_switch(Base_Task):
         self.last_approach = self._approach_progress()
         self.last_turn = self._turn_progress()
 
-    def play_once(self):
+    # -- scripted expert ------------------------------------------------------------------
+    # Split into stages so post-failure recovery can resume where the scene actually is
+    # (see Base_Task.scripted_stages). play_once runs both of them, unchanged.
+
+    def scripted_stages(self):
         arm_tag = self.arm_tag
+        return [
+            # 0: make a fist, so the switch is pushed with the closed gripper
+            lambda: self.move(self.close_gripper(arm_tag=arm_tag, pos=0)),
+            # 1: drive that fist through the switch's contact point, turning it
+            lambda: self.move(self.grasp_actor(self.switch, arm_tag=arm_tag, pre_grasp_dis=0.04)),
+        ]
 
-        # close gripper
-        self.move(self.close_gripper(arm_tag=arm_tag, pos=0))
-        # move the gripper to turn off the switch
-        self.move(self.grasp_actor(self.switch, arm_tag=arm_tag, pre_grasp_dis=0.04))
+    def resume_stage(self):
+        """Only one thing can already be done here: the gripper can already be shut.
 
-        self.info["info"] = {"{A}": f"056_switch/base{self.model_id}", "{a}": str(arm_tag)}
+        There is no object to hold and no handover, so unlike the two-arm tasks the partially
+        turned switch does not need its own stage -- stage 1 drives the switch from wherever
+        it is, and `check_success` reads the joint rather than the expert's progress through
+        the script.
+        """
+        if self.check_success():
+            return len(self.scripted_stages())
+        closed = (self.is_left_gripper_close() if self.arm_tag == "left"
+                  else self.is_right_gripper_close())
+        return 1 if closed else 0
+
+    def resume_feasible(self):
+        """Both stages run into the same grasp, so probe it either way.
+
+        This is the whole of the task's reachability: the switch's root is fixed, so a rewind
+        point the arm cannot plan to is one the expert cannot turn it from.
+        """
+        pre_grasp_pose, _ = self.choose_grasp_pose(self.switch, arm_tag=self.arm_tag, pre_dis=0.04)
+        return pre_grasp_pose is not None
+
+    def play_once(self):
+        for stage in self.scripted_stages():
+            stage()
+
+        self.info["info"] = {"{A}": f"056_switch/base{self.model_id}", "{a}": str(self.arm_tag)}
         return self.info
 
     def check_success(self):
