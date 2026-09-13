@@ -12,3 +12,6 @@ ARX-X5:
 
 ur5-wsg:
   file_path: "./assets/embodiments/ur5-wsg"
+
+franka-panda-droid:
+  file_path: "./assets/embodiments/franka-panda-droid/"

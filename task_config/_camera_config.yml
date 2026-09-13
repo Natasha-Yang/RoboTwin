@@ -17,3 +17,32 @@ Large_D435:
   fovy: 37
   w: 640
   h: 480
+# Stereolabs ZED Mini -- the wrist camera DROID records with, so a run feeding a
+# DROID-trained checkpoint (policy/pi05_droid) should use it rather than the D435.
+# Spec: 90 deg (H) x 60 deg (V) x 100 deg (D), 0.10-15 m depth, 63 mm baseline, 16:9 per eye.
+# `fovy: 60` at 16:9 reproduces the real horizontal FOV (2*atan(tan(30)*16/9) = 91.5 deg).
+# Mono here: RoboTwin renders one image per camera, so the stereo baseline has no analogue.
+ZED_Mini:
+  fovy: 60
+  w: 320
+  h: 180
+
+Large_ZED_Mini:
+  fovy: 60
+  w: 640
+  h: 360
+
+# Stereolabs ZED 2 -- the scene/exterior camera DROID records with (`exterior_image_1_left`).
+# Spec: 110 deg (H) x 70 deg (V) x 120 deg (D), 0.2-20 m depth, 120 mm baseline, 16:9 per eye.
+# `fovy: 70` is the spec'd vertical exactly; the horizontal then comes out 102 deg at 16:9
+# rather than 110, because a pinhole cannot reproduce a distortion-compensated 8-element wide
+# lens. Vertical is matched in preference to horizontal since `fovy` is what RoboTwin takes.
+ZED_2:
+  fovy: 70
+  w: 320
+  h: 180
+
+Large_ZED_2:
+  fovy: 70
+  w: 640
+  h: 360

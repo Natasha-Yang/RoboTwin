@@ -1,0 +1,60 @@
+# Zero-shot evaluation of the released pi05-DROID checkpoint in the RoboTwin sim.
+#
+# Unlike policy/pi05/deploy_policy.yml this carries no critic, no demo retrieval and no
+# rollout-collection keys: the checkpoint is frozen and being scored as-is, so there is nothing
+# to steer with and nothing to train. `script/eval_policy.py` defaults all of those off.
+#
+# REQUIRED TASK CONFIG: the checkpoint drives one 7-DoF Franka, so the task config must set
+#   embodiment: [franka-panda, franka-panda, 0.6]
+# The one-entry form `[franka-panda]` does NOT work -- franka is `dual_arm: False`, and the
+# one-entry form makes envs/robot/robot.py look for a `curobo_left.yml` that does not exist,
+# which fails per seed and spins the uncapped seed loop forever.
+
+# Filled in by eval.sh's positional args.
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# The checkpoint itself. `create_trained_policy` runs this through
+# `openpi.shared.download.maybe_download`, so a gs:// URL is downloaded once and cached under
+# ~/.cache/openpi (12 GB). A local path works too.
+checkpoint_dir: gs://openpi-assets/checkpoints/pi05_droid
+# The registered openpi config whose transforms and norm stats this checkpoint was trained
+# with (added to policy/pi05/src/openpi/training/config.py, copied from upstream openpi).
+train_config_name: pi05_droid
+
+# ---- DROID -> RoboTwin action conversion -------------------------------------------------
+# Which arm the policy drives. The other is held at its current commanded pose all episode.
+# `open_microwave` picks whichever arm's base is nearer the microwave, so under the
+# franka-panda-droid embodiment (right arm centred, left parked) its expert uses the right
+# arm too. Must match DRIVEN_ARM in script/gen_franka_droid_embodiment.py (its --verify checks).
+arm: right
+# Chunk steps executed per inference. The chunk is 15 long (pi05_droid's action_horizon), so
+# this cannot exceed 15.
+pi0_step: 8
+# Seconds of joint velocity one chunk step represents. DROID runs at 15 Hz; RoboTwin has no
+# equivalent clock (a `take_action` is a TOPP-retimed move to an absolute target), so this is
+# the conversion factor between the two and the FIRST KNOB TO TUNE -- too small and the arm
+# barely moves, too large and every step overshoots.
+velocity_dt: 0.0667
+# DROID's runtime binarizes the gripper command rather than tracking it continuously
+# (examples/droid/main.py). `gripper_threshold` is on DROID's scale, where 1 = closed.
+binarize_gripper: true
+gripper_threshold: 0.5
+
+# ---- eval loop ----------------------------------------------------------------------------
+test_num: 100
+# Periodic held-out evaluation exists to pick a critic checkpoint; there is no critic here.
+eval_interval: 0
+eval_episodes: 25
+eval_seed: null
+# Sparse success reward. The shaped term is a critic-training signal, and nothing trains here.
+use_step_reward: false
+# Rows per wrench drain (envs/utils/wrench.py). Only read by the debug recorders under a task
+# config with `debug: true`; keep it equal to pi0_step.
+wrench_trace_len: 8
+# Wall-clock breakdown (envs/utils/eval_profiler.py). false = hooks never installed.
+profile: false

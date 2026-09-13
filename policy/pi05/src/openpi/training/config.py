@@ -560,6 +560,32 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    #
+    # Inference-only DROID config, for evaluating the released pi05-DROID checkpoint
+    # (gs://openpi-assets/checkpoints/pi05_droid) inside the RoboTwin sim.
+    #
+    # Copied verbatim from upstream openpi so the transforms and the norm-stats asset id match
+    # the ones the checkpoint was trained with -- above all `asset_id="droid"`, which is the
+    # only entry in that checkpoint's assets/ dir. There is no dataset here: nothing trains
+    # from this config, it exists so `create_trained_policy` can build the input/output chain.
+    #
+    # The model it describes drives ONE Franka arm: state is 7 joint positions + 1 gripper, and
+    # `DroidOutputs` returns 8 dims -- 7 joint *velocities* plus an absolute gripper position.
+    # Turning that into RoboTwin's absolute-qpos `take_action` is policy/pi05_droid's job.
+    TrainConfig(
+        name="pi05_droid",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
     TrainConfig(
         name="pi05_base_aloha_lora_clean_multimodal_50x10",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),

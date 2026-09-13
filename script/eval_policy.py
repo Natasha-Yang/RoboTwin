@@ -829,8 +829,37 @@ def main(usr_args):
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
-        camera_config = get_camera_config(args["camera"]["head_camera_type"])
+        # Which camera the episode video shows. `head_camera` is the default and the historical
+        # behaviour; a task config can point it at any camera the observation carries, which is
+        # what a policy conditioned on a different viewpoint wants -- policy/pi05_droid reads
+        # `exterior_camera`, and a head-camera video would not show the view its actions came
+        # from. The ffmpeg pipe is raw frames, so its size has to be THAT camera's, not the head
+        # camera's: the two resolutions differ here (D435 320x240 vs ZED 2 320x180) and a
+        # mismatch writes a silently skewed video rather than failing.
+        video_camera = args.get("eval_video_camera") or "head_camera"
+        if video_camera == "head_camera":
+            video_camera_type = args["camera"]["head_camera_type"]
+        else:
+            static_cameras = {
+                cam["name"]: cam
+                for cam in (args["left_embodiment_config"].get("static_camera_list") or [])
+            }
+            if video_camera not in static_cameras:
+                raise ValueError(
+                    f"eval_video_camera is {video_camera!r}, which this embodiment does not "
+                    f"have. Its static cameras are {sorted(static_cameras)} (plus the wrist "
+                    f"cameras left_camera / right_camera, which move and are not video sources)."
+                )
+            video_camera_type = static_cameras[video_camera].get("type")
+            if video_camera_type is None:
+                raise ValueError(
+                    f"static camera {video_camera!r} has no `type`, so its frame size is "
+                    f"unknown. Give it one from task_config/_camera_config.yml."
+                )
+        args["eval_video_camera"] = video_camera
+        camera_config = get_camera_config(video_camera_type)
         video_size = str(camera_config["w"]) + "x" + str(camera_config["h"])
+        print(f"\033[94mEval video:\033[0m {video_camera} ({video_camera_type}, {video_size})")
         video_save_dir.mkdir(parents=True, exist_ok=True)
         args["eval_video_save_dir"] = video_save_dir
 
@@ -1183,7 +1212,7 @@ def run_holdout_eval(TASK_ENV, args, model, eval_func, reset_func, seeds, info_c
     was asked for.
 
     Video and the debug recorders are off: `eval_video_save_dir` is dropped from the env args
-    (the env writes head-camera frames into the run's ffmpeg pipe whenever that path is set, and
+    (the env writes frames from `eval_video_camera` into the run's ffmpeg pipe whenever that path is set, and
     there is no pipe here), and `rollout_episode` is called with no hooks.
     """
     holdout_args = {k: v for k, v in args.items() if k != "eval_video_save_dir"}

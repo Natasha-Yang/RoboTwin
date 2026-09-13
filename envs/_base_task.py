@@ -193,6 +193,13 @@ class Base_Task(gym.Env):
         self._wrench_accum = None
         self._wrench_accum_n = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
+        # Which camera the eval video is recorded from. `head_camera` is the default and the
+        # historical behaviour; a policy trained on a different viewpoint wants its video to
+        # show what it actually saw (policy/pi05_droid conditions on `exterior_camera`, so a
+        # head-camera video does not show the view that produced the actions). The camera must
+        # exist in the observation and `script/eval_policy.py` sizes the ffmpeg pipe from this
+        # same key, so the two cannot disagree about the frame size.
+        self.eval_video_camera = kwags.get("eval_video_camera") or "head_camera"
 
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
@@ -1831,7 +1838,8 @@ class Base_Task(gym.Env):
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+            self.eval_video_ffmpeg.stdin.write(
+                self.now_obs["observation"][self.eval_video_camera]["rgb"].tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -2011,7 +2019,8 @@ class Base_Task(gym.Env):
                 self._close_step_wrench()  # the steps that ran before success still count
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                    self.eval_video_ffmpeg.stdin.write(
+                        self.now_obs["observation"][self.eval_video_camera]["rgb"].tobytes())
                 return
 
         self._close_step_wrench()
