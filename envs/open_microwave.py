@@ -31,7 +31,16 @@ class open_microwave(Base_Task):
         self.last_microwave_qpos = self.microwave.get_qpos()[0]
 
     def play_once(self):
-        arm_tag = ArmTag("left")
+        # Use whichever arm's base is nearer the microwave. Every stock embodiment keeps the
+        # left arm, exactly as before: aloha-agilex has one base, so the distances tie and the
+        # tie goes left; franka-panda at embodiment_dis 0.6 puts the left base nearer. An
+        # embodiment that centres the RIGHT arm on the microwave and parks the left one out of
+        # reach (franka-panda-droid, for a right-arm DROID policy) gets the right arm -- without
+        # this the expert-feasibility gate fails every seed and eval spins forever.
+        mw_xy = np.asarray(self.microwave.actor.get_root_pose().p[:2])
+        left_d = np.linalg.norm(np.asarray(self.robot.left_entity_origion_pose.p[:2]) - mw_xy)
+        right_d = np.linalg.norm(np.asarray(self.robot.right_entity_origion_pose.p[:2]) - mw_xy)
+        arm_tag = ArmTag("right" if right_d < left_d else "left")
 
         # Grasp the microwave with pre-grasp displacement
         self.move(self.grasp_actor(self.microwave, arm_tag=arm_tag, pre_grasp_dis=0.08, contact_point_id=0))

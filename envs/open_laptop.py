@@ -45,21 +45,38 @@ class open_laptop(Base_Task):
         self.laptop.set_mass(0.01)
         self.laptop.set_properties(1, 0)
         self.add_prohibit_area(self.laptop, padding=0.1)
-        # `_approach_progress` reads `self.arm_tag`, which only exists once `play_once` has
-        # run, so both baselines are taken lazily on the first `step_reward` call rather than
-        # here. That also keeps the settling drift between here and the first control step out
-        # of the reward, since it is physics, not progress.
+        # Fixed here rather than in play_once, so neither `check_success` nor `_approach_progress`
+        # depends on the expert having run -- during a policy rollout it has not, and both read
+        # it every control step. The root link is fixed, so the pose this is derived from cannot
+        # move and deriving it early gives the same answer play_once used to.
+        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
+        self.arm_tag = ArmTag("left" if face_prod > 0 else "right")
+
         self.last_approach = None
         self.last_open = None
 
-    def play_once(self):
-        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
-        arm_tag = ArmTag("left" if face_prod > 0 else "right")
-        self.arm_tag = arm_tag
+    HOLD_DIS = 0.15  # TCP this close to the lid's grasp point counts as being on the lid.
+    #                  Looser than check_success's own 0.1: resuming only needs the gripper
+    #                  near enough for the crank loop's zero-distance re-grasp to take hold,
+    #                  not near enough to score.
 
-        # Grasp the laptop
-        self.move(self.grasp_actor(self.laptop, arm_tag=arm_tag, pre_grasp_dis=0.08, contact_point_id=0))
+    # -- scripted expert ------------------------------------------------------------------
+    # Split into stages so post-failure recovery can resume where the scene actually is
+    # (see Base_Task.scripted_stages). play_once runs both of them, unchanged.
 
+    def scripted_stages(self):
+        arm_tag = self.arm_tag
+        return [
+            # 0: approach and take the lid by its edge
+            lambda: self.move(
+                self.grasp_actor(self.laptop, arm_tag=arm_tag, pre_grasp_dis=0.08,
+                                 contact_point_id=0)),
+            # 1: crank the lid open, re-grasping at zero distance until it is past 0.5 of its
+            #    travel. Already self-terminating, so resuming here just runs fewer iterations.
+            lambda: self._crank_lid(arm_tag),
+        ]
+
+    def _crank_lid(self, arm_tag):
         for _ in range(15):
             # Get target rotation pose
             self.move(
@@ -74,6 +91,43 @@ class open_laptop(Base_Task):
                 break
             if self.check_success(target=0.5):
                 break
+
+    def _on_lid(self):
+        """The gripper is on the lid's grasp point -- the same distance check_success uses."""
+        rotate_pose = self.laptop.get_contact_point(1)
+        tip_pose = (self.robot.get_left_tcp_pose() if self.arm_tag == "left"
+                    else self.robot.get_right_tcp_pose())
+        return bool(np.linalg.norm(np.array(tip_pose[:3]) - np.array(rotate_pose[:3]))
+                    < self.HOLD_DIS)
+
+    def resume_stage(self):
+        """Ordinal progress: lid open, gripper on the lid, or neither.
+
+        Resuming at 0 with the gripper already on the lid would back the arm off by the 0.08
+        pre-grasp distance and approach again, which on a lid held part-way open lets it fall
+        shut -- undoing exactly the progress the rewind was meant to preserve.
+        """
+        if self.check_success():
+            return len(self.scripted_stages())
+        return 1 if self._on_lid() else 0
+
+    def resume_feasible(self):
+        """Both stages are grasps on the laptop, so probe whichever one would run."""
+        stage = self.resume_stage()
+        if stage == 0:
+            pre_dis, contact_point_id = 0.08, 0
+        elif stage == 1:
+            pre_dis, contact_point_id = 0.0, 1
+        else:
+            return True
+        pre_grasp_pose, _ = self.choose_grasp_pose(
+            self.laptop, arm_tag=self.arm_tag, pre_dis=pre_dis,
+            contact_point_id=contact_point_id)
+        return pre_grasp_pose is not None
+
+    def play_once(self):
+        for stage in self.scripted_stages():
+            stage()
 
         self.info["info"] = {
             "{A}": f"{self.model_name}/base{self.model_id}",
